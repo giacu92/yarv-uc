@@ -29,7 +29,11 @@ import rv32_pkg::*;
  * handshake into an AXI4-Lite transaction, so the rest of the system
  * sees the CPU as a plain AXI4-Lite master.
  *
- * The fd_pc_o low nibble is brought out as a debug tap.
+ * The F/D pipeline-register taps (full width) are brought out for
+ * simulation / observation; decode will consume them once it exists.
+ *
+ * Naming: ports use *_i/_o; internal signals have no prefix (they are
+ * neither inputs nor outputs).
  */
 
 module rv32imac_zicsr_zifencei (
@@ -44,8 +48,16 @@ module rv32imac_zicsr_zifencei (
     // AXI4-Lite master #1: peripherals (UART, GPIO, ...). Unused for now.
     axi4_lite_if.master peri_axi,
 
-    // Debug: low 4 bits of the current F/D PC, for LEDs / sim hooks.
-    output wire [3:0]      fd_pc_dbg_o
+    // Debug taps for the F/D pipeline register. The low 4 bits of the
+    // F/D PC go to the board LEDs; the full-width taps are left
+    // unconnected at the board top (swept by synthesis) and are used by
+    // the simulation wrapper to observe what fetch delivers.
+    output wire [3:0]      fd_pc_dbg_o,             // LED nibble
+    output wire [XLEN-1:0] fd_pc_full_dbg_o,        // full F/D PC
+    output wire [XLEN-1:0] fd_instr_dbg_o,          // F/D instruction word
+    output wire            fd_valid_dbg_o,          // F/D valid (held level)
+    output wire            fd_is_compressed_dbg_o,  // rdata[1:0] != 2'b11
+    output wire [XLEN-1:0] next_pc_dbg_o            // next fetch address
 );
 
     // -----------------------------------------------------------------
@@ -58,6 +70,14 @@ module rv32imac_zicsr_zifencei (
     mem_rsp_t imem_rsp;
     wire [XLEN-1:0] cpu_next_pc;
 
+    // F/D pipeline-register taps. Decode is not implemented yet, so
+    // fetch's F/D outputs are captured here for observation (debug
+    // taps above) instead of being tied off to ().
+    wire [XLEN-1:0] fd_pc_w;
+    wire [XLEN-1:0] fd_instr_w;
+    wire            fd_valid_w;
+    wire            fd_is_compressed_w;
+
     fetch_stage fetch_stage_i (
         .clk_i              (clk_i),
         .rstn_i             (rstn_i),
@@ -68,10 +88,10 @@ module rv32imac_zicsr_zifencei (
         .imem_req_o         (imem_req),
         .imem_rsp_i         (imem_rsp),
         .next_pc_o          (cpu_next_pc),
-        .fd_instr_o         (),
-        .fd_pc_o            (),
-        .fd_valid_o         (),
-        .fd_is_compressed_o ()
+        .fd_instr_o         (fd_instr_w),
+        .fd_pc_o            (fd_pc_w),
+        .fd_valid_o         (fd_valid_w),
+        .fd_is_compressed_o (fd_is_compressed_w)
     );
 
     // -----------------------------------------------------------------
@@ -102,7 +122,7 @@ module rv32imac_zicsr_zifencei (
     assign peri_req.wdata = '0;
     assign peri_req.wstrb = '0;
     assign peri_req.rready = 1'b1;   // never launched, but drive it (no X)
-    wire _unused_peri_rsp = peri_rsp.wready | peri_rsp.rvalid | peri_rsp.rdata[0];
+    wire unused_peri_rsp = peri_rsp.wready | peri_rsp.rvalid | peri_rsp.rdata[0];
 
     axi4_lite_master_bridge u_peri_bridge (
         .clk_i  (clk_i),
@@ -113,8 +133,13 @@ module rv32imac_zicsr_zifencei (
     );
 
     // -----------------------------------------------------------------
-    // Debug tap
+    // Debug taps
     // -----------------------------------------------------------------
-    assign fd_pc_dbg_o = fetch_stage_i.fd_pc_o[3:0];
+    assign fd_pc_dbg_o             = fd_pc_w[3:0];        // LED nibble
+    assign fd_pc_full_dbg_o        = fd_pc_w;             // full F/D PC
+    assign fd_instr_dbg_o         = fd_instr_w;
+    assign fd_valid_dbg_o          = fd_valid_w;
+    assign fd_is_compressed_dbg_o  = fd_is_compressed_w;
+    assign next_pc_dbg_o           = cpu_next_pc;
 
 endmodule

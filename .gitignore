@@ -18,6 +18,13 @@ rv32imac_Zicsr_Zifencei.gprj.user
 # Claude Code workspace state (per-machine)
 .claude/
 
+# Verilator sim build artefacts (regenerable)
+sim/obj_dir/
+obj_dir/
+sim/*.vcd
+sim/*.fst
+sim/*.log
+
 # Editor / OS
 *.swp
 *~

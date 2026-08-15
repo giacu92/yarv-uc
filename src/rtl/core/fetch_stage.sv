@@ -44,8 +44,8 @@ import rv32_pkg::*;
  *
  * Redirect (branch_valid_i, highest priority): kills the in-flight
  * fetch (flushed_q) AND any stale F/D content, and points pc_q at the
- * branch target. req.valid is gated by !branch_valid_i so no fetch of
- * the old pc_q issues during the redirect cycle.
+ * branch target. wvalid is gated by !branch_valid_i so no fetch of the
+ * old pc_q issues during the redirect cycle.
  *
  * stall_i: downstream hazard back-pressure. While high the F/D
  * register is not consumed (held); prefetch still issues up to 1 ahead
@@ -58,6 +58,10 @@ import rv32_pkg::*;
  * the next word (+4). fd_is_compressed_o is computed for decode.
  *
  * next_pc_o: the next fetch address (pc_q), for debug.
+ *
+ * Naming: ports use *_i/_o; internal signals have no prefix (they are
+ * neither inputs nor outputs). Flop registers end in _q, their
+ * next-state combinational counterparts in _d.
  */
 
 module fetch_stage (

@@ -15,6 +15,10 @@
  *
  * The storage array uses (* ram_style = "block" *) so the Gowin
  * synthesizer infers BSRAM.
+ *
+ * Naming: ports use *_i/_o; internal signals have no prefix. Flop
+ * registers end in _q, their next-state counterparts in _d. Localparams
+ * and AXI interface member names are unchanged.
  */
 
 module axi4_lite_ram #(
@@ -113,8 +117,8 @@ module axi4_lite_ram #(
         if (!rstn_i) begin
             aw_seen_q <= 1'b0;
             aw_word_q <= '0;
-            wstrb_q   <= '0;
-            wdata_q   <= '0;
+            wstrb_q   <= 1'b0;
+            wdata_q   <= 1'b0;
         end else begin
             aw_seen_q <= aw_seen_d;
             aw_word_q <= aw_word_d;
@@ -130,7 +134,7 @@ module axi4_lite_ram #(
     logic [STRB_W-1:0]      mem_wstrb_q;
 
     always_ff @(posedge clk_i) begin
-        mem_we_q   <= w_hs && aw_seen_q;
+        mem_we_q    <= w_hs && aw_seen_q;
         mem_waddr_q <= aw_word_q;
         mem_wdata_q <= wdata_d;
         mem_wstrb_q <= wstrb_d;

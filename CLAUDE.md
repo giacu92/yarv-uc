@@ -8,7 +8,7 @@ A RV32IMAC + Zicsr + Zifencei RISC-V core targeting a **Gowin GW2AR-18C** FPGA (
 
 Key files:
 - Board-level top (IDE `TopModule`): `src/rtl/core/top_module.sv` — `module top_module`.
-- CPU RTL top: `src/rtl/core/rv32imac_zicsr_Zifencei.sv` — `module rv32imac_zicsr_zifencei`; instantiates pipeline stages + two on-die AXI4-Lite bridges.
+- CPU RTL top: `src/rtl/core/rv32imac_zicsr_zifencei.sv` — `module rv32imac_zicsr_zifencei`; instantiates pipeline stages + two on-die AXI4-Lite bridges.
 - Gowin IDE project: `rv32imac_Zicsr_Zifencei.gprj` (file list + device).
 - Process/synthesis config: `impl/rv32imac_Zicsr_Zifencei_process_config.json` (`TopModule`, tool options).
 - Synthesized netlist/reports: `impl/gwsynthesis/`. PnR bitstream/reports: `impl/pnr/` (gitignored — regenerable).
@@ -50,16 +50,41 @@ Timing — `src/phys/rv32imac_Zicsr_Zifencei.sdc` (only applied if passed via `-
 - Primary clock `clk27` at 27 MHz on `clk_i` (period 37.037 ns).
 - `rstn_i` (false-path-from) and `led_o[*]` (false-path-to) marked non-timing-critical.
 
-There are **no unit tests, no simulation harness, and no lint config** in the repo. Verification is done outside this tree.
+There are **no unit tests and no lint config** in the repo. A **Verilator** functional sim harness lives in `sim/` (see **Simulation** below); it exercises the implemented fetch + bridge + RAM logic.
+
+## Simulation (Verilator)
+
+`sim/` holds a Verilator C++ harness that builds the implemented logic (fetch stage + on-die AXI4-Lite bridge + AXI4-Lite RAM) and logs what the fetch stage delivers. It is **not** part of the synthesis file list.
+
+- `sim/sim_top.sv` — sim wrapper. Replicates `top_module`'s wiring (CPU `imem_axi` → `axi4_lite_ram`; `peri_axi` tied off) but instantiates the RAM with `INIT_FILE="program.hex"` so a program is preloaded via `$readmemh`, and exposes the CPU's full F/D debug taps as output ports for the C++ log.
+- `sim/sim_main.cpp` — drives clk/rst (async active-low reset for a few cycles), clocks the design, prints one line per instruction delivered to the F/D register (`cycle / fd_pc / fd_instr / c / next_pc`), and writes a VCD (`sim/sim_top.vcd`) for GTKWave.
+- `sim/program.hex` — `$readmemh` preload, one 32-bit hex word per line (the word value IS the instruction encoding). Edit it to test different programs.
+- `sim/Makefile` — `make run` builds (`obj_dir/Vsim_top`) and runs from `sim/` (so `program.hex` resolves relative to the run cwd).
+
+Only fetch is implemented, so instructions do **not** execute — the sim verifies fetch delivers the right word at the right PC (advancing by 4), with the right `fd_is_compressed` flag, and that the AXI4-Lite round-trip behaves. Requires Verilator installed on the build host:
+
+```bash
+sudo apt-get install -y verilator
+cd sim && make run
+```
+
+Build artefacts (`sim/obj_dir/`, `*.vcd`, `*.log`) are gitignored.
 
 ## Architecture
 
 Built bottom-up; most pipeline stages past fetch are not yet present. Every RTL file does `import rv32_pkg::*;` and starts with `` `resetall `` / `` `default_nettype none `` / `` `timescale 1ns / 1ps `` — **match these in new files**.
 
+### Naming conventions (RTL)
+
+- **Ports:** inputs end `_i`, outputs end `_o` (e.g. `clk_i`, `fd_pc_o`).
+- **Internal signals:** **no prefix** — they are neither inputs nor outputs, so they are distinguishable already. Flop registers end `_q`, their next-state combinational counterparts end `_d` (e.g. `pc_q`/`pc_d`, `busy_q`, `state_q`). Plain wires/internals are unadorned (e.g. `imem_req`, `ar_hs`, `axi_bus_imem`).
+- **Module instance names:** keep `u_*` (e.g. `u_cpu`, `u_imem_bridge`) — not signals.
+- **Types (typedef/enum), parameters, localparams, enum labels, and AXI interface member names** (`awvalid`, `arready`, ...) keep their own spelling; AXI members follow the AXI spec.
+
 - **`src/rtl/pkg/rv32_pkg.sv`** — package: `XLEN=32`, `STRB_WIDTH`, `AXI4_LEN`, and the native memory structs, **split per direction (AXI-style)** so each is a legal single-direction packed struct port: `mem_req_t` (master→bridge: `wvalid`/`we`/`addr`/`wdata`/`wstrb`/`rready`) and `mem_rsp_t` (bridge→master: `wready`/`rvalid`/`rdata`). Handshakes: request launch is `req.wvalid && rsp.wready`; read response is `rsp.rvalid && req.rready`. `req_handshake()` returns the launch predicate. **No `bvalid` (write-ack) yet** — TODO for the LSU; fetch is read-only and the peri bridge is tied off today.
 - **`src/rtl/core/fetch_stage.sv`** — the only implemented stage. Owns the PC and the F/D pipeline register (`fd_pc_o`/`fd_instr_o`/`fd_valid_o`/`fd_is_compressed_o`). Exposes a **native** instruction-memory interface (`imem_req_o` / `imem_rsp_i`, direction-split) plus `next_pc_o`. **No bus protocol here** — it handshakes with the on-die bridge (`req.wvalid && rsp.wready` to launch, `rsp.rvalid && req.rready` to capture) as a single-outstanding **overlap-prefetch** FSM (no explicit `state_t`; uses `busy_q`/`req_pc_q`/`flushed_q` flags). Forward-compat inputs `stall_i`, `branch_valid_i`, `branch_addr_i` are on the port but tied off in the CPU top today.
-- **`src/rtl/core/rv32imac_zicsr_zifencei.sv`** — CPU RTL top. Instantiates `fetch_stage` (F/D outputs currently wired to `()` — decode stage missing) plus **two `axi4_lite_master_bridge`** instances: `u_imem_bridge` (driven by `fetch_stage`'s `imem_req_o`/`imem_rsp_i`) and `u_peri_bridge` (request tied inert — `wvalid=0` — LSU not yet implemented). The native interface is direction-split, so there are **no `req_ready` wires** — `wready` lives in `mem_rsp_t`. `peri_rsp` is sunk to a dummy net (`_unused_peri_rsp`) for the future LSU. Exits two AXI4-Lite masters. `fd_pc_dbg_o[3:0]` brought out as a debug tap.
-- **`src/rtl/core/top_module.sv`** — board top. Wires CPU `imem_axi` → `axi4_lite_ram` slave on `axi_bus_imem`; routes `peri_axi` to `axi_bus_peri` with the slave side tied off (all `*ready=0`/`*valid=0`) so a future peripheral drops in without rewiring. `led_o` = `fd_pc_dbg_o[3:0]`.
+- **`src/rtl/core/rv32imac_zicsr_zifencei.sv`** — CPU RTL top. Instantiates `fetch_stage` (F/D outputs exposed as full-width debug taps — `fd_pc_full_dbg_o`/`fd_instr_dbg_o`/`fd_valid_dbg_o`/`fd_is_compressed_dbg_o`/`next_pc_dbg_o` — because decode is missing) plus **two `axi4_lite_master_bridge`** instances: `u_imem_bridge` (driven by `fetch_stage`'s `imem_req_o`/`imem_rsp_i`) and `u_peri_bridge` (request tied inert — `wvalid=0` — LSU not yet implemented). The native interface is direction-split, so there are **no `req_ready` wires** — `wready` lives in `mem_rsp_t`. `peri_rsp` is sunk to a dummy net (`unused_peri_rsp`) for the future LSU. Exits two AXI4-Lite masters. `fd_pc_dbg_o[3:0]` brought out as the LED tap.
+- **`src/rtl/core/top_module.sv`** — board top. Wires CPU `imem_axi` → `axi4_lite_ram` slave on `axi_bus_imem`; routes `peri_axi` to `axi_bus_peri` with the slave side tied off (all `*ready=0`/`*valid=0`) so a future peripheral drops in without rewiring. The CPU's full F/D debug taps are left unconnected here (swept by synthesis); the sim wrapper (`sim/sim_top.sv`) consumes them. `led_o` = `fd_pc_dbg_o[3:0]`.
 - **`src/rtl/bus/axi4_lite_if.sv`** — SystemVerilog interface (32-bit addr/data) with `master`, `slave`, and `trunk` modports. `aclk`/`aresetn` are driven into the trunk from the board top.
 - **`src/rtl/bus/axi4_lite_master_bridge.sv`** — native `mem_req_t`/`mem_rsp_t` (direction-split) → AXI4-Lite AR/AW/W + R/B. Single shared FSM (`S_IDLE`/`S_RD_WAIT`/`S_WR_ADDR`/`S_WR_DATA`/`S_WR_WAIT`) — **single outstanding overall** (read OR write, not both). `rsp_o.wready = (state_q == S_IDLE)` is the launch handshake from the producer's side. **Read path**: in `S_RD_WAIT` the master's `req_i.rready` is forwarded straight to `axi.rready`, so the AXI slave holds `rvalid`/`rdata` until the master can accept; `rsp_o.rvalid = r_hs` the cycle data is consumed. For writes, AW+W launch in lock-step; on `b_hs` → `S_IDLE`. **Write retirement is not signalled back** (no `bvalid` in `mem_rsp_t` yet — TODO LSU); `bready` held high.
 - **`src/rtl/utils/axi4_lite_ram.sv`** — AXI4-Lite slave single-beat RAM, `(* ram_style = "block" *)` (infers BSRAM on Gowin). Params: `ADDR_W` (byte-addressed depth = 2^ADDR_W bytes) and optional `INIT_FILE` for `$readmemh`. Read latency 1 cycle (registered); `bvalid` asserted the cycle W handshakes (after AW captured). Byte-strobed writes. Wired as the `axi_bus_imem` slave.

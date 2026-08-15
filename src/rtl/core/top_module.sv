@@ -26,6 +26,9 @@ import rv32_pkg::*;
  * so the board top stays free of glue.
  *
  * Pin assignments are in impl/pnr/rv32imac_Zicsr_Zifencei.cst.
+ *
+ * Naming: ports use *_i/_o; internal signals (including interface
+ * instances) have no prefix. Module instance names keep u_*.
  */
 
 module top_module (
@@ -55,12 +58,19 @@ module top_module (
     wire [3:0] cpu_pc_dbg;
 
     rv32imac_zicsr_zifencei u_cpu (
-        .clk_i       (clk_i),
-        .rstn_i      (rstn_i),
-        .boot_addr_i (32'h0000_0000),
-        .imem_axi    (axi_bus_imem.master),
-        .peri_axi    (axi_bus_peri.master),
-        .fd_pc_dbg_o (cpu_pc_dbg)
+        .clk_i                  (clk_i),
+        .rstn_i                 (rstn_i),
+        .boot_addr_i            (32'h0000_0000),
+        .imem_axi               (axi_bus_imem.master),
+        .peri_axi               (axi_bus_peri.master),
+        .fd_pc_dbg_o            (cpu_pc_dbg),
+        // Full F/D debug taps: unused on the board (swept by synthesis),
+        // consumed by the simulation wrapper.
+        .fd_pc_full_dbg_o       (),
+        .fd_instr_dbg_o        (),
+        .fd_valid_dbg_o         (),
+        .fd_is_compressed_dbg_o (),
+        .next_pc_dbg_o          ()
     );
 
     // -----------------------------------------------------------------
@@ -71,7 +81,7 @@ module top_module (
         .INIT_FILE ("")
     ) u_ram (
         .clk_i  (clk_i),
-        .rstn_i (rstn_i),
+        .rstn_i  (rstn_i),
         .axi    (axi_bus_imem.slave)
     );
 

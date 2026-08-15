@@ -1,0 +1,27 @@
+@00000000
+// Small RV32I program to exercise the fetch stage. Only fetch is
+// implemented, so these do not execute; they just need to be valid
+// 32-bit words whose encodings we can match against fd_instr in the
+// log. One 32-bit hex word per line (little-endian-agnostic at word
+// level: the word value IS the instruction encoding).
+//
+//   0x00000013  nop          (addi  x0, x0, 0)
+//   0x00100093  addi  x1, x0, 1
+//   0x00200113  addi  x2, x0, 2
+//   0x00300193  addi  x3, x0, 3
+//   0x00400213  addi  x4, x0, 4
+//   0x00500293  addi  x5, x0, 5
+//   0x00600313  addi  x6, x0, 6
+//   0x00700393  addi  x7, x0, 7
+//   0x00000001  low half = 0x0001 = c.nop  -> fd_is_compressed = 1
+//   0x00000013  nop
+00000013
+00100093
+00200113
+00300193
+00400213
+00500293
+00600313
+00700393
+00000001
+00000013

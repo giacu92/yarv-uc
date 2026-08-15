@@ -32,6 +32,10 @@ import rv32_pkg::*;
  * The CPU does not need to know whether it is talking to memory or
  * peripherals — the board top picks the topology and instantiates one
  * of these per master port.
+ *
+ * Naming: ports use *_i/_o; internal signals have no prefix. The FSM
+ * state register is state_q, its next-state is state_d. AXI interface
+ * member names follow the AXI spec (awvalid, arready, ...).
  */
 
 module axi4_lite_master_bridge (
@@ -49,7 +53,9 @@ module axi4_lite_master_bridge (
     // -----------------------------------------------------------------
     // Per-channel state
     // -----------------------------------------------------------------
-    typedef enum logic [1:0] {
+    // 5 states -> need 3 bits (2 bits only hold 4 values and would
+    // wrap S_WR_WAIT onto S_IDLE).
+    typedef enum logic [2:0] {
         S_IDLE,
         S_RD_WAIT,
         S_WR_ADDR,
@@ -136,7 +142,7 @@ module axi4_lite_master_bridge (
             end
 
             S_WR_DATA: begin
-                // W hand-shoken, AW still outstanding
+                // W hand-shaken, AW still outstanding
                 axi.awaddr  = req_i.addr;
                 axi.awvalid = 1'b1;
                 if (aw_hs) begin

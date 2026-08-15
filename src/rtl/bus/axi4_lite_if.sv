@@ -1,10 +1,16 @@
 interface axi4_lite_if #(
     parameter int ADDR_WIDTH = 32,
     parameter int DATA_WIDTH = 32
-) (
-    input logic aclk,
-    input logic aresetn
-);
+) ();
+
+    // Clock and reset are NOT interface ports — they are internal nets
+    // driven from the board/sim top via the trunk (assign inst.aclk=...).
+    // Masters and slaves consume them (input in their modports); the
+    // trunk exposes them as outputs so a parent can drive them. Keeping
+    // them out of the port list avoids a direction conflict when the
+    // parent continuously assigns them.
+    logic aclk;
+    logic aresetn;
 
     logic [ADDR_WIDTH-1:0] awaddr;
     logic                  awvalid;
@@ -85,8 +91,8 @@ interface axi4_lite_if #(
     // Trunk: bidirectional access to all signals, used to wire a master
     // and a slave on the same interface instance inside a wrapper.
     modport trunk (
-        input  aclk,
-        input  aresetn,
+        output aclk,
+        output aresetn,
 
         output awaddr,
         output awvalid,
