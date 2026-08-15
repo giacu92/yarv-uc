@@ -65,20 +65,20 @@ import rv32_pkg::*;
  */
 
 module fetch_stage (
-    input  wire clk_i,
-    input  wire rstn_i,
+    input wire clk_i,
+    input wire rstn_i,
 
     // Reset vector boot address
-    input  wire [XLEN-1:0] boot_addr_i,
+    input wire [XLEN-1:0] boot_addr_i,
 
     // Forward-compat (currently tied off in CPU top)
-    input  wire            stall_i,
-    input  wire            branch_valid_i,
-    input  wire [XLEN-1:0] branch_addr_i,
+    input wire            stall_i,
+    input wire            branch_valid_i,
+    input wire [XLEN-1:0] branch_addr_i,
 
     // Native instruction-memory interface (consumed by the on-die bridge)
-    output mem_req_t       imem_req_o,
-    input  mem_rsp_t       imem_rsp_i,
+    output mem_req_t imem_req_o,
+    input  mem_rsp_t imem_rsp_i,
 
     // The next fetch address (debug).
     output wire [XLEN-1:0] next_pc_o,
@@ -93,15 +93,15 @@ module fetch_stage (
     // -----------------------------------------------------------------
     // State
     // -----------------------------------------------------------------
-    logic [XLEN-1:0] pc_q,     pc_d;       // next fetch address
-    logic [XLEN-1:0] req_pc_q, req_pc_d;   // address of the in-flight fetch
-    logic            busy_q,   busy_d;     // fetch in flight
-    logic            flushed_q, flushed_d; // in-flight fetch is to be dropped
+    logic [XLEN-1:0] pc_q, pc_d;  // next fetch address
+    logic [XLEN-1:0] req_pc_q, req_pc_d;  // address of the in-flight fetch
+    logic busy_q, busy_d;  // fetch in flight
+    logic flushed_q, flushed_d;  // in-flight fetch is to be dropped
 
-    logic            fd_valid_q,         fd_valid_d;
-    logic [XLEN-1:0] fd_pc_q,            fd_pc_d;
-    logic [XLEN-1:0] fd_instr_q,         fd_instr_d;
-    logic            fd_is_compressed_q, fd_is_compressed_d;
+    logic fd_valid_q, fd_valid_d;
+    logic [XLEN-1:0] fd_pc_q, fd_pc_d;
+    logic [XLEN-1:0] fd_instr_q, fd_instr_d;
+    logic fd_is_compressed_q, fd_is_compressed_d;
 
     // -----------------------------------------------------------------
     // Native interface outputs
@@ -116,16 +116,16 @@ module fetch_stage (
 
         // Issue a fetch when idle and not redirecting this cycle.
         imem_req_o.wvalid = !busy_q && !branch_valid_i;
-        imem_req_o.we    = 1'b0;
-        imem_req_o.addr  = pc_q;
-        imem_req_o.wdata = '0;
-        imem_req_o.wstrb = '0;
+        imem_req_o.we     = 1'b0;
+        imem_req_o.addr   = pc_q;
+        imem_req_o.wdata  = '0;
+        imem_req_o.wstrb  = '0;
     end
 
     assign next_pc_o = pc_q;
 
-    wire launch  = imem_req_o.wvalid && imem_rsp_i.wready; // req accepted
-    wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready; // read data consumed
+    wire launch = imem_req_o.wvalid && imem_rsp_i.wready;  // req accepted
+    wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready;  // read data consumed
 
     // -----------------------------------------------------------------
     // Next-state / datapath (combinational)
@@ -143,8 +143,8 @@ module fetch_stage (
 
         if (branch_valid_i) begin
             // ---- Redirect (highest priority) ----
-            fd_valid_d = 1'b0;            // kill stale F/D
-            pc_d       = branch_addr_i;   // next fetch -> target
+            fd_valid_d = 1'b0;  // kill stale F/D
+            pc_d       = branch_addr_i;  // next fetch -> target
             if (busy_q) begin
                 if (rsp_cap) begin
                     // Flushed response lands this cycle: drain & discard.
@@ -155,14 +155,14 @@ module fetch_stage (
                     flushed_d = 1'b1;
                 end
             end else begin
-                flushed_d = 1'b0;         // nothing in flight to drain
+                flushed_d = 1'b0;  // nothing in flight to drain
             end
         end else begin
             // ---- Normal ----
             // Launch the next fetch (single outstanding: only when idle).
             if (launch) begin
                 busy_d   = 1'b1;
-                req_pc_d = pc_q;          // remember the in-flight address
+                req_pc_d = pc_q;  // remember the in-flight address
                 pc_d     = pc_q + 32'd4;  // pc runs ahead
             end
 

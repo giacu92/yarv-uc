@@ -70,6 +70,20 @@ cd sim && make run
 
 Build artefacts (`sim/obj_dir/`, `*.vcd`, `*.log`) are gitignored.
 
+## Code formatting (Verible)
+
+SystemVerilog is formatted with **Verible** (`verible-verilog-format`). The project policy lives in `verible.flags` (a Verible `--flagfile`); it captures the style the RTL already follows — 4-space indent, 100-column limit, aligned port / named-parameter / named-port / assignment groups, and `end else` kept on one line. Edit `verible.flags` to change the project-wide policy; do not pass overriding flags on the command line or the two drift apart.
+
+A top-level `Makefile` drives the formatter over every `.sv`/`.svh`/`.v` under `src/rtl` and `sim/` (excluding `sim/obj_dir`):
+
+```bash
+make format        # reformat every file in place
+make format-check  # exit 1 if any file is unformatted (CI / pre-commit)
+make format-diff   # print the pending formatting diff
+```
+
+Verible is not in Debian apt on this distro; install the static binary from [chipsalliance/verible](https://github.com/chipsalliance/verible/releases) (the formatter is `verible-verilog-format`, the linter `verible-verilog-lint`). The build host has it at `~/tools/verible` with the `bin/` tools symlinked into `~/.local/bin` (already on PATH). The formatter reads `verible.flags` from the repo root via `--flagfile`, so it works the same from the IDE or CLI.
+
 ## Architecture
 
 Built bottom-up; most pipeline stages past fetch are not yet present. Every RTL file does `import rv32_pkg::*;` and starts with `` `resetall `` / `` `default_nettype none `` / `` `timescale 1ns / 1ps `` — **match these in new files**.

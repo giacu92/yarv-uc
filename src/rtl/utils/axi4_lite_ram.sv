@@ -23,12 +23,12 @@
 
 module axi4_lite_ram #(
     // Address width in bits (depth = 2^ADDR_W bytes)
-    parameter int ADDR_W   = 16,
+    parameter int ADDR_W = 16,
     // Optional $readmemh init file (relative to simulation working dir)
     parameter string INIT_FILE = ""
 ) (
-    input  wire clk_i,
-    input  wire rstn_i,
+    input wire clk_i,
+    input wire rstn_i,
 
     axi4_lite_if.slave axi
 );
@@ -36,16 +36,16 @@ module axi4_lite_ram #(
     // -----------------------------------------------------------------
     // Local params
     // -----------------------------------------------------------------
-    localparam int DATA_W    = axi.DATA_WIDTH;
-    localparam int STRB_W    = DATA_W / 8;
-    localparam int DEPTH     = 1 << ADDR_W;
+    localparam int DATA_W      = axi.DATA_WIDTH;
+    localparam int STRB_W      = DATA_W / 8;
+    localparam int DEPTH       = 1 << ADDR_W;
     localparam int WORD_ADDR_W = ADDR_W - $clog2(STRB_W);
 
     // -----------------------------------------------------------------
     // Storage
     // -----------------------------------------------------------------
     (* ram_style = "block" *)
-    logic [DATA_W-1:0] mem [DEPTH];
+    logic [DATA_W-1:0] mem[DEPTH];
 
     // Optional preload (simulation / bitstream init)
     initial begin
@@ -68,11 +68,11 @@ module axi4_lite_ram #(
     // bvalid the cycle the second one arrives.
     logic aw_seen_q, aw_seen_d;
     logic [WORD_ADDR_W-1:0] aw_word_q, aw_word_d;
-    logic [STRB_W-1:0]      wstrb_q,  wstrb_d;
-    logic [DATA_W-1:0]      wdata_q,  wdata_d;
+    logic [STRB_W-1:0] wstrb_q, wstrb_d;
+    logic [DATA_W-1:0] wdata_q, wdata_d;
 
     wire aw_hs = axi.awvalid && axi.awready;
-    wire w_hs  = axi.wvalid  && axi.wready;
+    wire w_hs = axi.wvalid && axi.wready;
 
     always_comb begin
         // Defaults
@@ -81,10 +81,10 @@ module axi4_lite_ram #(
         axi.bvalid  = 1'b0;
         axi.bresp   = 2'b00;
 
-        aw_seen_d = aw_seen_q;
-        aw_word_d = aw_word_q;
-        wstrb_d   = wstrb_q;
-        wdata_d   = wdata_q;
+        aw_seen_d   = aw_seen_q;
+        aw_word_d   = aw_word_q;
+        wstrb_d     = wstrb_q;
+        wdata_d     = wdata_q;
 
         // Address phase
         if (!aw_seen_q) begin
@@ -99,13 +99,13 @@ module axi4_lite_ram #(
         if (aw_seen_q) begin
             axi.wready = 1'b1;
             if (w_hs) begin
-                wstrb_d = axi.wstrb;
-                wdata_d = axi.wdata;
+                wstrb_d     = axi.wstrb;
+                wdata_d     = axi.wdata;
                 // B valid as soon as both AW and W have been seen in the
                 // same transaction (the W handshake is the second event).
-                axi.bvalid = 1'b1;
-                axi.awready = 1'b1; // accept next AW immediately
-                aw_seen_d  = 1'b0; // transaction complete
+                axi.bvalid  = 1'b1;
+                axi.awready = 1'b1;  // accept next AW immediately
+                aw_seen_d   = 1'b0;  // transaction complete
             end
         end
     end
@@ -128,10 +128,10 @@ module axi4_lite_ram #(
     end
 
     // Write enable to the BRAM, registered, byte-strobed.
-    logic mem_we_q;
+    logic                   mem_we_q;
     logic [WORD_ADDR_W-1:0] mem_waddr_q;
-    logic [DATA_W-1:0]      mem_wdata_q;
-    logic [STRB_W-1:0]      mem_wstrb_q;
+    logic [     DATA_W-1:0] mem_wdata_q;
+    logic [     STRB_W-1:0] mem_wstrb_q;
 
     always_ff @(posedge clk_i) begin
         mem_we_q    <= w_hs && aw_seen_q;
@@ -144,7 +144,7 @@ module axi4_lite_ram #(
         if (mem_we_q) begin
             for (integer i = 0; i < STRB_W; i++) begin
                 if (mem_wstrb_q[i]) begin
-                    mem[mem_waddr_q][8*i +: 8] <= mem_wdata_q[8*i +: 8];
+                    mem[mem_waddr_q][8*i+:8] <= mem_wdata_q[8*i+:8];
                 end
             end
         end
@@ -153,10 +153,10 @@ module axi4_lite_ram #(
     // -----------------------------------------------------------------
     // Read path (1-cycle registered latency)
     // -----------------------------------------------------------------
-    logic                    rvalid_q;
-    logic [DATA_W-1:0]       rdata_q;
+    logic              rvalid_q;
+    logic [DATA_W-1:0] rdata_q;
 
-    wire ar_hs = axi.arvalid && axi.arready;
+    wire               ar_hs = axi.arvalid && axi.arready;
 
     always_comb begin
         // Default: not ready to accept a new AR.

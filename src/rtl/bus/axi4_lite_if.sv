@@ -9,110 +9,110 @@ interface axi4_lite_if #(
     // trunk exposes them as outputs so a parent can drive them. Keeping
     // them out of the port list avoids a direction conflict when the
     // parent continuously assigns them.
-    logic aclk;
-    logic aresetn;
+    logic                    aclk;
+    logic                    aresetn;
 
-    logic [ADDR_WIDTH-1:0] awaddr;
-    logic                  awvalid;
-    logic                  awready;
+    logic [  ADDR_WIDTH-1:0] awaddr;
+    logic                    awvalid;
+    logic                    awready;
 
-    logic [DATA_WIDTH-1:0] wdata;
+    logic [  DATA_WIDTH-1:0] wdata;
     logic [DATA_WIDTH/8-1:0] wstrb;
-    logic                  wvalid;
-    logic                  wready;
+    logic                    wvalid;
+    logic                    wready;
 
-    logic [1:0]            bresp;
-    logic                  bvalid;
-    logic                  bready;
+    logic [             1:0] bresp;
+    logic                    bvalid;
+    logic                    bready;
 
-    logic [ADDR_WIDTH-1:0] araddr;
-    logic                  arvalid;
-    logic                  arready;
+    logic [  ADDR_WIDTH-1:0] araddr;
+    logic                    arvalid;
+    logic                    arready;
 
-    logic [DATA_WIDTH-1:0] rdata;
-    logic [1:0]            rresp;
-    logic                  rvalid;
-    logic                  rready;
+    logic [  DATA_WIDTH-1:0] rdata;
+    logic [             1:0] rresp;
+    logic                    rvalid;
+    logic                    rready;
 
-    modport master (
-        input  aclk,
-        input  aresetn,
+    modport master(
+        input aclk,
+        input aresetn,
 
         output awaddr,
         output awvalid,
-        input  awready,
+        input awready,
 
         output wdata,
         output wstrb,
         output wvalid,
-        input  wready,
+        input wready,
 
-        input  bresp,
-        input  bvalid,
+        input bresp,
+        input bvalid,
         output bready,
 
         output araddr,
         output arvalid,
-        input  arready,
+        input arready,
 
-        input  rdata,
-        input  rresp,
-        input  rvalid,
+        input rdata,
+        input rresp,
+        input rvalid,
         output rready
     );
 
-    modport slave (
-        input  aclk,
-        input  aresetn,
+    modport slave(
+        input aclk,
+        input aresetn,
 
-        input  awaddr,
-        input  awvalid,
+        input awaddr,
+        input awvalid,
         output awready,
 
-        input  wdata,
-        input  wstrb,
-        input  wvalid,
+        input wdata,
+        input wstrb,
+        input wvalid,
         output wready,
 
         output bresp,
         output bvalid,
-        input  bready,
+        input bready,
 
-        input  araddr,
-        input  arvalid,
+        input araddr,
+        input arvalid,
         output arready,
 
         output rdata,
         output rresp,
         output rvalid,
-        input  rready
+        input rready
     );
 
     // Trunk: bidirectional access to all signals, used to wire a master
     // and a slave on the same interface instance inside a wrapper.
-    modport trunk (
+    modport trunk(
         output aclk,
         output aresetn,
 
         output awaddr,
         output awvalid,
-        input  awready,
+        input awready,
 
         output wdata,
         output wstrb,
         output wvalid,
-        input  wready,
+        input wready,
 
-        input  bresp,
+        input bresp,
         output bvalid,
         output bready,
 
         output araddr,
         output arvalid,
-        input  arready,
+        input arready,
 
-        input  rdata,
-        input  rresp,
+        input rdata,
+        input rresp,
         output rvalid,
         output rready
     );

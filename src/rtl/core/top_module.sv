@@ -32,8 +32,8 @@ import rv32_pkg::*;
  */
 
 module top_module (
-    input  wire clk_i,
-    input  wire rstn_i,
+    input wire clk_i,
+    input wire rstn_i,
 
     // Debug LEDs: low 4 bits of the F/D PC.
     output wire [3:0] led_o
@@ -58,31 +58,31 @@ module top_module (
     wire [3:0] cpu_pc_dbg;
 
     rv32imac_zicsr_zifencei u_cpu (
-        .clk_i                  (clk_i),
-        .rstn_i                 (rstn_i),
-        .boot_addr_i            (32'h0000_0000),
-        .imem_axi               (axi_bus_imem.master),
-        .peri_axi               (axi_bus_peri.master),
-        .fd_pc_dbg_o            (cpu_pc_dbg),
+        .clk_i                 (clk_i),
+        .rstn_i                (rstn_i),
+        .boot_addr_i           (32'h0000_0000),
+        .imem_axi              (axi_bus_imem.master),
+        .peri_axi              (axi_bus_peri.master),
+        .fd_pc_dbg_o           (cpu_pc_dbg),
         // Full F/D debug taps: unused on the board (swept by synthesis),
         // consumed by the simulation wrapper.
-        .fd_pc_full_dbg_o       (),
+        .fd_pc_full_dbg_o      (),
         .fd_instr_dbg_o        (),
-        .fd_valid_dbg_o         (),
-        .fd_is_compressed_dbg_o (),
-        .next_pc_dbg_o          ()
+        .fd_valid_dbg_o        (),
+        .fd_is_compressed_dbg_o(),
+        .next_pc_dbg_o         ()
     );
 
     // -----------------------------------------------------------------
     // Instruction / data RAM on the imem bus
     // -----------------------------------------------------------------
     axi4_lite_ram #(
-        .ADDR_W   (16),                         // 64 KiB
-        .INIT_FILE ("")
+        .ADDR_W   (16),  // 64 KiB
+        .INIT_FILE("")
     ) u_ram (
-        .clk_i  (clk_i),
-        .rstn_i  (rstn_i),
-        .axi    (axi_bus_imem.slave)
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .axi   (axi_bus_imem.slave)
     );
 
     // -----------------------------------------------------------------
@@ -104,6 +104,6 @@ module top_module (
     // Debug LEDs: F/D PC low nibble. Keeps the design observable so
     // the synthesizer doesn't sweep the fetch stage away.
     // -----------------------------------------------------------------
-    assign led_o = cpu_pc_dbg;
+    assign led_o                = cpu_pc_dbg;
 
 endmodule

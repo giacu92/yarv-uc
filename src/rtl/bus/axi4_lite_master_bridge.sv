@@ -39,8 +39,8 @@ import rv32_pkg::*;
  */
 
 module axi4_lite_master_bridge (
-    input  wire clk_i,
-    input  wire rstn_i,
+    input wire clk_i,
+    input wire rstn_i,
 
     // Native CPU interface
     input  mem_req_t req_i,
@@ -70,28 +70,28 @@ module axi4_lite_master_bridge (
     // in flight (single outstanding overall).
     wire ar_hs = axi.arvalid && axi.arready;
     wire aw_hs = axi.awvalid && axi.awready;
-    wire w_hs  = axi.wvalid  && axi.wready;
-    wire r_hs  = axi.rvalid  && axi.rready;
-    wire b_hs  = axi.bvalid  && axi.bready;
+    wire w_hs = axi.wvalid && axi.wready;
+    wire r_hs = axi.rvalid && axi.rready;
+    wire b_hs = axi.bvalid && axi.bready;
 
     always_comb begin
         // Defaults
-        axi.awaddr  = '0;
-        axi.awvalid = 1'b0;
-        axi.wdata   = '0;
-        axi.wstrb   = '0;
-        axi.wvalid  = 1'b0;
-        axi.bready  = 1'b1;
+        axi.awaddr   = '0;
+        axi.awvalid  = 1'b0;
+        axi.wdata    = '0;
+        axi.wstrb    = '0;
+        axi.wvalid   = 1'b0;
+        axi.bready   = 1'b1;
 
-        axi.araddr  = req_i.addr;
-        axi.arvalid = 1'b0;
-        axi.rready  = 1'b0;
+        axi.araddr   = req_i.addr;
+        axi.arvalid  = 1'b0;
+        axi.rready   = 1'b0;
 
         rsp_o.wready = (state_q == S_IDLE);
         rsp_o.rvalid = 1'b0;
         rsp_o.rdata  = '0;
 
-        state_d = state_q;
+        state_d      = state_q;
 
         unique case (state_q)
             S_IDLE: begin

@@ -37,10 +37,10 @@ import rv32_pkg::*;
  */
 
 module rv32imac_zicsr_zifencei (
-    input  wire clk_i,
-    input  wire rstn_i,
+    input wire clk_i,
+    input wire rstn_i,
 
-    input  wire [XLEN-1:0] boot_addr_i,    // Reset vector boot address
+    input wire [XLEN-1:0] boot_addr_i,  // Reset vector boot address
 
     // AXI4-Lite master #0: instruction memory
     axi4_lite_if.master imem_axi,
@@ -52,7 +52,7 @@ module rv32imac_zicsr_zifencei (
     // F/D PC go to the board LEDs; the full-width taps are left
     // unconnected at the board top (swept by synthesis) and are used by
     // the simulation wrapper to observe what fetch delivers.
-    output wire [3:0]      fd_pc_dbg_o,             // LED nibble
+    output wire [     3:0] fd_pc_dbg_o,             // LED nibble
     output wire [XLEN-1:0] fd_pc_full_dbg_o,        // full F/D PC
     output wire [XLEN-1:0] fd_instr_dbg_o,          // F/D instruction word
     output wire            fd_valid_dbg_o,          // F/D valid (held level)
@@ -66,32 +66,32 @@ module rv32imac_zicsr_zifencei (
     // Forward-compat inputs (stall_i / branch_*) are tied off; the
     // hazard unit / execute stage will drive them once they exist.
     // -----------------------------------------------------------------
-    mem_req_t imem_req;
-    mem_rsp_t imem_rsp;
-    wire [XLEN-1:0] cpu_next_pc;
+    mem_req_t            imem_req;
+    mem_rsp_t            imem_rsp;
+    wire      [XLEN-1:0] cpu_next_pc;
 
     // F/D pipeline-register taps. Decode is not implemented yet, so
     // fetch's F/D outputs are captured here for observation (debug
     // taps above) instead of being tied off to ().
-    wire [XLEN-1:0] fd_pc_w;
-    wire [XLEN-1:0] fd_instr_w;
-    wire            fd_valid_w;
-    wire            fd_is_compressed_w;
+    wire      [XLEN-1:0] fd_pc_w;
+    wire      [XLEN-1:0] fd_instr_w;
+    wire                 fd_valid_w;
+    wire                 fd_is_compressed_w;
 
     fetch_stage fetch_stage_i (
-        .clk_i              (clk_i),
-        .rstn_i             (rstn_i),
-        .boot_addr_i        (boot_addr_i),
-        .stall_i            (1'b0),
-        .branch_valid_i     (1'b0),
-        .branch_addr_i      (32'h0000_0000),
-        .imem_req_o         (imem_req),
-        .imem_rsp_i         (imem_rsp),
-        .next_pc_o          (cpu_next_pc),
-        .fd_instr_o         (fd_instr_w),
-        .fd_pc_o            (fd_pc_w),
-        .fd_valid_o         (fd_valid_w),
-        .fd_is_compressed_o (fd_is_compressed_w)
+        .clk_i             (clk_i),
+        .rstn_i            (rstn_i),
+        .boot_addr_i       (boot_addr_i),
+        .stall_i           (1'b0),
+        .branch_valid_i    (1'b0),
+        .branch_addr_i     (32'h0000_0000),
+        .imem_req_o        (imem_req),
+        .imem_rsp_i        (imem_rsp),
+        .next_pc_o         (cpu_next_pc),
+        .fd_instr_o        (fd_instr_w),
+        .fd_pc_o           (fd_pc_w),
+        .fd_valid_o        (fd_valid_w),
+        .fd_is_compressed_o(fd_is_compressed_w)
     );
 
     // -----------------------------------------------------------------
@@ -102,11 +102,11 @@ module rv32imac_zicsr_zifencei (
     // request/response; the bridge owns the bus protocol.
     // -----------------------------------------------------------------
     axi4_lite_master_bridge u_imem_bridge (
-        .clk_i  (clk_i),
-        .rstn_i (rstn_i),
-        .req_i  (imem_req),
-        .rsp_o  (imem_rsp),
-        .axi    (imem_axi)
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .req_i (imem_req),
+        .rsp_o (imem_rsp),
+        .axi   (imem_axi)
     );
 
     mem_req_t peri_req;
@@ -117,29 +117,29 @@ module rv32imac_zicsr_zifencei (
     // into a dummy net so the synthesiser doesn't warn about a
     // dangling input.
     assign peri_req.wvalid = 1'b0;
-    assign peri_req.we    = 1'b0;
-    assign peri_req.addr  = '0;
-    assign peri_req.wdata = '0;
-    assign peri_req.wstrb = '0;
-    assign peri_req.rready = 1'b1;   // never launched, but drive it (no X)
+    assign peri_req.we     = 1'b0;
+    assign peri_req.addr   = '0;
+    assign peri_req.wdata  = '0;
+    assign peri_req.wstrb  = '0;
+    assign peri_req.rready = 1'b1;  // never launched, but drive it (no X)
     wire unused_peri_rsp = peri_rsp.wready | peri_rsp.rvalid | peri_rsp.rdata[0];
 
     axi4_lite_master_bridge u_peri_bridge (
-        .clk_i  (clk_i),
-        .rstn_i (rstn_i),
-        .req_i  (peri_req),
-        .rsp_o  (peri_rsp),
-        .axi    (peri_axi)
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .req_i (peri_req),
+        .rsp_o (peri_rsp),
+        .axi   (peri_axi)
     );
 
     // -----------------------------------------------------------------
     // Debug taps
     // -----------------------------------------------------------------
-    assign fd_pc_dbg_o             = fd_pc_w[3:0];        // LED nibble
-    assign fd_pc_full_dbg_o        = fd_pc_w;             // full F/D PC
+    assign fd_pc_dbg_o            = fd_pc_w[3:0];  // LED nibble
+    assign fd_pc_full_dbg_o       = fd_pc_w;  // full F/D PC
     assign fd_instr_dbg_o         = fd_instr_w;
-    assign fd_valid_dbg_o          = fd_valid_w;
-    assign fd_is_compressed_dbg_o  = fd_is_compressed_w;
-    assign next_pc_dbg_o           = cpu_next_pc;
+    assign fd_valid_dbg_o         = fd_valid_w;
+    assign fd_is_compressed_dbg_o = fd_is_compressed_w;
+    assign next_pc_dbg_o          = cpu_next_pc;
 
 endmodule
