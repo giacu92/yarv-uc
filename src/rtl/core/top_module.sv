@@ -35,7 +35,7 @@ module top_module (
     input wire clk_i,
     input wire rstn_i,
 
-    // Debug LEDs: low 4 bits of the F/D PC.
+    // Debug LEDs: low 4 bits of the fetch PC.
     output wire [3:0] led_o
 );
 
@@ -55,7 +55,9 @@ module top_module (
     // -----------------------------------------------------------------
     // CPU
     // -----------------------------------------------------------------
-    wire [3:0] cpu_pc_dbg;
+    // Full fetch PC; the LED nibble is its low 4 bits (keeps the fetch
+    // stage observable so synthesis doesn't sweep it away).
+    wire [XLEN-1:0] cpu_pc_dbg;
 
     rv32imac_zicsr_zifencei u_cpu (
         .clk_i                 (clk_i),
@@ -63,14 +65,37 @@ module top_module (
         .boot_addr_i           (32'h0000_0000),
         .imem_axi              (axi_bus_imem.master),
         .peri_axi              (axi_bus_peri.master),
-        .fd_pc_dbg_o           (cpu_pc_dbg),
-        // Full F/D debug taps: unused on the board (swept by synthesis),
+        // fe_* debug taps (fetch). Only fe_pc_dbg_o[3:0] is used here
+        // (LEDs); the rest are unused on the board (swept by synthesis),
         // consumed by the simulation wrapper.
-        .fd_pc_full_dbg_o      (),
-        .fd_instr_dbg_o        (),
-        .fd_valid_dbg_o        (),
-        .fd_is_compressed_dbg_o(),
-        .next_pc_dbg_o         ()
+        .fe_pc_dbg_o           (cpu_pc_dbg),
+        .fe_instr_dbg_o        (),
+        .fe_valid_dbg_o        (),
+        .fe_is_compressed_dbg_o(),
+        .fe_next_pc_dbg_o      (),
+        // de_* debug taps (decode): likewise unused on the board, swept
+        // by synthesis, consumed by the simulation wrapper.
+        .de_valid_dbg_o        (),
+        .de_pc_dbg_o           (),
+        .de_instr_dbg_o        (),
+        .de_is_compressed_dbg_o(),
+        .de_rs1_addr_dbg_o     (),
+        .de_rs2_addr_dbg_o     (),
+        .de_rs1_data_dbg_o     (),
+        .de_rs2_data_dbg_o     (),
+        .de_imm_dbg_o          (),
+        .de_rd_dbg_o           (),
+        .de_reg_write_dbg_o    (),
+        .de_alu_op_dbg_o       (),
+        .de_alu_src_a_dbg_o    (),
+        .de_alu_src_b_dbg_o    (),
+        .de_mem_read_dbg_o     (),
+        .de_mem_write_dbg_o    (),
+        .de_mem_size_dbg_o     (),
+        .de_mem_unsigned_dbg_o (),
+        .de_wb_src_dbg_o       (),
+        .de_branch_type_dbg_o  (),
+        .de_illegal_dbg_o      ()
     );
 
     // -----------------------------------------------------------------
@@ -101,9 +126,9 @@ module top_module (
     assign axi_bus_peri.rresp   = 2'b00;
 
     // -----------------------------------------------------------------
-    // Debug LEDs: F/D PC low nibble. Keeps the design observable so
+    // Debug LEDs: fetch PC low nibble. Keeps the design observable so
     // the synthesizer doesn't sweep the fetch stage away.
     // -----------------------------------------------------------------
-    assign led_o                = cpu_pc_dbg;
+    assign led_o                = cpu_pc_dbg[3:0];
 
 endmodule

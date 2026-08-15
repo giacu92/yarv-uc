@@ -43,4 +43,112 @@ package rv32_pkg;
         return req.wvalid && rsp.wready;
     endfunction
 
+    // ---------------------------------------------------------------
+    // Decode: opcodes, ALU/branch/source enums, and the D/E control
+    // struct. Phase 1 decodes RV32I + M + C; the A (LSU), Zicsr (CSR
+    // file) and Zifencei (fence) opcodes are present here so the
+    // decoder can flag them illegal, but they are not executed yet.
+    // ---------------------------------------------------------------
+
+    // Major opcodes (instr[6:0]).
+    localparam logic [6:0] OPC_LUI      = 7'b0110111;
+    localparam logic [6:0] OPC_AUIPC    = 7'b0010111;
+    localparam logic [6:0] OPC_JAL      = 7'b1101111;
+    localparam logic [6:0] OPC_JALR     = 7'b1100111;
+    localparam logic [6:0] OPC_BRANCH   = 7'b1100011;
+    localparam logic [6:0] OPC_LOAD     = 7'b0000011;
+    localparam logic [6:0] OPC_STORE    = 7'b0100011;
+    localparam logic [6:0] OPC_OP_IMM   = 7'b0010011;
+    localparam logic [6:0] OPC_OP       = 7'b0110011;  // M is OPC_OP with funct7=0000001
+    localparam logic [6:0] OPC_MISC_MEM = 7'b0001111;  // fence / fence.i (Zifencei) -> illegal
+    localparam logic [6:0] OPC_SYSTEM   = 7'b1110011;  // CSR / ecall / ebreak (Zicsr) -> illegal
+
+    // ALU operation (base RV32I + M extension). 18 values -> 5 bits.
+    typedef enum logic [4:0] {
+        ALU_ADD,
+        ALU_SUB,
+        ALU_SLL,
+        ALU_SLT,
+        ALU_SLTU,
+        ALU_XOR,
+        ALU_SRL,
+        ALU_SRA,
+        ALU_OR,
+        ALU_AND,
+        // M extension (funct7 == 0000001)
+        ALU_MUL,
+        ALU_MULH,
+        ALU_MULHSU,
+        ALU_MULHU,
+        ALU_DIV,
+        ALU_DIVU,
+        ALU_REM,
+        ALU_REMU
+    } alu_op_t;
+
+    // Branch / jump type (JAL/JALR encoded here too — no separate flags).
+    typedef enum logic [3:0] {
+        BR_NONE,
+        BR_BEQ,
+        BR_BNE,
+        BR_BLT,
+        BR_BGE,
+        BR_BLTU,
+        BR_BGEU,
+        BR_JAL,
+        BR_JALR
+    } branch_t;
+
+    // ALU operand-A source.
+    typedef enum logic [0:0] {
+        ALU_A_RS1,
+        ALU_A_PC
+    } alu_src_a_t;
+    // ALU operand-B source.
+    typedef enum logic [1:0] {
+        ALU_B_IMM,
+        ALU_B_RS2,
+        ALU_B_PC4,
+        ALU_B_ZERO
+    } alu_src_b_t;
+    // Write-back source.
+    typedef enum logic [1:0] {
+        WB_ALU,
+        WB_MEM,
+        WB_PC4
+    } wb_src_t;
+    // Memory access size.
+    typedef enum logic [1:0] {
+        MS_B,
+        MS_H,
+        MS_W
+    } mem_size_t;
+
+    // D/E pipeline register: everything decode produces for a (future)
+    // execute stage. Single-direction packed struct, legal as one port
+    // (matches the mem_req_t / mem_rsp_t convention).
+    typedef struct packed {
+        logic            valid;          // a decoded instr is held this cycle
+        logic [XLEN-1:0] pc;             // instr PC (P for low/32-bit, P+2 for upper half)
+        logic [XLEN-1:0] instr;          // 32-bit word decode treated (native or RVC-expanded)
+        logic            is_compressed;  // source was a 16-bit RVC instr
+        logic [4:0]      rs1_addr;
+        logic [4:0]      rs2_addr;
+        logic [XLEN-1:0] rs1_data;       // operand captured at decode (async read)
+        logic [XLEN-1:0] rs2_data;
+        logic [XLEN-1:0] imm;            // sign-extended I/S/B/U/J immediate
+        logic [4:0]      rd;
+        logic            reg_write;      // write back to rd
+        alu_op_t         alu_op;
+        alu_src_a_t      alu_src_a;
+        alu_src_b_t      alu_src_b;
+        logic            mem_read;
+        logic            mem_write;
+        mem_size_t       mem_size;
+        logic            mem_unsigned;   // load zero-extend (LBU/LHU)
+        wb_src_t         wb_src;
+        branch_t         branch_type;
+        logic            illegal;        // opcode/encoding not decoded this phase
+    } de_t;
+
 endpackage

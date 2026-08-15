@@ -30,15 +30,22 @@ import rv32_pkg::*;
  *   - Steady-state throughput ~2 cycles/instruction (the bridge
  *     round-trip floor: 1 issue + 1 response cycle).
  *
+ * Debug-tap convention: every pipeline stage exposes the PC it is
+ * treating, the instruction word, a valid, and any other useful debug
+ * as outputs prefixed by a stage sigil (fe = fetch, de = decode, ex =
+ * execute, ...). This stage's outputs are the F/D pipeline register,
+ * so they carry the `fe_` sigil: fe_pc_o / fe_instr_o / fe_valid_o /
+ * fe_is_compressed_o, plus fe_next_pc_o (the next fetch address).
+ *
  * Registers:
  *   - pc_q     : next fetch address (runs ahead; redirect overwrites
  *                it with the branch target).
  *   - req_pc_q : address of the in-flight fetch; stamped on the F/D
- *                register at capture so fd_pc_o is EXACT.
+ *                register at capture so fe_pc_o is EXACT.
  *   - busy_q   : a fetch is in flight.
  *   - flushed_q: a redirect killed the in-flight fetch; the next
  *                response must be drained and discarded.
- *   - fd_*     : F/D pipeline register; fd_valid_o is a HELD level
+ *   - fe_*     : F/D pipeline register; fe_valid_o is a HELD level
  *                (high from a fresh capture until decode consumes it
  *                via !stall_i, or a redirect kills it).
  *
@@ -55,15 +62,17 @@ import rv32_pkg::*;
  * fetches 32-bit words and advances by 4. A compressed instruction in
  * the low half of a word means the next instruction is the upper half
  * of the SAME word (handled by decode), so the next fetch is always
- * the next word (+4). fd_is_compressed_o is computed for decode.
+ * the next word (+4). fe_is_compressed_o is computed for decode.
  *
- * next_pc_o: the next fetch address (pc_q), for debug.
+ * fe_next_pc_o: the next fetch address (pc_q), for debug.
  *
  * Naming: ports use *_i/_o; internal signals have no prefix (they are
  * neither inputs nor outputs). Flop registers end in _q, their
- * next-state combinational counterparts in _d.
+ * next-state combinational counterparts in _d. The F/D register flops
+ * carry the `fe_` sigil to identify them as the fetch stage's output
+ * register (and to disambiguate fe_pc_q from pc_q, the next-fetch
+ * address).
  */
-
 module fetch_stage (
     input wire clk_i,
     input wire rstn_i,
@@ -80,14 +89,14 @@ module fetch_stage (
     output mem_req_t imem_req_o,
     input  mem_rsp_t imem_rsp_i,
 
-    // The next fetch address (debug).
-    output wire [XLEN-1:0] next_pc_o,
-
-    // F/D pipeline register outputs (consumed by decode)
-    output wire [XLEN-1:0] fd_instr_o,
-    output wire [XLEN-1:0] fd_pc_o,
-    output wire            fd_valid_o,
-    output wire            fd_is_compressed_o
+    // fe_* debug taps (the F/D pipeline register is this stage's output).
+    // Each pipeline stage exposes pc / instr / valid + debug prefixed by
+    // its stage sigil (fe = fetch).
+    output wire [XLEN-1:0] fe_next_pc_o,       // next fetch address (pc_q)
+    output wire [XLEN-1:0] fe_instr_o,         // F/D instruction word
+    output wire [XLEN-1:0] fe_pc_o,            // F/D instruction PC (exact)
+    output wire            fe_valid_o,         // F/D valid (held level)
+    output wire            fe_is_compressed_o  // rdata[1:0] != 2'b11
 );
 
     // -----------------------------------------------------------------
@@ -98,10 +107,10 @@ module fetch_stage (
     logic busy_q, busy_d;  // fetch in flight
     logic flushed_q, flushed_d;  // in-flight fetch is to be dropped
 
-    logic fd_valid_q, fd_valid_d;
-    logic [XLEN-1:0] fd_pc_q, fd_pc_d;
-    logic [XLEN-1:0] fd_instr_q, fd_instr_d;
-    logic fd_is_compressed_q, fd_is_compressed_d;
+    logic fe_valid_q, fe_valid_d;
+    logic [XLEN-1:0] fe_pc_q, fe_pc_d;
+    logic [XLEN-1:0] fe_instr_q, fe_instr_d;
+    logic fe_is_compressed_q, fe_is_compressed_d;
 
     // -----------------------------------------------------------------
     // Native interface outputs
@@ -112,7 +121,7 @@ module fetch_stage (
     always_comb begin
         // Accept read data when the F/D register has room, or drain a
         // flushed (redirected) response to free the bridge.
-        imem_req_o.rready = !fd_valid_q || flushed_q;
+        imem_req_o.rready = !fe_valid_q || flushed_q;
 
         // Issue a fetch when idle and not redirecting this cycle.
         imem_req_o.wvalid = !busy_q && !branch_valid_i;
@@ -122,7 +131,7 @@ module fetch_stage (
         imem_req_o.wstrb  = '0;
     end
 
-    assign next_pc_o = pc_q;
+    assign fe_next_pc_o = pc_q;
 
     wire launch = imem_req_o.wvalid && imem_rsp_i.wready;  // req accepted
     wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready;  // read data consumed
@@ -136,14 +145,14 @@ module fetch_stage (
         flushed_d          = flushed_q;
         pc_d               = pc_q;
         req_pc_d           = req_pc_q;
-        fd_valid_d         = fd_valid_q;
-        fd_pc_d            = fd_pc_q;
-        fd_instr_d         = fd_instr_q;
-        fd_is_compressed_d = fd_is_compressed_q;
+        fe_valid_d         = fe_valid_q;
+        fe_pc_d            = fe_pc_q;
+        fe_instr_d         = fe_instr_q;
+        fe_is_compressed_d = fe_is_compressed_q;
 
         if (branch_valid_i) begin
             // ---- Redirect (highest priority) ----
-            fd_valid_d = 1'b0;  // kill stale F/D
+            fe_valid_d = 1'b0;  // kill stale F/D
             pc_d       = branch_addr_i;  // next fetch -> target
             if (busy_q) begin
                 if (rsp_cap) begin
@@ -174,20 +183,20 @@ module fetch_stage (
                     flushed_d = 1'b0;
                     busy_d    = 1'b0;
                 end else begin
-                    // Capture with the *in-flight* pc (req_pc_q) => fd_pc exact.
-                    fd_valid_d         = 1'b1;
-                    fd_pc_d            = req_pc_q;
-                    fd_instr_d         = imem_rsp_i.rdata;
-                    fd_is_compressed_d = (imem_rsp_i.rdata[1:0] != 2'b11);
+                    // Capture with the *in-flight* pc (req_pc_q) => fe_pc exact.
+                    fe_valid_d         = 1'b1;
+                    fe_pc_d            = req_pc_q;
+                    fe_instr_d         = imem_rsp_i.rdata;
+                    fe_is_compressed_d = (imem_rsp_i.rdata[1:0] != 2'b11);
                     busy_d             = 1'b0;
                 end
             end
 
             // Consume the F/D register (decode accepts). Mutually
-            // exclusive with capture: capture needs rready = !fd_valid_q
-            // (F/D empty); consume needs fd_valid_q (F/D full).
-            if (fd_valid_q && !stall_i) begin
-                fd_valid_d = 1'b0;
+            // exclusive with capture: capture needs rready = !fe_valid_q
+            // (F/D empty); consume needs fe_valid_q (F/D full).
+            if (fe_valid_q && !stall_i) begin
+                fe_valid_d = 1'b0;
             end
         end
     end
@@ -201,25 +210,25 @@ module fetch_stage (
             req_pc_q           <= '0;
             busy_q             <= 1'b0;
             flushed_q          <= 1'b0;
-            fd_valid_q         <= 1'b0;
-            fd_pc_q            <= '0;
-            fd_instr_q         <= '0;
-            fd_is_compressed_q <= 1'b0;
+            fe_valid_q         <= 1'b0;
+            fe_pc_q            <= '0;
+            fe_instr_q         <= '0;
+            fe_is_compressed_q <= 1'b0;
         end else begin
             pc_q               <= pc_d;
             req_pc_q           <= req_pc_d;
             busy_q             <= busy_d;
             flushed_q          <= flushed_d;
-            fd_valid_q         <= fd_valid_d;
-            fd_pc_q            <= fd_pc_d;
-            fd_instr_q         <= fd_instr_d;
-            fd_is_compressed_q <= fd_is_compressed_d;
+            fe_valid_q         <= fe_valid_d;
+            fe_pc_q            <= fe_pc_d;
+            fe_instr_q         <= fe_instr_d;
+            fe_is_compressed_q <= fe_is_compressed_d;
         end
     end
 
-    assign fd_pc_o            = fd_pc_q;
-    assign fd_instr_o         = fd_instr_q;
-    assign fd_valid_o         = fd_valid_q;
-    assign fd_is_compressed_o = fd_is_compressed_q;
+    assign fe_pc_o            = fe_pc_q;
+    assign fe_instr_o         = fe_instr_q;
+    assign fe_valid_o         = fe_valid_q;
+    assign fe_is_compressed_o = fe_is_compressed_q;
 
 endmodule

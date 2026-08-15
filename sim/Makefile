@@ -1,7 +1,7 @@
-# Verilator simulation for the RV32 fetch subsystem.
+# Verilator simulation for the RV32 fetch + decode subsystem.
 #
 #   make          build the sim binary (obj_dir/Vsim_top)
-#   make run      build + run, prints the fetch log
+#   make run      build + run, prints the fetch + decode logs
 #   make wave     open the VCD in gtkwave (if installed)
 #   make clean    remove build artefacts + waveforms
 #
@@ -14,6 +14,8 @@ RTL := \
 	../src/rtl/bus/axi4_lite_if.sv \
 	../src/rtl/bus/axi4_lite_master_bridge.sv \
 	../src/rtl/core/fetch_stage.sv \
+	../src/rtl/core/reg_file.sv \
+	../src/rtl/core/decode_stage.sv \
 	../src/rtl/core/rv32imac_zicsr_zifencei.sv \
 	../src/rtl/utils/axi4_lite_ram.sv \
 	sim_top.sv
