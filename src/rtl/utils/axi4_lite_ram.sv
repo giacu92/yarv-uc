@@ -3,18 +3,39 @@
 `default_nettype none
 
 /*
- * AXI4-Lite slave single-beat RAM.
+ * AXI4-Lite slave single-beat RAM (protocol-compliant).
  *
  * Byte-addressed, parameterised depth (2^ADDR_W bytes), data width fixed
- * by the interface DATA_WIDTH. No bursts: awlen/arlen ignored (slave
- * always treats each transfer as a single beat).
+ * by the interface DATA_WIDTH. No bursts: AXI4-Lite has no len/id signals,
+ * so every transfer is a single beat.
  *
- * Read latency: 1 cycle (registered).
- * Write response: combinational bvalid asserted the same cycle AW and W
- * both hand-shake.
+ * Write path:
+ *   - AW and W are independent channels and may arrive in either order.
+ *     Each is captured into its own holding register (aw_seen_q / w_seen_q);
+ *     the transaction completes the cycle BOTH have been seen, the BRAM
+ *     write fires, and BVALID is raised.
+ *   - BVALID is REGISTERED and held high until the B channel handshakes
+ *     (bvalid && bready). This is the AXI rule "VALID must remain asserted
+ *     until the handshake" and is the key compliance point.
+ *   - Single outstanding: while BVALID is pending (bvalid_q=1) both
+ *     AWREADY and WREADY are low, so no second write is accepted until the
+ *     current B response is consumed.
+ *
+ * Read path (1-cycle registered latency):
+ *   - ARREADY is asserted when no unread response is being held (or the
+ *     master is draining the current one). It depends only on registers
+ *     and RREADY, never on ARVALID.
+ *   - On the AR handshake the BRAM read is launched (registered), RVALID
+ *     raised the next cycle, and held until RREADY.
  *
  * The storage array uses (* ram_style = "block" *) so the Gowin
- * synthesizer infers BSRAM.
+ * synthesizer infers a simple dual-port BSRAM (one write port + one
+ * read port, single clock). Byte-strobed writes use the BSRAM byte
+ * enables.
+ *
+ * Reset is synchronous (matches the bus layer: axi4_lite_master_bridge),
+ * active-low. The memory contents are NOT reset (BRAM has no reset); only
+ * the control / response registers are.
  *
  * Naming: ports use *_i/_o; internal signals have no prefix. Flop
  * registers end in _q, their next-state counterparts in _d. Localparams
@@ -38,14 +59,15 @@ module axi4_lite_ram #(
     // -----------------------------------------------------------------
     localparam int DATA_W      = axi.DATA_WIDTH;
     localparam int STRB_W      = DATA_W / 8;
-    localparam int DEPTH       = 1 << ADDR_W;
-    localparam int WORD_ADDR_W = ADDR_W - $clog2(STRB_W);
+    localparam int BYTES_W     = $clog2(STRB_W);    // byte-select bits
+    localparam int WORD_ADDR_W = ADDR_W - BYTES_W;
+    localparam int DEPTH_WORDS = 1 << WORD_ADDR_W;  // addressable words
 
     // -----------------------------------------------------------------
-    // Storage
+    // Storage (BRAM)
     // -----------------------------------------------------------------
     (* ram_style = "block" *)
-    logic [DATA_W-1:0] mem[DEPTH];
+    logic [DATA_W-1:0] mem[DEPTH_WORDS];
 
     // Optional preload (simulation / bitstream init)
     initial begin
@@ -55,134 +77,138 @@ module axi4_lite_ram #(
     end
 
     // -----------------------------------------------------------------
-    // Address decoding
+    // Address decoding (byte address -> word index)
     // -----------------------------------------------------------------
-    // AXI addresses are byte addresses; we index the word-addressed array.
-    wire [WORD_ADDR_W-1:0] waddr_word = axi.awaddr[ADDR_W-1:$clog2(STRB_W)];
-    wire [WORD_ADDR_W-1:0] raddr_word = axi.araddr[ADDR_W-1:$clog2(STRB_W)];
+    wire  [WORD_ADDR_W-1:0] aw_word = axi.awaddr[ADDR_W-1:BYTES_W];
+    wire  [WORD_ADDR_W-1:0] ar_word = axi.araddr[ADDR_W-1:BYTES_W];
 
-    // -----------------------------------------------------------------
+    // =================================================================
     // Write path
-    // -----------------------------------------------------------------
-    // AW and W can handshake independently; we capture both and assert
-    // bvalid the cycle the second one arrives.
-    logic aw_seen_q, aw_seen_d;
-    logic [WORD_ADDR_W-1:0] aw_word_q, aw_word_d;
-    logic [STRB_W-1:0] wstrb_q, wstrb_d;
-    logic [DATA_W-1:0] wdata_q, wdata_d;
+    // =================================================================
+    // Holding registers for the two independent write address / data
+    // phases. Either may arrive first; the transaction completes once
+    // both have been seen (and no B response is pending -> single
+    // outstanding).
+    logic                   aw_seen_q;
+    logic                   w_seen_q;
+    logic [WORD_ADDR_W-1:0] aw_word_q;
+    logic [     STRB_W-1:0] wstrb_q;
+    logic [     DATA_W-1:0] wdata_q;
 
-    wire aw_hs = axi.awvalid && axi.awready;
-    wire w_hs = axi.wvalid && axi.wready;
+    // Registered, held write-response valid.
+    logic                   bvalid_q;
 
-    always_comb begin
-        // Defaults
-        axi.awready = 1'b0;
-        axi.wready  = 1'b0;
-        axi.bvalid  = 1'b0;
-        axi.bresp   = 2'b00;
+    // READY outputs: register-based, NEVER depend on the same-channel
+    // VALID (AXI requirement). Held low while a B response is pending
+    // (single outstanding).
+    assign axi.awready = !aw_seen_q && !bvalid_q;
+    assign axi.wready  = !w_seen_q && !bvalid_q;
 
-        aw_seen_d   = aw_seen_q;
-        aw_word_d   = aw_word_q;
-        wstrb_d     = wstrb_q;
-        wdata_d     = wdata_q;
+    wire                   aw_hs = axi.awvalid && axi.awready;
+    wire                   w_hs = axi.wvalid && axi.wready;
 
-        // Address phase
-        if (!aw_seen_q) begin
-            axi.awready = 1'b1;
-            if (aw_hs) begin
-                aw_seen_d = 1'b1;
-                aw_word_d = waddr_word;
-            end
-        end
+    // A phase "is present" this cycle if it was captured earlier OR it
+    // handshakes right now (lets AW and W arriving the same cycle complete
+    // in a single cycle).
+    wire                   aw_present = aw_seen_q || aw_hs;
+    wire                   w_present = w_seen_q || w_hs;
+    wire                   do_write = aw_present && w_present && !bvalid_q;
 
-        // Data phase: only accept W once AW has been captured.
-        if (aw_seen_q) begin
-            axi.wready = 1'b1;
-            if (w_hs) begin
-                wstrb_d     = axi.wstrb;
-                wdata_d     = axi.wdata;
-                // B valid as soon as both AW and W have been seen in the
-                // same transaction (the W handshake is the second event).
-                axi.bvalid  = 1'b1;
-                axi.awready = 1'b1;  // accept next AW immediately
-                aw_seen_d   = 1'b0;  // transaction complete
-            end
-        end
-    end
+    // Effective write operands: take the live channel value when it
+    // handshakes this cycle, else the held value from the earlier phase.
+    wire [WORD_ADDR_W-1:0] waddr_eff = aw_hs ? aw_word : aw_word_q;
+    wire [     DATA_W-1:0] wdata_eff = w_hs ? axi.wdata : wdata_q;
+    wire [     STRB_W-1:0] wstrb_eff = w_hs ? axi.wstrb : wstrb_q;
 
-    // BREADY just gates the bvalid hold (no skid).
-    wire b_fire = axi.bvalid && axi.bready;
+    // B response: registered, held until bready (compliant). bresp is
+    // always OKAY (no decode errors on this RAM).
+    assign axi.bvalid = bvalid_q;
+    assign axi.bresp  = 2'b00;  // OKAY
+    wire b_hs = axi.bvalid && axi.bready;
 
-    always_ff @(posedge clk_i or negedge rstn_i) begin
+    always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             aw_seen_q <= 1'b0;
+            w_seen_q  <= 1'b0;
             aw_word_q <= '0;
-            wstrb_q   <= 1'b0;
-            wdata_q   <= 1'b0;
+            wstrb_q   <= '0;
+            wdata_q   <= '0;
+            bvalid_q  <= 1'b0;
         end else begin
-            aw_seen_q <= aw_seen_d;
-            aw_word_q <= aw_word_d;
-            wstrb_q   <= wstrb_d;
-            wdata_q   <= wdata_d;
+            // Capture each phase independently when it handshakes.
+            if (aw_hs) begin
+                aw_seen_q <= 1'b1;
+                aw_word_q <= aw_word;
+            end
+            if (w_hs) begin
+                w_seen_q <= 1'b1;
+                wstrb_q  <= axi.wstrb;
+                wdata_q  <= axi.wdata;
+            end
+
+            // Both phases present: complete the transaction. Clear the
+            // holding flags (overrides any capture above when AW and W
+            // land together) and raise BVALID. BVALID stays high until
+            // the B handshake below clears it.
+            if (do_write) begin
+                aw_seen_q <= 1'b0;
+                w_seen_q  <= 1'b0;
+                bvalid_q  <= 1'b1;
+            end
+
+            // B channel handshake: drop BVALID. (If do_write and b_hs
+            // were both possible the same cycle they are not: bvalid_q
+            // must be 0 for do_write, and b_hs needs bvalid_q=1.)
+            if (b_hs) begin
+                bvalid_q <= 1'b0;
+            end
         end
     end
 
-    // Write enable to the BRAM, registered, byte-strobed.
-    logic                   mem_we_q;
-    logic [WORD_ADDR_W-1:0] mem_waddr_q;
-    logic [     DATA_W-1:0] mem_wdata_q;
-    logic [     STRB_W-1:0] mem_wstrb_q;
-
+    // Synchronous byte-strobed BRAM write (fires the cycle both phases
+    // are present). Registered write port -> infers BSRAM.
     always_ff @(posedge clk_i) begin
-        mem_we_q    <= w_hs && aw_seen_q;
-        mem_waddr_q <= aw_word_q;
-        mem_wdata_q <= wdata_d;
-        mem_wstrb_q <= wstrb_d;
-    end
-
-    always_ff @(posedge clk_i) begin
-        if (mem_we_q) begin
+        if (do_write) begin
             for (integer i = 0; i < STRB_W; i++) begin
-                if (mem_wstrb_q[i]) begin
-                    mem[mem_waddr_q][8*i+:8] <= mem_wdata_q[8*i+:8];
+                if (wstrb_eff[i]) begin
+                    mem[waddr_eff][8*i+:8] <= wdata_eff[8*i+:8];
                 end
             end
         end
     end
 
-    // -----------------------------------------------------------------
+    // =================================================================
     // Read path (1-cycle registered latency)
-    // -----------------------------------------------------------------
+    // =================================================================
     logic              rvalid_q;
     logic [DATA_W-1:0] rdata_q;
 
-    wire               ar_hs = axi.arvalid && axi.arready;
+    // ARREADY: accept a new AR when no unread response is held, or while
+    // the master is draining the current one (back-to-back reads).
+    // Register + RREADY based only -> no ARVALID dependency, no comb loop.
+    assign axi.arready = !rvalid_q || (rvalid_q && axi.rready);
 
-    always_comb begin
-        // Default: not ready to accept a new AR.
-        axi.arready = 1'b0;
-        // Accept AR whenever the read data register is free (not holding
-        // an unread response, or the master is draining the current one).
-        if (!rvalid_q || (rvalid_q && axi.rready)) begin
-            axi.arready = 1'b1;
-        end
+    wire ar_hs = axi.arvalid && axi.arready;
 
-        axi.rvalid = rvalid_q;
-        axi.rdata  = rdata_q;
-        axi.rresp  = 2'b00;
-    end
+    // R response: registered, held until RREADY. rresp is always OKAY.
+    assign axi.rvalid = rvalid_q;
+    assign axi.rdata  = rdata_q;
+    assign axi.rresp  = 2'b00;  // OKAY
 
-    always_ff @(posedge clk_i or negedge rstn_i) begin
+    always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             rvalid_q <= 1'b0;
             rdata_q  <= '0;
         end else begin
             if (ar_hs) begin
-                // Latch new read data; rvalid stays high until master rready.
+                // Launch the BRAM read; data is registered and RVALID
+                // raised next cycle. If a response was still being held
+                // it is consumed by rready this same cycle (arready was
+                // high only because rready was), so overwriting is safe.
                 rvalid_q <= 1'b1;
-                rdata_q  <= mem[raddr_word];
-            end else if (axi.rready) begin
-                // Master consumed the response; clear rvalid.
+                rdata_q  <= mem[ar_word];
+            end else if (rvalid_q && axi.rready) begin
+                // Master consumed the response; drop RVALID.
                 rvalid_q <= 1'b0;
             end
         end

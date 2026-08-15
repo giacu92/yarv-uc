@@ -50,7 +50,7 @@ Timing — `src/phys/rv32imac_Zicsr_Zifencei.sdc` (only applied if passed via `-
 - Primary clock `clk27` at 27 MHz on `clk_i` (period 37.037 ns).
 - `rstn_i` (false-path-from) and `led_o[*]` (false-path-to) marked non-timing-critical.
 
-There are **no unit tests and no lint config** in the repo. A **Verilator** functional sim harness lives in `sim/` (see **Simulation** below); it exercises the implemented fetch + decode + bridge + RAM logic.
+There is **no lint config** in the repo. A **Verilator** functional sim harness lives in `sim/` (see **Simulation** below); it exercises the implemented fetch + decode + bridge + RAM logic. A separate **AXI4-Lite RAM protocol-compliance test** lives in `sim/ram_tb/` (see **Simulation** below); it drives the RAM slave directly as a master and verifies the B/R channel handshake rules.
 
 ## Simulation (Verilator)
 
@@ -69,6 +69,18 @@ cd sim && make run
 ```
 
 Build artefacts (`sim/obj_dir/`, `*.vcd`, `*.log`) are gitignored.
+
+### AXI4-Lite RAM compliance test (`sim/ram_tb/`)
+
+A second, independent Verilator harness that does **not** use the CPU — it instantiates `axi4_lite_ram` alone and drives it as an AXI4-Lite master from C++ (`ram_tb.cpp` is a small cycle-accurate BFM). It verifies the RAM's **protocol compliance**, which the main sim cannot (the CPU has no LSU/writeback, so it never writes to the RAM):
+
+- `sim/ram_tb/ram_tb.sv` — wrapper that breaks the `axi4_lite_if` out to flat master-side ports for the C++ BFM.
+- `sim/ram_tb/ram_tb.cpp` — BFM + checks. Key checks: **BVALID is registered and held high while BREADY is deliberately kept low for several cycles** (the fix that made the RAM compliant — the old combinational BVALID would have dropped here); AW-first and W-first orderings; byte-strobed partial writes read back correctly; back-to-back writes; **single outstanding** (AWREADY/WREADY low while B pending); RVALID held while RREADY delayed.
+- `sim/ram_tb/Makefile` — `make run` builds `obj_dir/Vram_tb` and runs it; exits non-zero on any check failure.
+
+```bash
+cd sim/ram_tb && make run     # prints "N checks, 0 failures" on success
+```
 
 ## Code formatting (Verible)
 
@@ -104,7 +116,7 @@ Built bottom-up; fetch and decode are implemented, execute onward is not yet pre
 - **`src/rtl/core/top_module.sv`** — board top. Wires CPU `imem_axi` → `axi4_lite_ram` slave on `axi_bus_imem`; routes `peri_axi` to `axi_bus_peri` with the slave side tied off (all `*ready=0`/`*valid=0`) so a future peripheral drops in without rewiring. The CPU's full `fe_*`/`de_*` debug taps are left unconnected here (swept by synthesis); the sim wrapper (`sim/sim_top.sv`) consumes them. `led_o` = `fe_pc_dbg_o[3:0]`.
 - **`src/rtl/bus/axi4_lite_if.sv`** — SystemVerilog interface (32-bit addr/data) with `master`, `slave`, and `trunk` modports. `aclk`/`aresetn` are driven into the trunk from the board top.
 - **`src/rtl/bus/axi4_lite_master_bridge.sv`** — native `mem_req_t`/`mem_rsp_t` (direction-split) → AXI4-Lite AR/AW/W + R/B. Single shared FSM (`S_IDLE`/`S_RD_WAIT`/`S_WR_ADDR`/`S_WR_DATA`/`S_WR_WAIT`) — **single outstanding overall** (read OR write, not both). `rsp_o.wready = (state_q == S_IDLE)` is the launch handshake from the producer's side. **Read path**: in `S_RD_WAIT` the master's `req_i.rready` is forwarded straight to `axi.rready`, so the AXI slave holds `rvalid`/`rdata` until the master can accept; `rsp_o.rvalid = r_hs` the cycle data is consumed. For writes, AW+W launch in lock-step; on `b_hs` → `S_IDLE`. **Write retirement is not signalled back** (no `bvalid` in `mem_rsp_t` yet — TODO LSU); `bready` held high.
-- **`src/rtl/utils/axi4_lite_ram.sv`** — AXI4-Lite slave single-beat RAM, `(* ram_style = "block" *)` (infers BSRAM on Gowin). Params: `ADDR_W` (byte-addressed depth = 2^ADDR_W bytes) and optional `INIT_FILE` for `$readmemh`. Read latency 1 cycle (registered); `bvalid` asserted the cycle W handshakes (after AW captured). Byte-strobed writes. Wired as the `axi_bus_imem` slave.
+- **`src/rtl/utils/axi4_lite_ram.sv`** — AXI4-Lite slave single-beat RAM, **protocol-compliant** (verified by `sim/ram_tb/`). `(* ram_style = "block" *)` (infers a simple dual-port BSRAM on Gowin: one write port + one read port, single clock). Params: `ADDR_W` (byte-addressed depth = 2^ADDR_W bytes) and optional `INIT_FILE` for `$readmemh`. **Write path**: AW and W are independent channels and may arrive in either order (each captured into its own holding register, `aw_seen_q`/`w_seen_q`); the transaction completes the cycle both are seen, the BSRAM write fires, and **BVALID is registered and held high until the B handshake** (`bvalid && bready`) — this is the AXI "VALID stays asserted until the handshake" rule and the key compliance point (a previous version had a combinational one-cycle BVALID that only worked because the master bridge holds `bready` high; that was non-compliant). **Single outstanding**: while BVALID is pending, `awready`/`wready` are low. **Read path**: 1-cycle registered latency; `arready` depends only on registers + `rready` (never `arvalid`); RVALID registered and held until `rready`. READY outputs never depend on the same-channel VALID. Synchronous active-low reset (matches the bus layer; memory contents are not reset). Byte-strobed writes use the BSRAM byte enables. Wired as the `axi_bus_imem` slave.
 
 ### Fetch stage behaviour (current)
 
