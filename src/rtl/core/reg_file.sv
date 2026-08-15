@@ -45,7 +45,7 @@ module reg_file (
     // -----------------------------------------------------------------
     // Write (sync, whole word, x0 ignored)
     // -----------------------------------------------------------------
-    always_ff @(posedge clk_i or negedge rstn_i) begin
+    always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             for (integer i = 0; i < 32; i++) begin
                 regs[i] <= '0;

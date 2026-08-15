@@ -204,7 +204,7 @@ module fetch_stage (
     // -----------------------------------------------------------------
     // Sequential
     // -----------------------------------------------------------------
-    always_ff @(posedge clk_i or negedge rstn_i) begin
+    always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             pc_q               <= boot_addr_i;
             req_pc_q           <= '0;

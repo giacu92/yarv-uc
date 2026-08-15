@@ -839,7 +839,7 @@ module decode_stage (
     // =================================================================
     // Sequential
     // =================================================================
-    always_ff @(posedge clk_i or negedge rstn_i) begin
+    always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             hold_q      <= 1'b0;
             hold_word_q <= 32'd0;

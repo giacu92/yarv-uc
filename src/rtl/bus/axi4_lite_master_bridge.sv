@@ -160,7 +160,7 @@ module axi4_lite_master_bridge (
         endcase
     end
 
-    always_ff @(posedge clk_i or negedge rstn_i) begin
+    always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             state_q <= S_IDLE;
         end else begin
