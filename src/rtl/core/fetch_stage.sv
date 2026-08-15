@@ -9,30 +9,55 @@ import rv32_pkg::*;
  *
  * Owns the PC and exposes a small native interface for instruction
  * memory access. The stage does NOT drive any bus protocol — it just
- * publishes a request every cycle (the external bridge turns it into
- * AXI4-Lite or whatever the system bus is).
+ * publishes a request when it needs an instruction; the on-die
+ * axi4_lite_master_bridge turns it into AXI4-Lite.
  *
- * Behaviour:
- *   - pc_q: the address of the current fetch (registered).
- *   - pc_d = pc_q + 4 by default; can be replaced by `next_pc_d` when
- *     a redirect is in flight (see stall_i / branch_valid_i below).
- *   - imem_req_o.valid = 1 every cycle (continuous fetching). The
- *     external bridge is responsible for back-pressure: if it cannot
- *     accept a request this cycle, it must hold ready low AND stall
- *     the fetch stage via `stall_i` so the request stays pending.
- *   - imem_rsp_i.valid is high for exactly one cycle when the
- *     instruction arrives; that cycle's rdata is captured into the
- *     F/D pipeline register as fd_instr_o.
+ * Native interface (valid/ready su entrambi i lati, vedi rv32_pkg):
+ *   - Request launch:  imem_req_o.wvalid && imem_rsp_i.wready.
+ *   - Read response:   imem_rsp_i.rvalid && imem_req_o.rready.
  *
- * Forward-compat inputs (currently tied off in the CPU top):
- *   - stall_i: hold the PC and request; useful for hazard / multi-cycle.
- *   - branch_valid_i + branch_addr_i: on the next cycle, use
- *     branch_addr_i as the new PC (flushes the in-flight fetch).
+ * Single-outstanding overlap-prefetch:
+ *   - At most one fetch in flight (busy_q). The bridge is single
+ *     outstanding, so this matches it 1:1.
+ *   - As soon as a fetch response is captured into the F/D register,
+ *     the next fetch is launched while decode consumes the current
+ *     instruction from the F/D register — fetch runs ahead of decode.
+ *   - If decode is slower than memory and the next response arrives
+ *     while the F/D register is still full, rready is held low: the
+ *     bridge (and the AXI slave) hold rvalid/rdata until decode frees
+ *     the F/D register. No skid buffer is needed (single outstanding
+ *     => nothing queues behind the waiting response).
+ *   - Steady-state throughput ~2 cycles/instruction (the bridge
+ *     round-trip floor: 1 issue + 1 response cycle).
  *
- * next_pc_o: the PC value that the fetch stage WANTS to use next cycle
- * (i.e. pc_d, the result of `pc_q + 4` or the redirect target). The
- * external bridge can compare this against the response address to
- * detect pipeline flushes if it wants.
+ * Registers:
+ *   - pc_q     : next fetch address (runs ahead; redirect overwrites
+ *                it with the branch target).
+ *   - req_pc_q : address of the in-flight fetch; stamped on the F/D
+ *                register at capture so fd_pc_o is EXACT.
+ *   - busy_q   : a fetch is in flight.
+ *   - flushed_q: a redirect killed the in-flight fetch; the next
+ *                response must be drained and discarded.
+ *   - fd_*     : F/D pipeline register; fd_valid_o is a HELD level
+ *                (high from a fresh capture until decode consumes it
+ *                via !stall_i, or a redirect kills it).
+ *
+ * Redirect (branch_valid_i, highest priority): kills the in-flight
+ * fetch (flushed_q) AND any stale F/D content, and points pc_q at the
+ * branch target. req.valid is gated by !branch_valid_i so no fetch of
+ * the old pc_q issues during the redirect cycle.
+ *
+ * stall_i: downstream hazard back-pressure. While high the F/D
+ * register is not consumed (held); prefetch still issues up to 1 ahead
+ * (bounded by single outstanding) and is discarded on redirect.
+ *
+ * Compressed (C) extension is NOT handled here: the stage always
+ * fetches 32-bit words and advances by 4. A compressed instruction in
+ * the low half of a word means the next instruction is the upper half
+ * of the SAME word (handled by decode), so the next fetch is always
+ * the next word (+4). fd_is_compressed_o is computed for decode.
+ *
+ * next_pc_o: the next fetch address (pc_q), for debug.
  */
 
 module fetch_stage (
@@ -47,12 +72,11 @@ module fetch_stage (
     input  wire            branch_valid_i,
     input  wire [XLEN-1:0] branch_addr_i,
 
-    // Native instruction-memory interface (consumed by the external bridge)
+    // Native instruction-memory interface (consumed by the on-die bridge)
     output mem_req_t       imem_req_o,
     input  mem_rsp_t       imem_rsp_i,
 
-    // The "next PC" this stage intends to use next cycle. Useful for
-    // debug and for the bridge to detect in-flight flushes.
+    // The next fetch address (debug).
     output wire [XLEN-1:0] next_pc_o,
 
     // F/D pipeline register outputs (consumed by decode)
@@ -63,82 +87,129 @@ module fetch_stage (
 );
 
     // -----------------------------------------------------------------
-    // PC register
+    // State
     // -----------------------------------------------------------------
-    logic [XLEN-1:0] pc_q, pc_d;
-    logic [XLEN-1:0] next_pc_d;
+    logic [XLEN-1:0] pc_q,     pc_d;       // next fetch address
+    logic [XLEN-1:0] req_pc_q, req_pc_d;   // address of the in-flight fetch
+    logic            busy_q,   busy_d;     // fetch in flight
+    logic            flushed_q, flushed_d; // in-flight fetch is to be dropped
 
-    // next_pc_d is the PC we want to move to next cycle. Defaults to
-    // pc_q + 4 (sequential). A redirect overrides it.
+    logic            fd_valid_q,         fd_valid_d;
+    logic [XLEN-1:0] fd_pc_q,            fd_pc_d;
+    logic [XLEN-1:0] fd_instr_q,         fd_instr_d;
+    logic            fd_is_compressed_q, fd_is_compressed_d;
+
+    // -----------------------------------------------------------------
+    // Native interface outputs
+    //
+    // rready depends ONLY on registers (never on rvalid) => no
+    // combinational loop through the bridge's axi.rready forwarding.
+    // -----------------------------------------------------------------
     always_comb begin
-        next_pc_d = pc_q + 4;
+        // Accept read data when the F/D register has room, or drain a
+        // flushed (redirected) response to free the bridge.
+        imem_req_o.rready = !fd_valid_q || flushed_q;
+
+        // Issue a fetch when idle and not redirecting this cycle.
+        imem_req_o.wvalid = !busy_q && !branch_valid_i;
+        imem_req_o.we    = 1'b0;
+        imem_req_o.addr  = pc_q;
+        imem_req_o.wdata = '0;
+        imem_req_o.wstrb = '0;
+    end
+
+    assign next_pc_o = pc_q;
+
+    wire launch  = imem_req_o.wvalid && imem_rsp_i.wready; // req accepted
+    wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready; // read data consumed
+
+    // -----------------------------------------------------------------
+    // Next-state / datapath (combinational)
+    // -----------------------------------------------------------------
+    always_comb begin
+        // Defaults: hold
+        busy_d             = busy_q;
+        flushed_d          = flushed_q;
+        pc_d               = pc_q;
+        req_pc_d           = req_pc_q;
+        fd_valid_d         = fd_valid_q;
+        fd_pc_d            = fd_pc_q;
+        fd_instr_d         = fd_instr_q;
+        fd_is_compressed_d = fd_is_compressed_q;
+
         if (branch_valid_i) begin
-            next_pc_d = branch_addr_i;
+            // ---- Redirect (highest priority) ----
+            fd_valid_d = 1'b0;            // kill stale F/D
+            pc_d       = branch_addr_i;   // next fetch -> target
+            if (busy_q) begin
+                if (rsp_cap) begin
+                    // Flushed response lands this cycle: drain & discard.
+                    flushed_d = 1'b0;
+                    busy_d    = 1'b0;
+                end else begin
+                    // Mark the in-flight fetch to be drained when it lands.
+                    flushed_d = 1'b1;
+                end
+            end else begin
+                flushed_d = 1'b0;         // nothing in flight to drain
+            end
+        end else begin
+            // ---- Normal ----
+            // Launch the next fetch (single outstanding: only when idle).
+            if (launch) begin
+                busy_d   = 1'b1;
+                req_pc_d = pc_q;          // remember the in-flight address
+                pc_d     = pc_q + 32'd4;  // pc runs ahead
+            end
+
+            // Capture / drain the in-flight response. Mutually exclusive
+            // with launch: rsp_cap requires busy_q, launch requires !busy_q.
+            if (rsp_cap) begin
+                if (flushed_q) begin
+                    // Dropped response from a redirected fetch.
+                    flushed_d = 1'b0;
+                    busy_d    = 1'b0;
+                end else begin
+                    // Capture with the *in-flight* pc (req_pc_q) => fd_pc exact.
+                    fd_valid_d         = 1'b1;
+                    fd_pc_d            = req_pc_q;
+                    fd_instr_d         = imem_rsp_i.rdata;
+                    fd_is_compressed_d = (imem_rsp_i.rdata[1:0] != 2'b11);
+                    busy_d             = 1'b0;
+                end
+            end
+
+            // Consume the F/D register (decode accepts). Mutually
+            // exclusive with capture: capture needs rready = !fd_valid_q
+            // (F/D empty); consume needs fd_valid_q (F/D full).
+            if (fd_valid_q && !stall_i) begin
+                fd_valid_d = 1'b0;
+            end
         end
     end
 
-    assign pc_d = next_pc_d;
-
+    // -----------------------------------------------------------------
+    // Sequential
+    // -----------------------------------------------------------------
     always_ff @(posedge clk_i or negedge rstn_i) begin
         if (!rstn_i) begin
-            pc_q <= boot_addr_i;
-        end else if (!stall_i) begin
-            pc_q <= pc_d;
-        end
-        // else: hold pc_q (stall)
-		else begin
-			pc_q <= pc_q;
-		end
-    end
-
-    // -----------------------------------------------------------------
-    // Instruction-memory request
-    //
-    // Continuous fetch: every non-stalled cycle we publish a read
-    // request for pc_q. The external bridge accepts (ready=1) when
-    // it can launch the transaction. On a stall we keep the request
-    // asserted so the bridge can still latch the address when it
-    // becomes ready (the address is stable because pc_q is held).
-    // -----------------------------------------------------------------
-    assign imem_req_o.valid = 1'b1;
-    assign imem_req_o.we    = 1'b0;
-    assign imem_req_o.addr  = pc_q;
-    assign imem_req_o.wdata = '0;
-    assign imem_req_o.wstrb = '0;
-
-    assign next_pc_o = pc_d;
-
-    // -----------------------------------------------------------------
-    // F/D pipeline register
-    //
-    // When the response arrives (imem_rsp_i.valid=1), we latch it.
-    // We also stamp it with fd_valid_o=1 for that cycle and the PC
-    // that was being read (pc_q at the time of the request). Note:
-    // pc_q may have advanced already by the time rvalid arrives, so
-    // we use `pc_q - 4` to recover the request address... but since
-    // the fetch is sequential and we always request pc_q exactly one
-    // cycle after the previous pc_q+4, the address of the *current*
-    // response is the pc_q that was sampled when this rvalid was
-    // generated upstream. For now we expose the latched pc_q.
-    // -----------------------------------------------------------------
-    logic            fd_valid_q;
-    logic [XLEN-1:0] fd_pc_q;
-    logic [XLEN-1:0] fd_instr_q;
-    logic            fd_is_compressed_q;
-
-    always_ff @(posedge clk_i or negedge rstn_i) begin
-        if (!rstn_i) begin
-            fd_valid_q        <= 1'b0;
-            fd_pc_q           <= '0;
-            fd_instr_q        <= '0;
+            pc_q               <= boot_addr_i;
+            req_pc_q           <= '0;
+            busy_q             <= 1'b0;
+            flushed_q          <= 1'b0;
+            fd_valid_q         <= 1'b0;
+            fd_pc_q            <= '0;
+            fd_instr_q         <= '0;
             fd_is_compressed_q <= 1'b0;
         end else begin
-            fd_valid_q        <= imem_rsp_i.valid;
-            fd_pc_q           <= imem_rsp_i.valid ? pc_q : fd_pc_q;
-            fd_instr_q        <= imem_rsp_i.valid ? imem_rsp_i.rdata : fd_instr_q;
-            fd_is_compressed_q <= imem_rsp_i.valid
-                                  ? (imem_rsp_i.rdata[1:0] != 2'b11)
-                                  : fd_is_compressed_q;
+            pc_q               <= pc_d;
+            req_pc_q           <= req_pc_d;
+            busy_q             <= busy_d;
+            flushed_q          <= flushed_d;
+            fd_valid_q         <= fd_valid_d;
+            fd_pc_q            <= fd_pc_d;
+            fd_instr_q         <= fd_instr_d;
+            fd_is_compressed_q <= fd_is_compressed_d;
         end
     end
 

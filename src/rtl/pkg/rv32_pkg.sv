@@ -7,37 +7,40 @@ package rv32_pkg;
 	typedef logic [STRB_WIDTH-1:0] strb_t;
 
 	// ---------------------------------------------------------------
-	// Memory request (master -> memoria)
+	// Native memory interface — split per DIREZIONE (stile AXI):
+	// ogni bundle e' una sola direzione, cosi' e' legale come packed
+	// struct passata come singola porta. I canali (request / read
+	// response) sono mischiati dentro ciascun bundle.
 	//
-	// `valid` is high for one cycle when a new request is launched.
-	// `we` = 1 indicates a write (wdata/wstrb meaningful); `we` = 0
-	// is a read (only `addr` is meaningful on the request side; the
-	// read data comes back through mem_rsp_t.rdata).
+	// Handshake richiesta (launch): req.wvalid && rsp.wready.
+	// Handshake read response:       rsp.rvalid && req.rready.
 	// ---------------------------------------------------------------
+
+	// master -> bridge  (tutti gli OUTPUT del master)
 	typedef struct packed {
-		logic  valid;                                    // 1 = request launched this cycle
-		logic  we;                                       // 1 = write, 0 = read
-		logic [XLEN-1:0]        addr;                    // byte address
-		logic [XLEN-1:0]        wdata;                   // write data (ignored if we=0)
-		logic [STRB_WIDTH-1:0]	wstrb;                   // byte strobes; all-1 on a word store
+		logic                  wvalid;   // request valid (launch)
+		logic                  we;       // 1 = write, 0 = read
+		logic [XLEN-1:0]       addr;     // byte address
+		logic [XLEN-1:0]       wdata;    // write data (ignored if we=0)
+		logic [STRB_WIDTH-1:0] wstrb;    // byte strobes; all-1 on a word store
+		logic                  rready;   // master ready to accept read data
 	} mem_req_t;
 
-	// ---------------------------------------------------------------
-	// Memory response (memoria -> master), 1 ciclo dopo la request
-	// ---------------------------------------------------------------
+	// bridge -> master  (tutti gli INPUT del master)
 	typedef struct packed {
-		logic  valid;   // 1 = rdata is valid this cycle
-		logic [XLEN-1:0] rdata;
+		logic            wready;   // bridge accepts the request (= idle)
+		logic            rvalid;   // read data valid this cycle
+		logic [XLEN-1:0] rdata;    // read data
+		// TODO(LSU): add bvalid (write-ack, bridge->master). The fetch
+		// is read-only so it is not needed yet; the peri bridge is tied
+		// off and no write is ever launched today.
 	} mem_rsp_t;
 
 	// ---------------------------------------------------------------
-	// Convenience: a "request handshake" predicate. The bridge that
-	// turns imem_req_o into an actual bus transaction is expected to
-	// consume the request when req_valid && req_ready (the ready side
-	// is owned by the bridge, not by the producer stage).
+	// Convenience: request-launch predicate (req.wvalid && rsp.wready).
 	// ---------------------------------------------------------------
-	function automatic logic req_handshake(input mem_req_t req, input logic ready);
-		return req.valid && ready;
+	function automatic logic req_handshake(input mem_req_t req, input mem_rsp_t rsp);
+		return req.wvalid && rsp.wready;
 	endfunction
 
 endpackage

@@ -4,83 +4,84 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A RV32IMAC + Zicsr + Zifencei RISC-V core targeting a **Gowin GW2AR-18C** FPGA (part `GW2AR-LV18QN88C8/I7`, QFN88 package). The core is a work-in-progress pipeline; only the instruction fetch stage is implemented so far. The CPU exits **two AXI4-Lite masters** (`imem_axi`, `peri_axi`). The conversion from the pipeline's native `mem_req_t` / `mem_rsp_t` to AXI4-Lite is done inside the CPU (one `axi4_lite_master_bridge` per master port), so the rest of the system sees the CPU as a plain AXI4-Lite master.
+A RV32IMAC + Zicsr + Zifencei RISC-V core targeting a **Gowin GW2AR-18C** FPGA (part `GW2AR-LV18QN88C8/I7`, QFN88 package), on a Sipeed Tang Nano 20k board. The core is a work-in-progress pipeline; **only the instruction fetch stage is implemented so far**. The CPU exits **two AXI4-Lite masters** (`imem_axi`, `peri_axi`). The native `mem_req_t` / `mem_rsp_t` → AXI4-Lite conversion is done **inside the CPU** (one `axi4_lite_master_bridge` per master port), so the rest of the system sees the CPU as a plain AXI4-Lite master and the board top stays free of glue.
 
-- Top module (board-level / IDE): `top_module` (file `src/rtl/core/top_module.sv`)
-- CPU top (RTL-level): `rv32imac_zicsr_zifencei` (file `src/rtl/core/rv32imac_zicsr_zifencei.sv`) — instantiates pipeline stages AND one `axi4_lite_master_bridge` per master port; exits two AXI4-Lite masters.
-- Project file (Gowin IDE): `rv32imac_Zicsr_Zifencei.gprj`
-- Process / synthesis config: `impl/rv32imac_Zicsr_Zifencei_process_config.json`
-- Synthesized netlist / reports: `impl/gwsynthesis/`
-- PnR bitstream / reports: `impl/pnr/`
+Key files:
+- Board-level top (IDE `TopModule`): `src/rtl/core/top_module.sv` — `module top_module`.
+- CPU RTL top: `src/rtl/core/rv32imac_zicsr_Zifencei.sv` — `module rv32imac_zicsr_zifencei`; instantiates pipeline stages + two on-die AXI4-Lite bridges.
+- Gowin IDE project: `rv32imac_Zicsr_Zifencei.gprj` (file list + device).
+- Process/synthesis config: `impl/rv32imac_Zicsr_Zifencei_process_config.json` (`TopModule`, tool options).
+- Synthesized netlist/reports: `impl/gwsynthesis/`. PnR bitstream/reports: `impl/pnr/` (gitignored — regenerable).
 
 ## Build flow (Gowin EDA)
 
-This project is built with the **Gowin FPGA Designer** toolchain, not a generic open-source flow. There are no Makefile / shell scripts in the repo. The tool is invoked through the IDE (project `.gprj`) or via Tcl / `gw_sh`.
+This is a **Gowin FPGA Designer** project — no open-source flow, no Makefile. Build via the IDE or `gw_sh` Tcl shell. The Gowin toolchain is **not installed in this environment**; find `gw_sh`/`gw_ide` on the actual build host before invoking (the old `~/gowin_ide/...` paths no longer exist — do not assume them).
 
-The Gowin IDE / Tcl are installed on the build host at:
+The synthesizer writes its run log to `impl/gwsynthesis/rv32imac_Zicsr_Zifencei.log` — **read that file for errors/warnings**; `gw_sh` itself prints only a banner to stdout.
 
-- IDE binary: `~/gowin_ide/IDE/bin/gw_ide`
-- Headless shell: `~/gowin_ide/IDE/bin/gw_sh` (use with `QT_QPA_PLATFORM=offscreen` over SSH because the GUI needs X11)
-- Launch helper: `~/gowin_ide/run_ide.sh`
+### Synthesize
 
-From the IDE:
-1. Open `rv32imac_Zicsr_Zifencei.gprj` in Gowin FPGA Designer.
-2. **Synthesize** → produces `impl/gwsynthesis/rv32imac_Zicsr_Zifencei.vg`.
-3. **Place & Route** → runs `impl/pnr/cmd.do`, producing `impl/pnr/rv32imac_Zicsr_Zifencei.fs` and `.bin`.
-4. Program the device with `impl/pnr/rv32imac_Zicsr_Zifencei.fs` (or `.bin`).
-
-From the command line (Gowin shell) — the CLI form `gw_sh -synth -f <gprj>` is fragile: it silently exits without producing any output if the target `.vg`/`.log` files already exist (e.g. from a previous run). **Always use a Tcl script** that calls `open_project` + `run_synthesis`:
+A committed Tcl entry point exists: `impl/synth_check.tcl`. It opens the `.gprj`, sets `top_module`, and runs `syn`. Invoke it with the Gowin shell (use `QT_QPA_PLATFORM=offscreen` over SSH — the shell still links Qt and needs X11 otherwise):
 
 ```bash
-# /tmp/synth.tcl  (or commit one under impl/pnr/)
-#   open_project /home/giacomo/gowin_proj/rv32imac_Zicsr_Zifencei/rv32imac_Zicsr_Zifencei.gprj
-#   set_option -top_module top_module
-#   run_synthesis
+QT_QPA_PLATFORM=offscreen gw_sh impl/synth_check.tcl
+```
 
-QT_QPA_PLATFORM=offscreen gw_sh /tmp/synth.tcl
+**Gowin CLI quirk (important):** `gw_sh` silently no-ops and produces no output if the target `.vg` / `.log` already exist from a previous run. **Delete them before re-running** synthesis, or the run will appear to succeed while changing nothing.
 
-# Place & Route (uses impl/pnr/cmd.do)
+### Place & Route
+
+Driven by `impl/pnr/cmd.do` (targets GW2AR-18C, runs `-bit -tr -ph -timing`, converts SDP32/36 → SDP16/18 BSRAMs, `global_freq 100.000`). PnR device options come from `impl/pnr/device.cfg`:
+
+```bash
 gw_sh -pnr -do impl/pnr/cmd.do
 ```
 
-The synthesizer writes the run log to `impl/gwsynthesis/rv32imac_Zicsr_Zifencei.log` — **read that file for errors and warnings**, `gw_sh` itself prints only a banner to stdout.
+Outputs `impl/pnr/rv32imac_Zicsr_Zifencei.fs` / `.bin` for programming. Note: `cmd.do` has **no `-sdc` flag**, so the SDC constraints file is **not** applied in the current PnR flow — timing is unconstrained beyond the global frequency. Add `-sdc src/phys/rv32imac_Zicsr_Zifencei.sdc` to `cmd.do` when you want the 27 MHz clock constraint enforced.
 
-PnR is driven by `impl/pnr/cmd.do` with constraints from `impl/pnr/device.cfg`. The script targets the GW2AR-18C part, runs `-bit -tr -ph -timing` and converts SDP32/36 → SDP16/18 BSRAMs.
+### Constraints (in `src/phys/`, NOT `impl/pnr/`)
 
-Pin assignment (`impl/pnr/rv32imac_Zicsr_Zifencei.cst`):
-- `clk_i` → PIN4 (27 MHz onboard oscillator on Tang Nano 20k)
-- `led_o[0..3]` → PIN15, PIN17, PIN18, PIN19 (onboard LEDs)
-- `rstn_i` is **not** mapped — rely on the FPGA's internal POR until the S1 user-key pin on the GW2AR-18C QFN88 is confirmed against the board schematic.
+Pin assignment — `src/phys/rv32imac_Zicsr_Zifencei.cst`:
+- `clk_i` → PIN4 (27 MHz onboard oscillator)
+- `rstn_i` → PIN88 (mapped; async, active-low)
+- `led_o[0..3]` → PIN15, PIN16, PIN17, PIN18 (onboard LEDs; `fd_pc_dbg_o[3:0]`)
 
-Timing (`impl/pnr/rv32imac_Zicsr_Zifencei.sdc`):
+Timing — `src/phys/rv32imac_Zicsr_Zifencei.sdc` (only applied if passed via `-sdc`):
 - Primary clock `clk27` at 27 MHz on `clk_i` (period 37.037 ns).
-- `rstn_i` and `led_o[*]` marked as false paths.
+- `rstn_i` (false-path-from) and `led_o[*]` (false-path-to) marked non-timing-critical.
 
-There are **no unit tests, no simulation harness, and no lint config** in the repo. Verification (if needed) is done outside this tree.
+There are **no unit tests, no simulation harness, and no lint config** in the repo. Verification is done outside this tree.
 
 ## Architecture
 
-The core is being built bottom-up — most pipeline stages past fetch are not yet present. The current RTL is intentionally minimal:
+Built bottom-up; most pipeline stages past fetch are not yet present. Every RTL file does `import rv32_pkg::*;` and starts with `` `resetall `` / `` `default_nettype none `` / `` `timescale 1ns / 1ps `` — **match these in new files**.
 
-- **`src/rtl/pkg/rv32_pkg.sv`** — package with `XLEN = 32`, `STRB_WIDTH`, `AXI4_LEN`, and the native memory structs `mem_req_t` (we/addr/wdata/wstrb) and `mem_rsp_t` (valid/rdata). Every RTL file does `import rv32_pkg::*;`.
-- **`src/rtl/core/fetch_stage.sv`** — the only implemented pipeline stage. Owns the PC, the F/D pipeline register (`fd_pc_o`/`fd_instr_o`/`fd_valid_o`/`fd_is_compressed_o`), and exposes a **native instruction-memory interface** (`imem_req_o` / `imem_rsp_i` as `mem_req_t`/`mem_rsp_t`) plus `next_pc_o`. **No bus protocol lives here** — the fetch stage just publishes a request every cycle; the on-die AXI4-Lite bridge inside the CPU converts it into AR/R and feeds the response back through `imem_rsp_i`. Forward-compat inputs `stall_i`, `branch_valid_i`, `branch_addr_i` are present on the port but tied off in the CPU top today.
-- **`src/rtl/core/rv32imac_zicsr_zifencei.sv`** — CPU RTL top. Instantiates pipeline stages AND **two `axi4_lite_master_bridge` instances** — one for `imem_axi` (driven by `fetch_stage` today), one for `peri_axi` (LSU side, request tied off today). Exits two AXI4-Lite masters: `imem_axi` (toward instruction/data memory) and `peri_axi` (toward peripherals, unused for now but routed at the boundary so the board top can drop in slaves without re-touching the CPU). `fd_pc_dbg_o[3:0]` is brought out as a debug tap.
-- **`src/rtl/core/top_module.sv`** — board-level top (set as `TopModule` in `process_config.json`). Instantiates `rv32imac_zicsr_zifencei` only — no bus glue, no bridges. Wires the CPU's `imem_axi` to an `axi4_lite_ram` slave on `axi_bus_imem`, and the CPU's `peri_axi` to `axi_bus_peri` (trunk left open on the slave side and tied off so future peripherals drop in without rewiring). Exposes `clk_i`, `rstn_i`, and a 4-bit `led_o` wired to the CPU's `fd_pc_dbg_o[3:0]`.
-- **`src/rtl/bus/axi4_lite_if.sv`** — local `axi4_lite_if` interface (32-bit data/addr) with `master`, `slave`, and `trunk` modports. Used by the CPU's AXI4-Lite master ports and by the board top to wire slaves.
-- **`src/rtl/bus/axi4_lite_master_bridge.sv`** — generic AXI4-Lite master bridge that turns a native `mem_req_t` / `mem_rsp_t` into AR/AW/W + R/B. Per-channel FSM (read / write independent), single outstanding beat per channel. Instantiated twice **inside** the CPU — once for `imem_axi`, once for `peri_axi`.
-- **`src/rtl/utils/axi4_lite_ram.sv`** — AXI4-Lite slave single-beat RAM with `(* ram_style = "block" *)` storage (infers BSRAM on Gowin). Parameterised `ADDR_W` (byte-addressed depth = 2^ADDR_W bytes) and optional `INIT_FILE` for `$readmemh`. Read latency 1 cycle; bvalid asserted the cycle AW and W both hand-shake. Byte-strobed writes. Wired as the slave on `axi_bus_imem` by the board top.
+- **`src/rtl/pkg/rv32_pkg.sv`** — package: `XLEN=32`, `STRB_WIDTH`, `AXI4_LEN`, and the native memory structs, **split per direction (AXI-style)** so each is a legal single-direction packed struct port: `mem_req_t` (master→bridge: `wvalid`/`we`/`addr`/`wdata`/`wstrb`/`rready`) and `mem_rsp_t` (bridge→master: `wready`/`rvalid`/`rdata`). Handshakes: request launch is `req.wvalid && rsp.wready`; read response is `rsp.rvalid && req.rready`. `req_handshake()` returns the launch predicate. **No `bvalid` (write-ack) yet** — TODO for the LSU; fetch is read-only and the peri bridge is tied off today.
+- **`src/rtl/core/fetch_stage.sv`** — the only implemented stage. Owns the PC and the F/D pipeline register (`fd_pc_o`/`fd_instr_o`/`fd_valid_o`/`fd_is_compressed_o`). Exposes a **native** instruction-memory interface (`imem_req_o` / `imem_rsp_i`, direction-split) plus `next_pc_o`. **No bus protocol here** — it handshakes with the on-die bridge (`req.wvalid && rsp.wready` to launch, `rsp.rvalid && req.rready` to capture) as a single-outstanding **overlap-prefetch** FSM (no explicit `state_t`; uses `busy_q`/`req_pc_q`/`flushed_q` flags). Forward-compat inputs `stall_i`, `branch_valid_i`, `branch_addr_i` are on the port but tied off in the CPU top today.
+- **`src/rtl/core/rv32imac_zicsr_zifencei.sv`** — CPU RTL top. Instantiates `fetch_stage` (F/D outputs currently wired to `()` — decode stage missing) plus **two `axi4_lite_master_bridge`** instances: `u_imem_bridge` (driven by `fetch_stage`'s `imem_req_o`/`imem_rsp_i`) and `u_peri_bridge` (request tied inert — `wvalid=0` — LSU not yet implemented). The native interface is direction-split, so there are **no `req_ready` wires** — `wready` lives in `mem_rsp_t`. `peri_rsp` is sunk to a dummy net (`_unused_peri_rsp`) for the future LSU. Exits two AXI4-Lite masters. `fd_pc_dbg_o[3:0]` brought out as a debug tap.
+- **`src/rtl/core/top_module.sv`** — board top. Wires CPU `imem_axi` → `axi4_lite_ram` slave on `axi_bus_imem`; routes `peri_axi` to `axi_bus_peri` with the slave side tied off (all `*ready=0`/`*valid=0`) so a future peripheral drops in without rewiring. `led_o` = `fd_pc_dbg_o[3:0]`.
+- **`src/rtl/bus/axi4_lite_if.sv`** — SystemVerilog interface (32-bit addr/data) with `master`, `slave`, and `trunk` modports. `aclk`/`aresetn` are driven into the trunk from the board top.
+- **`src/rtl/bus/axi4_lite_master_bridge.sv`** — native `mem_req_t`/`mem_rsp_t` (direction-split) → AXI4-Lite AR/AW/W + R/B. Single shared FSM (`S_IDLE`/`S_RD_WAIT`/`S_WR_ADDR`/`S_WR_DATA`/`S_WR_WAIT`) — **single outstanding overall** (read OR write, not both). `rsp_o.wready = (state_q == S_IDLE)` is the launch handshake from the producer's side. **Read path**: in `S_RD_WAIT` the master's `req_i.rready` is forwarded straight to `axi.rready`, so the AXI slave holds `rvalid`/`rdata` until the master can accept; `rsp_o.rvalid = r_hs` the cycle data is consumed. For writes, AW+W launch in lock-step; on `b_hs` → `S_IDLE`. **Write retirement is not signalled back** (no `bvalid` in `mem_rsp_t` yet — TODO LSU); `bready` held high.
+- **`src/rtl/utils/axi4_lite_ram.sv`** — AXI4-Lite slave single-beat RAM, `(* ram_style = "block" *)` (infers BSRAM on Gowin). Params: `ADDR_W` (byte-addressed depth = 2^ADDR_W bytes) and optional `INIT_FILE` for `$readmemh`. Read latency 1 cycle (registered); `bvalid` asserted the cycle W handshakes (after AW captured). Byte-strobed writes. Wired as the `axi_bus_imem` slave.
 
 ### Fetch stage behaviour (current)
 
-- `pc_q`: the address of the current fetch (registered).
-- `pc_d = pc_q + 4` by default; a redirect overrides it via `next_pc_d`.
-- `imem_req_o.valid = 1` every cycle — continuous fetching. The external bridge is responsible for back-pressure: if it cannot accept a request this cycle, it must assert `stall_i` so the fetch stage holds the PC and the request stays pending at the same address.
-- When `imem_rsp_i.valid` arrives (one cycle of high), `fd_instr_o` / `fd_pc_o` / `fd_is_compressed_o` / `fd_valid_o` are latched into the F/D pipeline register and held until the next response.
+Single-outstanding **overlap-prefetch**. No `state_t` enum — the FSM is a set of flags (`busy_q`/`req_pc_q`/`flushed_q`) plus the F/D register. Handshakes with the on-die bridge: launch = `imem_req_o.wvalid && imem_rsp_i.wready`; capture = `imem_rsp_i.rvalid && imem_req_o.rready`.
+
+- `pc_q`: **next fetch address** — runs ahead of decode. Resets to `boot_addr_i`. On launch it advances to `pc_q + 4`; on redirect it is overwritten with the target. (Note: fetch always reads 32-bit words and advances by 4 — see Compressed below.)
+- `req_pc_q`: address of the **in-flight** fetch. Stamped onto the F/D register at capture, so `fd_pc_o` is the **exact** address of the delivered instruction (not the already-advanced `pc_q`).
+- `busy_q`: a fetch is in flight (at most one — single outstanding). `imem_req_o.wvalid = !busy_q && !branch_valid_i` (issue only when idle and not redirecting).
+- `imem_req_o.rready = !fd_valid_q || flushed_q` — accept read data when the F/D register has room, **or** drain a flushed (redirected) response to free the bridge. This depends **only on registers**, never on `rvalid`, so there is no combinational loop through the bridge's `axi.rready` forwarding.
+- **Overlap-prefetch**: on capture of fetch K (busy→0 next cycle), the next fetch K+1 is launched the very next cycle (the bridge is back in `S_IDLE`), while decode consumes K from the F/D register. Only one transaction is ever in flight (K+1; K already sits in F/D). If decode is slower than memory and K+1's response lands while F/D is still full, `rready` stays low and the bridge/AXI slave hold `rvalid`/`rdata` until decode frees F/D — **no skid buffer needed** (single outstanding ⇒ nothing queues behind the waiting response). Steady-state ~2 cycles/instruction (the bridge round-trip floor: 1 issue + 1 response).
+- `fd_valid_o`: **held level** — high from a fresh capture until decode consumes it (`fd_valid_q && !stall_i` → `fd_valid_d=0`), or a redirect kills it. Mutually exclusive with capture (capture needs F/D empty; consume needs F/D full).
+- **Redirect** (`branch_valid_i`, highest priority): kills stale F/D (`fd_valid_d=0`) and marks the in-flight fetch `flushed_q=1` so its response is drained and discarded; sets `pc_q` to the target. `wvalid` is gated by `!branch_valid_i` so no fetch of the old `pc_q` issues during the redirect cycle. If the flushed response lands the same cycle as the redirect, it is drained immediately.
+- **Compressed (C)**: NOT handled here — always fetches 32 bits, advances by 4; `fd_is_compressed_o = (rdata[1:0] != 2'b11)` is computed for decode, which owns RVC expansion (a compressed instr in the low half of a word ⇒ the next instr is the upper half of the same word, handled in decode).
+- **stall_i**: downstream back-pressure. While high the F/D register is held (not consumed); prefetch still issues up to 1 ahead (bounded by single outstanding) and is discarded on redirect.
 
 ### Open work / things future instances should know
 
-- The F/D register signals from `fetch_stage` are connected to `()` in the CPU top — the **decode stage is missing** and is the next obvious step.
-- The "redirect" path (branch/jal/jalr → PC redirect) and "stall" path (hazard unit) are present in `fetch_stage`'s port list but tied off in the CPU top. Reserve these names when adding the execute/branch and hazard modules.
-- `rv32_pkg::mem_req_t` has a `valid` field. The fetch stage asserts it continuously; the on-die `axi4_lite_master_bridge u_imem_bridge` consumes the request when it can launch the AXI4-Lite transaction.
-- The CPU exposes `peri_axi` (currently inert, no LSU). When the LSU lands it will drive the internal `peri_req`; the on-die `axi4_lite_master_bridge u_peri_bridge` will translate it into AW/W on `peri_axi` without any board-top changes.
-- `cmd.do` uses `global_freq 100.000` MHz; the Tang Nano 20k is rated much lower. Update before relying on timing closure.
+- **Decode stage is missing** — `fetch_stage`'s F/D outputs are connected to `()` in the CPU top. This is the next obvious step (planned: `decode_stage.sv` + `reg_file.sv`, with RVC expansion living in decode).
+- The **redirect path** (`branch_valid_i`/`branch_addr_i` → PC redirect + in-flight flush) and **stall path** (`stall_i` from a hazard unit) are **implemented in the fetch FSM** but tied off in the CPU top. Reserve these names when adding execute/branch and hazard modules.
+- The CPU exposes `peri_axi` (inert, no LSU). When the LSU lands it should drive the internal `peri_req`; `u_peri_bridge` will translate to AW/W on `peri_axi` with **no board-top changes**.
+- `cmd.do` sets `global_freq 100.000` MHz and currently applies **no SDC** — the Tang Nano 20k runs at 27 MHz; update both before relying on timing closure.
+- `rv32imac_Zicsr_Zifencei.gprj.user` is per-machine IDE state (gitignored) — don't rely on it; the canonical file list is the `.gprj`.
