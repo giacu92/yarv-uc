@@ -1,0 +1,24 @@
+# Gowin build artefacts (regenerable from src/)
+impl/gwsynthesis/
+impl/pnr/*.vg
+impl/pnr/*.bin
+impl/pnr/*.binx
+impl/pnr/*.fs
+impl/pnr/*.db
+impl/pnr/*.log
+impl/pnr/*.html
+impl/pnr/*.xml
+impl/pnr/*.txt
+impl/pnr/*.timing_paths
+impl/temp/
+
+# IDE workspace state (per-machine, TerosHDL / Gowin IDE)
+rv32imac_Zicsr_Zifencei.gprj.user
+
+# Claude Code workspace state (per-machine)
+.claude/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
