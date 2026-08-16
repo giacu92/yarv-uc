@@ -7,22 +7,20 @@ import rv32_pkg::*;
 /**
  * Decode stage — phase 1 (RV32I + M + C, no execute yet).
  *
- * Consumes fetch's F/D outputs (fe_instr / fe_pc / fe_valid /
- * fe_is_compressed — `fe_` is the fetch stage's debug-tap sigil; the
- * F/D register is fetch's output, so these inputs take the producer's
- * sigil) and produces a D/E control word (de_o) latched into a D/E
- * register. The register file is read asynchronously from this stage
- * so operands are captured at decode. There is no execute stage yet, so
- * de_o feeds debug taps only (same pattern fetch's fe_* used); the
+ * Consumes fetch's F/D outputs (fe_instr / fe_pc / fe_valid — `fe_` is
+ * the fetch stage's sigil; the F/D register is fetch's output, so these
+ * inputs take the producer's sigil) and produces a D/E control word
+ * (de_o) latched into a D/E register. The register file is read
+ * asynchronously from this stage so operands are captured at decode.
+ * There is no execute stage yet, so de_o feeds debug taps only; the
  * reg-file write port has no producer (writeback) and is tied off in the
  * CPU top.
  *
- * Debug-tap convention: every pipeline stage exposes the PC it is
- * treating, the instruction word, a valid, and other useful debug as
- * outputs prefixed by a stage sigil (fe = fetch, de = decode, ex =
- * execute, ...). Decode's output is the D/E register, so its taps carry
- * the `de_` sigil — including de_instr, the 32-bit word decode treated
- * (native or RVC-expanded), latched alongside de_pc/de_valid.
+ * Each pipeline stage exposes the PC it is treating, the instruction
+ * word, and a valid as outputs (prefixed by its stage sigil: fe = fetch,
+ * de = decode, ex = execute, ...). Further debug signals are added on
+ * demand. Decode's output is the D/E register (de_o); the CPU top
+ * exposes de_pc / de_instr / de_valid as taps.
  *
  * Strategy: **expand-then-decode-uniformly**. A 16-bit RVC instruction is
  * first turned into its 32-bit RV32I equivalent by c_expand(); the same
@@ -31,8 +29,9 @@ import rv32_pkg::*;
  * forms, so only RV32I compressed instructions are expanded.
  *
  * RVC spanning / phase-1 simplification: fetch always delivers a 32-bit
- * word at a 4-byte boundary and flags fe_is_compressed = (word[1:0]!=11).
- * A compressed instruction sitting in the LOW half of a word is decoded
+ * word at a 4-byte boundary; is-compressed = (word[1:0]!=2'b11) is
+ * derived here from fe_instr_i. A compressed instruction sitting in the
+ * LOW half of a word is decoded
  * this cycle and the UPPER half is latched into a hold buffer to be
  * decoded next cycle (its PC = word_pc + 2). A 32-bit instruction must
  * be 4-byte aligned; the spanning case (low half compressed AND the
@@ -58,10 +57,11 @@ module decode_stage (
 
     // F/D register inputs (from fetch_stage). Named with the fetch
     // stage's `fe_` sigil: these are fetch's output, consumed here.
+    // is-compressed is derived from fe_instr_i[1:0] (not a separate
+    // port) so fetch exports only pc / instr / valid.
     input wire [XLEN-1:0] fe_instr_i,
     input wire [XLEN-1:0] fe_pc_i,
     input wire            fe_valid_i,
-    input wire            fe_is_compressed_i,
 
     // Register-file read port (decode drives addresses; data returns
     // combinationally the same cycle).
@@ -423,6 +423,10 @@ module decode_stage (
     // =================================================================
     // Source selection + uniform 32-bit decode (one always_comb).
     // =================================================================
+    // is-compressed of the fetched word, derived from the instruction
+    // word itself (fetch no longer exports it as a separate port).
+    wire         fe_is_compressed = (fe_instr_i[1:0] != 2'b11);
+
     logic [31:0] src_instr32;
     logic [31:0] src_pc;
     logic        src_is_compressed;
@@ -466,11 +470,11 @@ module decode_stage (
             src_instr32       = c_expand(hold_word_q[15:0]);
             src_pc            = hold_pc_q;
             // Recompute: a 16-bit instr in the upper half is compressed
-            // iff its [1:0] != 2'b11 (do NOT trust fe_is_compressed_i,
-            // which described the WHOLE word, not this half).
+            // iff its [1:0] != 2'b11 (do NOT trust fe_is_compressed,
+            // which describes the WHOLE word, not this half).
             src_is_compressed = (hold_word_q[1:0] != 2'b11);
         end else begin
-            if (fe_is_compressed_i) begin
+            if (fe_is_compressed) begin
                 src_instr32       = c_expand(fe_instr_i[15:0]);
                 src_pc            = fe_pc_i;
                 src_is_compressed = 1'b1;
@@ -482,7 +486,7 @@ module decode_stage (
         end
 
         // Decode the low compressed half now -> stash the upper half.
-        buffer_upper = (!is_hold) && fe_valid_i && fe_is_compressed_i;
+        buffer_upper = (!is_hold) && fe_valid_i && fe_is_compressed;
 
         // Spanning case: upper half that looks like a 32-bit instr.
         spanning_illegal = is_hold && (hold_word_q[1:0] == 2'b11);

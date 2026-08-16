@@ -120,42 +120,20 @@ module top_module (
     wire [XLEN-1:0] cpu_pc_dbg;
 
     rv32imac_zicsr_zifencei u_cpu (
-        .clk_i                 (clk_core),
-        .rstn_i                (rstn_core),
-        .boot_addr_i           (32'h0000_0000),
-        .imem_axi              (axi_bus_imem.master),
-        .peri_axi              (axi_bus_peri.master),
-        // fe_* debug taps (fetch). Only fe_pc_dbg_o[3:0] is used here
+        .clk_i         (clk_core),
+        .rstn_i        (rstn_core),
+        .boot_addr_i   (32'h0000_0000),
+        .imem_axi      (axi_bus_imem.master),
+        .peri_axi      (axi_bus_peri.master),
+        // fe_* / de_* debug taps: only fe_pc_dbg_o[3:0] is used here
         // (LEDs); the rest are unused on the board (swept by synthesis),
         // consumed by the simulation wrapper.
-        .fe_pc_dbg_o           (cpu_pc_dbg),
-        .fe_instr_dbg_o        (),
-        .fe_valid_dbg_o        (),
-        .fe_is_compressed_dbg_o(),
-        .fe_next_pc_dbg_o      (),
-        // de_* debug taps (decode): likewise unused on the board, swept
-        // by synthesis, consumed by the simulation wrapper.
-        .de_valid_dbg_o        (),
-        .de_pc_dbg_o           (),
-        .de_instr_dbg_o        (),
-        .de_is_compressed_dbg_o(),
-        .de_rs1_addr_dbg_o     (),
-        .de_rs2_addr_dbg_o     (),
-        .de_rs1_data_dbg_o     (),
-        .de_rs2_data_dbg_o     (),
-        .de_imm_dbg_o          (),
-        .de_rd_dbg_o           (),
-        .de_reg_write_dbg_o    (),
-        .de_alu_op_dbg_o       (),
-        .de_alu_src_a_dbg_o    (),
-        .de_alu_src_b_dbg_o    (),
-        .de_mem_read_dbg_o     (),
-        .de_mem_write_dbg_o    (),
-        .de_mem_size_dbg_o     (),
-        .de_mem_unsigned_dbg_o (),
-        .de_wb_src_dbg_o       (),
-        .de_branch_type_dbg_o  (),
-        .de_illegal_dbg_o      ()
+        .fe_pc_dbg_o   (cpu_pc_dbg),
+        .fe_instr_dbg_o(),
+        .fe_valid_dbg_o(),
+        .de_pc_dbg_o   (),
+        .de_instr_dbg_o(),
+        .de_valid_dbg_o()
     );
 
     // -----------------------------------------------------------------
