@@ -24,15 +24,21 @@ import rv32_pkg::*;
 
 
 module alu (
-    input logic clk_i,
-    input logic rst_ni,
+    input wire clk_i,
+    input wire rst_ni,
 
-    input logic    [XLEN-1:0] operand_a_i,
-    input logic    [XLEN-1:0] operand_b_i,
-    input alu_op_t            alu_op_i,
-    input logic    [     1:0] shamt_i,      // Zilx index scale (log2 size, 0 unscaled)
+    input wire [XLEN-1:0] operand_a_i,
+    input wire [XLEN-1:0] operand_b_i,
+    input wire alu_op_t alu_op_i,  // enum port: needs explicit net type under `default_nettype none` (EX3094); struct ports (de_t/mem_req_t) auto-resolve to var, enum does not
+    input wire [1:0] shamt_i,  // Zilx index scale (log2 size, 0 unscaled)
 
-    input  logic            start_i,         // impulso: lancia l'op (serve solo per DIV/REM)
+    // result_valid_o / result_o are driven procedurally in the final
+    // always_comb below, so they are variables (logic) — a wire/net cannot
+    // take a procedural assignment (GowinSynthesis EX3900). Inputs and the
+    // assign-driven helpers stay wire (EX3094: under `default_nettype none`
+    // every net needs an explicit net type, and `logic` is a variable kind,
+    // not a net — so ports must be `wire`, matching the rest of the project).
+    input  wire             start_i,         // impulso: lancia l'op (serve solo per DIV/REM)
     output logic            result_valid_o,
     output logic [XLEN-1:0] result_o
 );
@@ -90,9 +96,11 @@ module alu (
         (alu_op_i == ALU_MULHSU) || (alu_op_i == ALU_MULHU);
 
     // -----------------------------------------------------------
-    // DIV/REM — multi-ciclo, restoring division, 32 iterazioni
-    // TODO: gestire i case RISC-V-defined per div-by-zero e
-    // overflow (INT_MIN / -1) prima di usare div_result.
+    // DIV/REM — multi-ciclo, restoring division, 32 iterazioni.
+    // Div-by-zero e' rilevato sul divisore memorizzato (div_divisor_q);
+    // i risultati RISC-V (all-ones per DIV/DIVU, dividendo per REM/REMU)
+    // sono codificati nel mux div_result qui sotto.
+    // TODO: overflow (INT_MIN / -1) non ancora gestito.
     // -----------------------------------------------------------
     logic is_div_op;
     assign is_div_op = (alu_op_i == ALU_DIV) || (alu_op_i == ALU_DIVU) || (alu_op_i == ALU_REM) ||
@@ -106,20 +114,10 @@ module alu (
     div_state_e div_state_q, div_state_d;
 
     logic [4:0] div_cnt_q, div_cnt_d;
-    logic [XLEN-1:0] div_a_q, div_b_q;
+    logic [XLEN-1:0] div_a_q;
     logic div_a_neg_q, div_b_neg_q;
     logic [2*XLEN-1:0] div_rem_q, div_rem_d;  // {remainder, quotient} shift register
     logic [XLEN-1:0] div_divisor_q;
-
-    always_ff @(posedge clk_i or negedge rst_ni) begin
-        if (!rst_ni) begin
-            div_state_q <= DIV_IDLE;
-            div_cnt_q   <= '0;
-        end else begin
-            div_state_q <= div_state_d;
-            div_cnt_q   <= div_cnt_d;
-        end
-    end
 
     // operandi unsigned per il core della divisione; il segno si
     // riapplica in uscita per DIV/REM (non per DIVU/REMU)
@@ -129,23 +127,46 @@ module alu (
     assign div_b_abs = (alu_op_i inside {ALU_DIV, ALU_REM}) && operand_b_i[XLEN-1] ? -operand_b_i :
         operand_b_i;
 
+    // Shift-subtract helper nets. SUG949E §3 follows Verilog-2001 style:
+    // no variable declarations nested inside an always block, so these
+    // cannot be `automatic` locals declared in the DIV_RUN branch
+    // (GowinSynthesis rejects that, the module is ignored, and the
+    // u_alu instantiation cascades to EX3990). Declare them at module
+    // scope and drive them with continuous assigns instead.
+    logic [2*XLEN-1:0] shifted;
+    logic [  XLEN-1:0] rem_part;
+    assign shifted  = div_rem_q << 1;
+    assign rem_part = shifted[2*XLEN-1:XLEN];
+
+    // Un solo clock, reset sincrono (coerente col resto della pipeline;
+    // SUG949E §3.2 rule 1: ogni registro deve avere un valore iniziale/di
+    // reset -- prima div_a_q / div_divisor_q / div_a_neg_q / div_b_neg_q /
+    // div_rem_q non ne avevano).
     always_ff @(posedge clk_i) begin
-        if (div_state_q == DIV_IDLE && start_i && is_div_op) begin
-            div_a_q       <= div_a_abs;
-            div_divisor_q <= div_b_abs;
-            div_a_neg_q   <= (alu_op_i == ALU_DIV) && (operand_a_i[XLEN-1] ^ operand_b_i[XLEN-1]);
-            div_b_neg_q   <= (alu_op_i == ALU_REM) && operand_a_i[XLEN-1];
-            div_rem_q     <= {{XLEN{1'b0}}, div_a_abs};
-        end else if (div_state_q == DIV_RUN) begin
-            // uno shift-subtract per ciclo
-            automatic logic [2*XLEN-1:0] shifted;
-            automatic logic [  XLEN-1:0] rem_part;
-            shifted  = div_rem_q << 1;
-            rem_part = shifted[2*XLEN-1:XLEN];
-            if (rem_part >= div_divisor_q) begin
-                div_rem_q <= {rem_part - div_divisor_q, shifted[XLEN-2:0], 1'b1};
-            end else begin
-                div_rem_q <= shifted;
+        if (!rst_ni) begin
+            div_state_q   <= DIV_IDLE;
+            div_cnt_q     <= '0;
+            div_a_q       <= '0;
+            div_divisor_q <= '0;
+            div_a_neg_q   <= 1'b0;
+            div_b_neg_q   <= 1'b0;
+            div_rem_q     <= '0;
+        end else begin
+            div_state_q <= div_state_d;
+            div_cnt_q   <= div_cnt_d;
+            if (div_state_q == DIV_IDLE && start_i && is_div_op) begin
+                div_a_q <= div_a_abs;
+                div_divisor_q <= div_b_abs;
+                div_a_neg_q <= (alu_op_i == ALU_DIV) && (operand_a_i[XLEN-1] ^ operand_b_i[XLEN-1]);
+                div_b_neg_q <= (alu_op_i == ALU_REM) && operand_a_i[XLEN-1];
+                div_rem_q <= {{XLEN{1'b0}}, div_a_abs};
+            end else if (div_state_q == DIV_RUN) begin
+                // uno shift-subtract per ciclo
+                if (rem_part >= div_divisor_q) begin
+                    div_rem_q <= {rem_part - div_divisor_q, shifted[XLEN-2:0], 1'b1};
+                end else begin
+                    div_rem_q <= shifted;
+                end
             end
         end
     end
@@ -161,7 +182,7 @@ module alu (
             end
             DIV_RUN: begin
                 if (div_cnt_q == XLEN - 1) div_state_d = DIV_DONE;
-                else div_cnt_d = div_cnt_q + 1;
+                else div_cnt_d = div_cnt_q + 5'd1;  // sized: avoid 6->5 truncation (EX3791)
             end
             DIV_DONE: div_state_d = DIV_IDLE;
             default:  div_state_d = DIV_IDLE;
@@ -174,13 +195,21 @@ module alu (
 
     logic [XLEN-1:0] div_result;
     always_comb begin
+        // Div-by-zero: detect on the stored divisor (div_divisor_q holds
+        // abs(operand_b) for DIV/REM, operand_b for DIVU/REMU -- both are
+        // 0 iff operand_b==0). Previously this used div_b_q, a register
+        // that was never written, so the check was stuck at true and every
+        // DIV/REM wrongly took the div-by-zero path.
+        // TODO: overflow (INT_MIN / -1) is still not handled.
         unique case (alu_op_i)
             ALU_DIV:
-            div_result = (div_b_q == 0) ? '1 : (div_a_neg_q ? -div_quot_raw : div_quot_raw);
-            ALU_DIVU: div_result = (div_b_q == 0) ? '1 : div_quot_raw;
+            div_result = (div_divisor_q == 0) ?
+                {XLEN{1'b1}} : (div_a_neg_q ? -div_quot_raw : div_quot_raw);
+            ALU_DIVU: div_result = (div_divisor_q == 0) ? {XLEN{1'b1}} : div_quot_raw;
             ALU_REM:
-            div_result = (div_b_q == 0) ? div_a_q : (div_b_neg_q ? -div_rem_raw : div_rem_raw);
-            ALU_REMU: div_result = (div_b_q == 0) ? div_a_q : div_rem_raw;
+            div_result = (div_divisor_q == 0) ?
+                div_a_q : (div_b_neg_q ? -div_rem_raw : div_rem_raw);
+            ALU_REMU: div_result = (div_divisor_q == 0) ? div_a_q : div_rem_raw;
             default: div_result = '0;
         endcase
     end

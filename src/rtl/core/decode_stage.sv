@@ -473,6 +473,17 @@ module decode_stage (
     branch_t         branch_type;
     logic            dec_illegal;
 
+    // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
+    // and driven with a default every cycle in the decode always_comb below:
+    // declaring them inside the OPC_AMO case branch and assigning them only
+    // there made GowinSynthesis infer a latch (EX2420/EX3101) — they "held"
+    // when any other opcode ran. Defaults at the top of the always_comb kill
+    // the latch; the OPC_AMO branch overrides zilx_ok to 1 when the encoding
+    // is a valid RV32 Zilx indexed load.
+    logic is_unscaled, is_scaled;
+    logic size_ok_rv32;
+    logic zilx_ok;
+
     always_comb begin
         // ---- Source selection (priority: hold buffer > fresh F/D) ----
         is_hold = hold_q;
@@ -552,6 +563,12 @@ module decode_stage (
         wb_src = WB_ALU;
         branch_type = BR_NONE;
         dec_illegal = 1'b1;  // default: anything not matched is illegal
+        // Zilx helpers: assigned here so every opcode path drives them (no
+        // latch). Only OPC_AMO below reads/overrides zilx_ok.
+        is_unscaled = (funct5 == 5'b10010);  // lx  (unscaled)
+        is_scaled = (funct5 == 5'b11010);  // lxs (scaled)
+        size_ok_rv32 = (funct3 inside {3'b000, 3'b001, 3'b010, 3'b100, 3'b101});
+        zilx_ok = 1'b0;
 
         unique case (opcode)
             OPC_LUI: begin
@@ -764,11 +781,10 @@ module decode_stage (
                 //   control rides the D/E register to the debug taps.
                 //   Real AMOs (funct5 not in the Zilx set) and RV64-only
                 //   encodings decode to illegal=1 this phase.
-                logic is_unscaled, is_scaled;
-                logic size_ok_rv32;
-                logic zilx_ok;
-                is_unscaled = (funct5 == 5'b10010);  // lx
-                is_scaled   = (funct5 == 5'b11010);  // lxs
+                // is_unscaled / is_scaled / size_ok_rv32 / zilx_ok default
+                // are set at the top of this always_comb (no latch —
+                // declaring them here and assigning only in this branch
+                // made GowinSynthesis infer a latch, EX2420/EX3101).
                 // funct5 == 5'b11110 (lxsuw) is RV64-only -> illegal on RV32.
 
                 // funct3 -> access size/sign (same map as OPC_LOAD).
@@ -799,10 +815,8 @@ module decode_stage (
                     end
                     // 3'b011 / 3'b110 (RV64) and 3'b111 -> reserved
                 endcase
-                size_ok_rv32 = (funct3 inside {3'b000, 3'b001, 3'b010, 3'b100, 3'b101});
-                zilx_ok      = 1'b0;
                 if (aq || rl) begin
-                    // aq/rl reserved -> illegal
+                    // aq/rl reserved -> illegal (zilx_ok stays 0 from default)
                 end else if (is_unscaled) begin
                     // lx: no unscaled byte (funct3[1:0]==00); RV64 sizes reserved.
                     if (size_ok_rv32 && funct3[1:0] != 2'b00) begin

@@ -65,10 +65,14 @@ module execute_stage (
     // Flush decode's D/E register on a taken branch.
     output wire flush_o,
 
-    // Writeback to the register file.
-    output wire [     4:0] wb_addr_o,
-    output wire [XLEN-1:0] wb_data_o,
-    output wire            wb_en_o,
+    // Writeback to the register file. wb_data_o is driven procedurally in
+    // the writeback always_comb below, so it must be a variable (logic),
+    // not a wire — a wire/net cannot take a procedural assignment
+    // (GowinSynthesis EX3900). The assign-driven wb_addr_o / wb_en_o stay
+    // wire.
+    output wire  [     4:0] wb_addr_o,
+    output logic [XLEN-1:0] wb_data_o,
+    output wire             wb_en_o,
 
     // Branch redirect to fetch.
     output wire            branch_valid_o,
