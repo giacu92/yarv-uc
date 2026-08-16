@@ -1,62 +1,62 @@
 @00000000
-// RV32I + M + C program to exercise fetch AND decode. Neither stage past
-// decode is implemented, so nothing executes; the encodings just need to
-// be valid so the decode log (control + operands + immediates) can be
-// matched. One 32-bit hex word per line; the word value IS the encoding
-// (low half = rdata[15:0], upper half = rdata[31:16]).
+// ALU-only RV32IM test program for the execute-stage retire log.
 //
-// Every encoding below was computed with the RV32I bit-field formula
-//   instr = (imm<<..)|(rs2<<20)|(rs1<<15)|(funct3<<12)|(rd<<7)|opcode
-// (and the RVC field tables for the compressed forms) and cross-checked
-// against the decode log. Decode is validated: it faithfully decodes
-// whatever word fetch delivers, so the verification is encoding-vs-log.
+// No control flow (no branches/jumps) and no loads/stores: every
+// instruction is a register-register or register-immediate ALU op or a
+// NOP, so the retire (ex) log is a clean, in-order record of what the
+// execute stage wrote back. The program is HAZARD-FREE by construction
+// (see the RAW limitation in CLAUDE.md / execute_stage.sv): no
+// instruction reads the register written by the immediately preceding
+// instruction -- a NOP (or an independent op) is inserted wherever a
+// producer is followed by its consumer, so each read sees a settled
+// value. DIV/REM are multi-cycle and stall the pipe; their results are
+// not consumed by the next slot (div result not bypassed), so no div
+// consumer is placed adjacent to its div.
 //
-//   c.li   x1,5     = 0x4095  -> addi x1,x0,5     (rd=1, rs1=0, imm=5, C)
-//   c.addi x1,1     = 0x0085  -> addi x1,x1,1     (rd=1, rs1=1, imm=1, C)
-//   lui    x2,1     = 0x00001137                (rd=2, imm=0x1000)
-//   auipc  x3,2     = 0x00002197                (rd=3, imm=0x2000)
-//   addi   x4,x0,7  = 0x00700213                (rd=4, rs1=0, imm=7)
-//   mul    x8,x9,x10= 0x02A48433                (M: alu=MUL, rd=8, rs1=9, rs2=10)
-//   beq    x0,x0,8  = 0x00000463                (BRANCH BEQ, rs1=0, rs2=0, imm=8)
-//   lw     x5,4(x0) = 0x00402283                (LOAD W, rd=5, rs1=0, imm=4)
-//   sw     x5,8(x0) = 0x00502423                (STORE W, rs1=0, rs2=5, imm=8)
-//   c.mv   x1,x2    = 0x808A  -> add  x1,x0,x2    (rd=1, rs1=0, rs2=2, C)
-//   c.add  x1,x2    = 0x908A  -> add  x1,x1,x2    (rd=1, rs1=1, rs2=2, C)
-//   c.slli x1,2     = 0x008A  -> slli x1,x1,2     (rd=1, rs1=1, imm=2, C)
-//   c.nop           = 0x0001  -> addi x0,x0,0     (rd=0, C)
-//   jalr   x0,0(x1) = 0x00008067                (JALR, rd=0, rs1=1, imm=0)
-//   c.j    16       = 0xA801  -> jal  x0,16       (branch=JAL, imm=16, C)
-//   c.j    0        = 0xA001  -> jal  x0,0        (branch=JAL, imm=0, C)
-//   ecall           = 0x00000073                (SYSTEM -> illegal=1)
-//   upper 0x0013 in a compressed-low word          (spanning case -> illegal=1)
+// One 32-bit hex word per line; the word value IS the encoding
+// (low half = rdata[15:0], upper half = rdata[31:16]). Encodings were
+// computed with a bit-field script and spot-checked by hand. The sim
+// retire log is the oracle: it should show every instruction below
+// retiring in PC order, ending at the last NOP -- the zeros past the
+// program decode to illegal (opcode 0) and do not retire.
 //
-// Word layout (low half decoded first; if low is compressed, upper half
-// is held and decoded next cycle at PC=word_pc+2):
-//   0x00854095  c.addi x1,1 | c.li x1,5        PC 0  / 2
-//   0x00001137  lui x2,1                          PC 4
-//   0x00002197  auipc x3,2                        PC 8
-//   0x00700213  addi x4,x0,7                       PC 12
-//   0x02A48433  mul x8,x9,x10                      PC 16
-//   0x00000463  beq x0,x0,8                        PC 20
-//   0x00402283  lw x5,4(x0)                        PC 24
-//   0x00502423  sw x5,8(x0)                        PC 28
-//   0x908A808A  c.add x1,x2 | c.mv x1,x2           PC 32 / 34
-//   0x0001008A  c.nop | c.slli x1,2                PC 36 / 38
-//   0x00008067  jalr x0,0(x1)                      PC 40
-//   0xA001A801  c.j 0 | c.j 16                     PC 44 / 46
-//   0x00000073  ecall (illegal)                    PC 48
-//   0x00134095  spanning(0x0013) | c.li x1,5        PC 52 (li) / 54 (spanning illegal)
-00854095
-00001137
-00002197
-00700213
-02A48433
-00000463
-00402283
-00502423
-908A808A
-0001008A
-00008067
-A001A801
-00000073
-00134095
+// ex_* exposes pc / instr / valid only, so the writeback VALUE is not
+// directly observable here; the retire log verifies the sequencing and
+// the writeback/branch-resolve path. Add a writeback tap when values
+// need checking.
+
+0x00a00093  // 0x00: addi  x1,  x0, 10        [x1 = 10]
+0x01400113  // 0x04: addi  x2,  x0, 20        [x2 = 20]
+0x00000013  // 0x08: nop                       [bubble for x1,x2]
+0x002081b3  // 0x0c: add   x3,  x1, x2        [x3 = 30]
+0x40208233  // 0x10: sub   x4,  x1, x2        [x4 = -10]
+0x0020e3b3  // 0x14: or    x7,  x1, x2        [x7 = 30]
+0x0020f2b3  // 0x18: and   x5,  x1, x2        [x5 = 0]
+0x0020c433  // 0x1c: xor   x8,  x1, x2        [x8 = 30]
+0x00200313  // 0x20: addi  x6,  x0, 2         [x6 = 2]
+0x00000013  // 0x24: nop                       [bubble for x6]
+0x006094b3  // 0x28: sll   x9,  x1, x6        [x9 = 40]
+0x0060d533  // 0x2c: srl   x10, x1, x6        [x10 = 2]
+0x406255b3  // 0x30: sra   x11, x4, x6        [x11 = -3]
+0x0020a633  // 0x34: slt   x12, x1, x2        [x12 = 1]
+0x002236b3  // 0x38: sltu  x13, x4, x2        [x13 = 0]
+0x02208733  // 0x3c: mul   x14, x1, x2        [x14 = 200]
+0x000017b7  // 0x40: lui   x15, 1             [x15 = 0x1000]
+0x00002817  // 0x44: auipc x16, 2             [x16 = pc + 0x2000]
+0xfff00893  // 0x48: addi  x17, x0, -1        [x17 = 0xFFFFFFFF]
+0x00000013  // 0x4c: nop                       [bubble for x17]
+0x0078c913  // 0x50: xori  x18, x17, 7         [x18 = 0xFFFFFFF8]
+0x1000e993  // 0x54: ori   x19, x1, 0x100     [x19 = 0x10A]
+0x00f17a13  // 0x58: andi  x20, x2, 0xF       [x20 = 4]
+0x0140aa93  // 0x5c: slti  x21, x1, 20        [x21 = 1]
+0x00b0bb13  // 0x60: sltiu x22, x1, 11        [x22 = 1]
+0x00309b93  // 0x64: slli  x23, x1, 3         [x23 = 80]
+0x00215c13  // 0x68: srli  x24, x2, 2         [x24 = 5]
+0x40125c93  // 0x6c: srai  x25, x4, 1         [x25 = -5]
+0x02614d33  // 0x70: div   x26, x2, x6        [x26 = 10  (multi-cycle)]
+0x02616db3  // 0x74: rem   x27, x2, x6        [x27 = 0   (multi-cycle)]
+0x00000013  // 0x78: nop                       [bubble after div chain]
+0x02615e33  // 0x7c: divu  x28, x2, x6        [x28 = 10  (multi-cycle)]
+0x02617eb3  // 0x80: remu  x29, x2, x6        [x29 = 0   (multi-cycle)]
+0x00000013  // 0x84: nop
+0x00000013  // 0x88: nop

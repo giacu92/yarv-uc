@@ -37,7 +37,12 @@ module sim_top (
     // de_* debug taps (decode / D/E register): pc / instr / valid.
     output wire [XLEN-1:0] de_pc_dbg_o,
     output wire [XLEN-1:0] de_instr_dbg_o,
-    output wire            de_valid_dbg_o
+    output wire            de_valid_dbg_o,
+
+    // ex_* debug taps (execute / E/M register): pc / instr / valid.
+    output wire [XLEN-1:0] ex_pc_dbg_o,
+    output wire [XLEN-1:0] ex_instr_dbg_o,
+    output wire            ex_valid_dbg_o
 );
 
     // -----------------------------------------------------------------
@@ -69,7 +74,10 @@ module sim_top (
         .fe_valid_dbg_o(fe_valid_dbg_o),
         .de_pc_dbg_o   (de_pc_dbg_o),
         .de_instr_dbg_o(de_instr_dbg_o),
-        .de_valid_dbg_o(de_valid_dbg_o)
+        .de_valid_dbg_o(de_valid_dbg_o),
+        .ex_pc_dbg_o   (ex_pc_dbg_o),
+        .ex_instr_dbg_o(ex_instr_dbg_o),
+        .ex_valid_dbg_o(ex_valid_dbg_o)
     );
 
     assign led_o       = cpu_pc_dbg[3:0];

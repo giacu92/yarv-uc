@@ -2,12 +2,16 @@
 //
 // Drives clk/rst, holds reset for a few cycles, then clocks the design
 // and logs (per stage: pc / instr / valid — the only debug taps the CPU
-// exports now):
+// exports now), each in its own reset+run pass so the three logs stay
+// aligned (each stage lags the previous by one cycle):
 //   - every instruction word the fetch stage delivers to the F/D
-//     register (fetch log), and
+//     register (fetch log),
 //   - every decoded instruction the decode stage latches into the D/E
-//     register (decode log). Decode control / operands / immediates are
-//     no longer exported; add taps back when they need verifying.
+//     register (decode log), and
+//   - every operation the execute stage retires into the E/M register
+//     (execute log). Decode control / operands / immediates and the
+//     writeback value are not exported; add taps back when they need
+//     verifying.
 //
 // A VCD waveform (sim_top.vcd) is written for GTKWave.
 //
@@ -43,7 +47,7 @@ int main(int argc, char** argv) {
     top->trace(tfp, 99);
     tfp->open("sim_top.vcd");
 
-    printf("=== RV32 fetch + decode sim ===\n");
+    printf("=== RV32 fetch + decode + execute sim ===\n");
 
     // Reset (async, active-low): hold rstn_i=0 for a few cycles.
     top->clk_i  = 0;
@@ -70,6 +74,7 @@ int main(int argc, char** argv) {
     int fetched   = 0;
     int decoded   = 0;
     int max_fetch = 16;      // stop after this many fetched words
+    int max_instr = 64;      // cap for the decode / execute retire logs
     int max_cyc   = 400;     // safety bound
     uint32_t prev_fe_pc = 0;
     bool     have_prev_fe = false;
@@ -120,7 +125,7 @@ int main(int argc, char** argv) {
     // recovered from it, and the instruction-stream PC advance (+2 / +4)
     // is not checkable here without an is-compressed tap. Add taps back
     // when decode control / compressed-ness need verifying.
-    for (int cyc = 0; cyc < max_cyc && decoded < max_fetch * 2; ++cyc) {
+    for (int cyc = 0; cyc < max_cyc && decoded < max_instr; ++cyc) {
         tick(top, tfp);
 
         if (top->de_valid_dbg_o) {
@@ -133,6 +138,42 @@ int main(int argc, char** argv) {
 
     printf("---  ----------  ----------\n");
     printf("decoded %d instructions in %d cycles\n", decoded, max_cyc);
+
+    // ----- Execute retire log (one line per E/M-valid retired op) -----
+    // A third reset+run pass, so the retire log is aligned with the fetch
+    // and decode logs above. ex_* is the E/M register: it latches the PC /
+    // instr / valid of the operation that retired this cycle (single-cycle
+    // ALU ops retire the cycle they are valid; DIV/REM retire when the ALU
+    // asserts result_valid_o). Mem ops and illegal ops do not retire
+    // (ex_valid stays 0), so the retire log ends when the program runs off
+    // into zeros. ex_* exposes pc / instr / valid only — the writeback value
+    // is not observable here; add a writeback tap when values need verifying.
+    top->rstn_i = 0;
+    top->eval();
+    tfp->dump(sim_time++);
+    for (int i = 0; i < 4; ++i) tick(top, tfp);
+    top->rstn_i = 1;
+    top->eval();
+    tfp->dump(sim_time++);
+
+    printf("--- execute (ex) ---\n");
+    printf("cyc  pc          instr\n");
+    printf("---  ----------  ----------\n");
+
+    int retired = 0;
+    for (int cyc = 0; cyc < max_cyc && retired < max_instr; ++cyc) {
+        tick(top, tfp);
+
+        if (top->ex_valid_dbg_o) {
+            uint32_t pc    = top->ex_pc_dbg_o;
+            uint32_t instr = top->ex_instr_dbg_o;
+            printf("%3d  0x%08x  0x%08x\n", cyc, pc, instr);
+            ++retired;
+        }
+    }
+
+    printf("---  ----------  ----------\n");
+    printf("retired %d instructions in %d cycles\n", retired, max_cyc);
 
     // Let a few final cycles ripple for the waveform tail.
     for (int i = 0; i < 4; ++i) tick(top, tfp);
