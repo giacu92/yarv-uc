@@ -14,12 +14,12 @@
 
 # Primary clock: 27 MHz from the onboard oscillator on PIN4.
 # Period = 37.037 ns. 50/50 duty cycle.
-create_clock -name clk27 -period 37.037 [get_ports clk_i]
+create_clock -name clk27 -period 37.037 [get_ports {clk_i}]
 
 # Async reset: treat rstn_i as asynchronous to clk_i.
 # (We do not currently generate / assert rstn_i internally; this is
 # documentation for future use.)
-set_false_path -from [get_ports rstn_i]
+set_false_path -from [get_ports {rstn_i}]
 
 # Debug LEDs are not timing-critical (human eye).
 set_false_path -to [get_ports {led_o[*]}]

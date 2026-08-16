@@ -157,6 +157,10 @@ module axi4_lite_master_bridge (
                     state_d = S_IDLE;
                 end
             end
+
+            // The 3-bit state_t enum has 3 unused encodings; cover them so
+            // the unique case is full (silences EX3005) and recovers to idle.
+            default: state_d = S_IDLE;
         endcase
     end
 

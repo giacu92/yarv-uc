@@ -40,6 +40,66 @@ module top_module (
 );
 
     // -----------------------------------------------------------------
+    // Clock generation
+    //
+    // Board oscillator:
+    //   clk_i = 27 MHz
+    //
+    // Internal CPU clock:
+    //   clk_core = 50 MHz
+    // -----------------------------------------------------------------
+
+    wire clk_core;
+    wire pll_lock;
+
+    rPLL #(  // For GW1NR-9C C6/I5 (Tang Nano 9K proto dev board)
+        .FCLKIN   ("27"),
+        .IDIV_SEL (5),     // -> PFD = 4.5 MHz (range: 3-400 MHz)
+        .FBDIV_SEL(21),    // -> CLKOUT = 99 MHz (range: 3.125-600 MHz)
+        .ODIV_SEL (8)      // -> VCO = 792 MHz (range: 400-1200 MHz)
+    ) pll (
+        .CLKOUTP (),
+        .CLKOUTD (),
+        .CLKOUTD3(),
+        .RESET   (1'b0),
+        .RESET_P (1'b0),
+        .CLKFB   (1'b0),
+        .FBDSEL  (6'b0),
+        .IDSEL   (6'b0),
+        .ODSEL   (6'b0),
+        .PSDA    (4'b0),
+        .DUTYDA  (4'b0),
+        .FDLY    (4'b0),
+        .CLKIN   (clk_i),     // 27 MHz
+        .CLKOUT  (clk_core),  // 99 MHz
+        .LOCK    (pll_lock)
+    );
+
+    // -----------------------------------------------------------------
+    // Reset synchronization
+    //
+    // Reset is asserted while:
+    //   - external reset is asserted, OR
+    //   - PLL has not locked yet.
+    //
+    // Deassertion is synchronized to clk_core.
+    // -----------------------------------------------------------------
+
+    logic [1:0] rst_sync;
+
+    always_ff @(posedge clk_core or negedge rstn_i) begin
+        if (!rstn_i) begin
+            rst_sync <= 2'b00;
+        end else if (!pll_lock) begin
+            rst_sync <= 2'b00;
+        end else begin
+            rst_sync <= {rst_sync[0], 1'b1};
+        end
+    end
+
+    wire rstn_core = rst_sync[1];
+
+    // -----------------------------------------------------------------
     // AXI4-Lite buses (trunk modport) — one per CPU master port
     // -----------------------------------------------------------------
     axi4_lite_if axi_bus_imem ();
@@ -60,8 +120,8 @@ module top_module (
     wire [XLEN-1:0] cpu_pc_dbg;
 
     rv32imac_zicsr_zifencei u_cpu (
-        .clk_i                 (clk_i),
-        .rstn_i                (rstn_i),
+        .clk_i                 (clk_core),
+        .rstn_i                (rstn_core),
         .boot_addr_i           (32'h0000_0000),
         .imem_axi              (axi_bus_imem.master),
         .peri_axi              (axi_bus_peri.master),

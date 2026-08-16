@@ -2,6 +2,7 @@
 -p GW2AR-18C-QFN88-8
 -pn GW2AR-LV18QN88C8/I7
 -cst /home/giacomo/gowin_proj/rv32imac_Zicsr_Zifencei/src/phys/rv32imac_Zicsr_Zifencei.cst
+-sdc /home/giacomo/gowin_proj/rv32imac_Zicsr_Zifencei/src/phys/rv32imac_Zicsr_Zifencei.sdc
 -cfg /home/giacomo/gowin_proj/rv32imac_Zicsr_Zifencei/impl/pnr/device.cfg
 -bit
 -tr
@@ -14,4 +15,4 @@
 -clock_route_order 0
 -correct_hold 1
 -route_maxfan 23
--global_freq 100.000
+-global_freq 27.000
