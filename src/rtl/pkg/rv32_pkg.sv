@@ -62,9 +62,11 @@ package rv32_pkg;
     localparam logic [6:0] OPC_OP       = 7'b0110011;  // M is OPC_OP with funct7=0000001
     localparam logic [6:0] OPC_MISC_MEM = 7'b0001111;  // fence / fence.i (Zifencei) -> illegal
     localparam logic [6:0] OPC_SYSTEM   = 7'b1110011;  // CSR / ecall / ebreak (Zicsr) -> illegal
+    localparam logic [6:0] OPC_AMO      = 7'b0101111;  // A extension (Zam) -> illegal
 
-    // ALU operation (base RV32I + M extension). 18 values -> 5 bits.
+    // ALU operation (base RV32I + M extension + Zilx EA). 19 values -> 5 bits.
     typedef enum logic [4:0] {
+        // -------- Base ALU operations --------
         ALU_ADD,
         ALU_SUB,
         ALU_SLL,
@@ -75,7 +77,8 @@ package rv32_pkg;
         ALU_SRA,
         ALU_OR,
         ALU_AND,
-        // M extension (funct7 == 0000001)
+
+        // -------- M extension (funct7 == 0000001) --------
         ALU_MUL,
         ALU_MULH,
         ALU_MULHSU,
@@ -83,7 +86,14 @@ package rv32_pkg;
         ALU_DIV,
         ALU_DIVU,
         ALU_REM,
-        ALU_REMU
+        ALU_REMU,
+
+        // -------- Zilx indexed-load EA (RV32) --------
+        // EA = base + (index << shamt). operand_a = rs2_data (base),
+        // operand_b = rs1_data (index); shamt comes from de_t.mem_shamt
+        // (0 unscaled, log2(access_size) scaled). The load itself is the
+        // LSU's job (mem_read / WB_MEM); ALU_LX computes the address only.
+        ALU_LX
     } alu_op_t;
 
     // Branch / jump type (JAL/JALR encoded here too — no separate flags).
@@ -100,16 +110,18 @@ package rv32_pkg;
     } branch_t;
 
     // ALU operand-A source.
-    typedef enum logic [0:0] {
+    typedef enum logic [1:0] {
         ALU_A_RS1,
-        ALU_A_PC
+        ALU_A_PC,
+        ALU_A_RS2   // Zilx base (spec: rs2 = base, rs1 = index)
     } alu_src_a_t;
     // ALU operand-B source.
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         ALU_B_IMM,
         ALU_B_RS2,
         ALU_B_PC4,
-        ALU_B_ZERO
+        ALU_B_ZERO,
+        ALU_B_RS1_SH  // Zilx index (rs1), shifted by de_t.mem_shamt inside the ALU
     } alu_src_b_t;
     // Write-back source.
     typedef enum logic [1:0] {
@@ -146,6 +158,7 @@ package rv32_pkg;
         logic            mem_write;
         mem_size_t       mem_size;
         logic            mem_unsigned;   // load zero-extend (LBU/LHU)
+        logic [1:0]      mem_shamt;      // Zilx index scale (0 unscaled, log2 size scaled)
         wb_src_t         wb_src;
         branch_t         branch_type;
         logic            illegal;        // opcode/encoding not decoded this phase

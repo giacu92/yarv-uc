@@ -42,6 +42,13 @@ import rv32_pkg::*;
  * fe_valid_i are mutually exclusive by construction (hold raises the
  * cycle fe_valid falls), so stall_o is 0 in steady state.
  *
+ * Decoded-but-not-yet-executable opcodes (control rides the D/E register to
+ * the debug taps; the LSU is not present yet, so loads don't retire):
+ *   OPC_AMO with Zilx funct5 (10010 unscaled / 11010 scaled) -> indexed-load
+ *     control (mem_read, ALU_LX effective address, WB_MEM). rs1=index,
+ *     rs2=base (roles swapped vs base loads). Real AMOs (other funct5) and
+ *     RV64-only encodings (funct5=11110, funct3=011/110) decode to illegal.
+ *
  * Deferred opcodes (decode to illegal=1, not executed this phase):
  *   OPC_MISC_MEM (fence / fence.i — Zifencei),
  *   OPC_SYSTEM   (CSR / ecall / ebreak — Zicsr),
@@ -443,6 +450,8 @@ module decode_stage (
     logic [ 2:0] funct3;
     logic [ 6:0] funct7;
     logic        funct7b5;  // funct7[5] — SUB/SRA, M-ext
+    logic [ 4:0] funct5;  // AMO/Zilx mode (instr[31:27])
+    logic aq, rl;  // AMO ordering bits (instr[26:25]) — must be 0 for Zilx
     logic [4:0] rd_field, rs1_field, rs2_field;
     logic is_m_ext;
 
@@ -457,11 +466,12 @@ module decode_stage (
     alu_src_a_t alu_src_a;
     alu_src_b_t alu_src_b;
     logic mem_read, mem_write;
-    mem_size_t mem_size;
-    logic      mem_unsigned;
-    wb_src_t   wb_src;
-    branch_t   branch_type;
-    logic      dec_illegal;
+    mem_size_t       mem_size;
+    logic            mem_unsigned;
+    logic      [1:0] mem_shamt;  // Zilx index scale (0 unscaled, log2 size scaled)
+    wb_src_t         wb_src;
+    branch_t         branch_type;
+    logic            dec_illegal;
 
     always_comb begin
         // ---- Source selection (priority: hold buffer > fresh F/D) ----
@@ -497,6 +507,9 @@ module decode_stage (
         funct3 = src_instr32[14:12];
         funct7 = src_instr32[31:25];
         funct7b5 = src_instr32[30];
+        funct5 = src_instr32[31:27];  // AMO/Zilx mode
+        aq = src_instr32[26];  // AMO aq (must be 0 for Zilx)
+        rl = src_instr32[25];  // AMO rl (must be 0 for Zilx)
         rd_field = src_instr32[11:7];
         rs1_field = src_instr32[19:15];
         rs2_field = src_instr32[24:20];
@@ -535,6 +548,7 @@ module decode_stage (
         mem_write = 1'b0;
         mem_size = MS_W;
         mem_unsigned = 1'b0;
+        mem_shamt = 2'd0;
         wb_src = WB_ALU;
         branch_type = BR_NONE;
         dec_illegal = 1'b1;  // default: anything not matched is illegal
@@ -739,6 +753,90 @@ module decode_stage (
                     if (funct7 != 7'b0000000 && funct7 != 7'b0100000) dec_illegal = 1'b1;
                 end
             end
+            OPC_AMO: begin
+                // Zilx indexed loads (AMO opcode). Encoding:
+                //   funct5=[31:27] mode, aq=[26]/rl=[25] (must be 0),
+                //   rs2=[24:20]=base, rs1=[19:15]=index, funct3=[14:12]
+                //   size/sign, rd=[11:7]. rs1=index, rs2=base — roles
+                //   swapped vs base loads. EA = base + (index << shamt),
+                //   computed in the ALU (ALU_LX); the load itself is the
+                //   LSU's job (mem_read / WB_MEM) — not present yet, so
+                //   control rides the D/E register to the debug taps.
+                //   Real AMOs (funct5 not in the Zilx set) and RV64-only
+                //   encodings decode to illegal=1 this phase.
+                logic is_unscaled, is_scaled;
+                logic size_ok_rv32;
+                logic zilx_ok;
+                is_unscaled = (funct5 == 5'b10010);  // lx
+                is_scaled   = (funct5 == 5'b11010);  // lxs
+                // funct5 == 5'b11110 (lxsuw) is RV64-only -> illegal on RV32.
+
+                // funct3 -> access size/sign (same map as OPC_LOAD).
+                unique case (funct3)
+                    3'b000: begin
+                        mem_size     = MS_B;
+                        mem_unsigned = 1'b0;
+                    end
+                    3'b001: begin
+                        mem_size     = MS_H;
+                        mem_unsigned = 1'b0;
+                    end
+                    3'b010: begin
+                        mem_size     = MS_W;
+                        mem_unsigned = 1'b0;
+                    end
+                    3'b100: begin
+                        mem_size     = MS_B;
+                        mem_unsigned = 1'b1;
+                    end
+                    3'b101: begin
+                        mem_size     = MS_H;
+                        mem_unsigned = 1'b1;
+                    end
+                    default: begin
+                        mem_size     = MS_W;
+                        mem_unsigned = 1'b0;
+                    end
+                    // 3'b011 / 3'b110 (RV64) and 3'b111 -> reserved
+                endcase
+                size_ok_rv32 = (funct3 inside {3'b000, 3'b001, 3'b010, 3'b100, 3'b101});
+                zilx_ok      = 1'b0;
+                if (aq || rl) begin
+                    // aq/rl reserved -> illegal
+                end else if (is_unscaled) begin
+                    // lx: no unscaled byte (funct3[1:0]==00); RV64 sizes reserved.
+                    if (size_ok_rv32 && funct3[1:0] != 2'b00) begin
+                        zilx_ok   = 1'b1;
+                        mem_shamt = 2'd0;  // unscaled
+                    end
+                end else if (is_scaled) begin
+                    // lxs: byte/half/word, signed/unsigned all valid on RV32.
+                    if (size_ok_rv32) begin
+                        zilx_ok = 1'b1;
+                        case (mem_size)
+                            MS_B: mem_shamt = 2'd0;
+                            MS_H: mem_shamt = 2'd1;
+                            MS_W: mem_shamt = 2'd2;
+                            default: mem_shamt = 2'd0;
+                        endcase
+                    end
+                end
+                // else: funct5=11110 (RV64) or real AMO -> illegal.
+
+                if (zilx_ok) begin
+                    dec_illegal = 1'b0;
+                    reg_write   = 1'b1;
+                    mem_read    = 1'b1;
+                    alu_op      = ALU_LX;
+                    alu_src_a   = ALU_A_RS2;  // base (rs2)
+                    alu_src_b   = ALU_B_RS1_SH;  // index (rs1) << shamt
+                    uses_rs1    = 1'b1;  // index
+                    uses_rs2    = 1'b1;  // base
+                    imm         = 32'd0;
+                    wb_src      = WB_MEM;
+                end
+            end
+
             default: begin
                 // OPC_MISC_MEM (fence), OPC_SYSTEM (csr/ecall/ebreak),
                 // atomics, anything else -> illegal this phase.
@@ -768,6 +866,7 @@ module decode_stage (
         de_d.alu_src_b     = alu_src_b;
         de_d.mem_size      = mem_size;
         de_d.mem_unsigned  = mem_unsigned;
+        de_d.mem_shamt     = mem_shamt;
         de_d.wb_src        = wb_src;
         de_d.branch_type   = branch_type;
         // reg_write / mem_read / mem_write are squashed by illegal or
