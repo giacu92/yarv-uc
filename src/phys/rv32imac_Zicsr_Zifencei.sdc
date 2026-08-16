@@ -25,8 +25,7 @@ create_clock -name clk27 -period 37.037 [get_ports {clk_i}]
 # Gowin auto-derives a clock on the rPLL output (named *.default_gen_clk);
 # this explicit constraint takes precedence (a PnR warning is expected and
 # harmless — it just names the clock clk_core for the timing reports).
-create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk27 \
-    -multiply_by 11 -divide_by 3 [get_nets {clk_core}]
+create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk27 -multiply_by 11 -divide_by 3 [get_nets {clk_core}]
 
 # Async reset: treat rstn_i as asynchronous to clk_i.
 # (We do not currently generate / assert rstn_i internally; this is
@@ -36,7 +35,10 @@ set_false_path -from [get_ports {rstn_i}]
 # Debug LEDs are not timing-critical (human eye).
 set_false_path -to [get_ports {led_o[*]}]
 
-# Master AXI4-Lite port: inputs from the slave (rdata, rvalid, etc.)
-# are assumed to be registered by the slave (axi4_lite_ram) and are
-# captured on the same clk_i edge. No set_input_delay needed for the
-# current single-chip topology (CPU + RAM live in the same FPGA).
+# Single clock domain: the CPU, both AXI4-Lite bridges, the buses and
+# the axi4_lite_ram slave all run on clk_core (99 MHz, generated above).
+# clk_i (27 MHz, clk27) only feeds the rPLL — there are no user-logic
+# paths on clk27, so there is no clock-domain crossing to cut. Slave
+# outputs (rdata, rvalid, etc.) are registered in axi4_lite_ram and
+# captured on the same clk_core edge; no set_input_delay is needed for
+# this single-chip topology.

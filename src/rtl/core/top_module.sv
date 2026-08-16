@@ -108,12 +108,14 @@ module top_module (
     axi4_lite_if axi_bus_imem ();
     axi4_lite_if axi_bus_peri ();
 
-    // Drive the bus clock/reset from the top-level ports so every
-    // master/slave on a given bus sees the same edges.
-    assign axi_bus_imem.aclk    = clk_i;
-    assign axi_bus_imem.aresetn = rstn_i;
-    assign axi_bus_peri.aclk    = clk_i;
-    assign axi_bus_peri.aresetn = rstn_i;
+    // Single clock domain: the whole fabric (CPU, both AXI4-Lite bridges,
+    // the buses, and the RAM slave) runs on clk_core / rstn_core. There
+    // is NO clock-domain crossing — clk_i (27 MHz) only feeds the rPLL,
+    // and rstn_i is the async board reset that feeds the synchronizer.
+    assign axi_bus_imem.aclk    = clk_core;
+    assign axi_bus_imem.aresetn = rstn_core;
+    assign axi_bus_peri.aclk    = clk_core;
+    assign axi_bus_peri.aresetn = rstn_core;
 
     // -----------------------------------------------------------------
     // CPU
@@ -146,8 +148,8 @@ module top_module (
         .ADDR_W   (16),  // 64 KiB
         .INIT_FILE("")
     ) u_ram (
-        .clk_i (clk_i),
-        .rstn_i(rstn_i),
+        .clk_i (clk_core),
+        .rstn_i(rstn_core),
         .axi   (axi_bus_imem.slave)
     );
 
