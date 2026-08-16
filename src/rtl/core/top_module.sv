@@ -32,7 +32,10 @@ import rv32_pkg::*;
  */
 
 module top_module (
-    input wire clk_i,
+    // Differential 25 MHz reference clock from an MS5351M clock generator
+    // (25 MHz crystal reference). P/N on PIN10/PIN11, Bank 6.
+    input wire clk_p_i,
+    input wire clk_n_i,
     input wire rstn_i,
 
     // Debug LEDs: low 4 bits of the fetch PC.
@@ -42,24 +45,35 @@ module top_module (
     // -----------------------------------------------------------------
     // Clock generation
     //
-    // Board oscillator:
-    //   clk_i = 27 MHz
+    // Reference clock:
+    //   clk_p_i / clk_n_i = 25 MHz differential (MS5351M, crystal-fed)
     //
     // Internal CPU clock (rPLL CLKOUT):
-    //   clk_core = 27 * FBDIV / IDIV = 27 * 22 / 6 = 99 MHz
-    //   (IDIV_SEL=5 -> IDIV=6, FBDIV_SEL=21 -> FBDIV=22; ODIV_SEL=8
-    //   only sets the VCO = 27*22*8/6 = 792 MHz, it does NOT divide
-    //   CLKOUT). Period = 10.101 ns. Constrained in the SDC.
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 20 / 5 = 100 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=19 -> FBDIV=20; ODIV_SEL=8
+    //   only sets the VCO = 25*20*8/5 = 800 MHz, it does NOT divide
+    //   CLKOUT). Period = 10 ns. Constrained in the SDC.
     // -----------------------------------------------------------------
+
+    // Differential clock input: P/N -> single-ended for the rPLL.
+    // Bank 6 has no on-chip 100R differential termination (only Bank 0/1
+    // do), so the board must provide an external 100R across P/N.
+    wire clk_ibuf;
+
+    TLVDS_IBUF u_clk_ibuf (
+        .I (clk_p_i),
+        .IB(clk_n_i),
+        .O (clk_ibuf)
+    );
 
     wire clk_core;
     wire pll_lock;
 
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
-        .FCLKIN   ("27"),
-        .IDIV_SEL (5),     // -> PFD = 4.5 MHz (range: 3-400 MHz)
-        .FBDIV_SEL(21),    // -> CLKOUT = 99 MHz (range: 3.125-600 MHz)
-        .ODIV_SEL (8)      // -> VCO = 792 MHz (range: 400-1200 MHz)
+        .FCLKIN   ("25"),
+        .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
+        .FBDIV_SEL(19),    // -> CLKOUT = 100 MHz (range: 3.125-600 MHz)
+        .ODIV_SEL (8)      // -> VCO = 800 MHz (range: 400-1200 MHz)
     ) pll (
         .CLKOUTP (),
         .CLKOUTD (),
@@ -73,8 +87,8 @@ module top_module (
         .PSDA    (4'b0),
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
-        .CLKIN   (clk_i),     // 27 MHz
-        .CLKOUT  (clk_core),  // 99 MHz
+        .CLKIN   (clk_ibuf),  // 25 MHz (from the differential input buffer)
+        .CLKOUT  (clk_core),  // 100 MHz
         .LOCK    (pll_lock)
     );
 
@@ -110,8 +124,9 @@ module top_module (
 
     // Single clock domain: the whole fabric (CPU, both AXI4-Lite bridges,
     // the buses, and the RAM slave) runs on clk_core / rstn_core. There
-    // is NO clock-domain crossing — clk_i (27 MHz) only feeds the rPLL,
-    // and rstn_i is the async board reset that feeds the synchronizer.
+    // is NO clock-domain crossing — clk_p_i (25 MHz) only feeds the
+    // TLVDS_IBUF + rPLL, and rstn_i is the async board reset that feeds
+    // the synchronizer.
     assign axi_bus_imem.aclk    = clk_core;
     assign axi_bus_imem.aresetn = rstn_core;
     assign axi_bus_peri.aclk    = clk_core;
