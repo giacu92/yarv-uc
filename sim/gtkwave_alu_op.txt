@@ -1,0 +1,30 @@
+# GTKWave translate filter for the 5-bit alu_op / alu_op_i signals.
+# (rv32_pkg::alu_op_t — positional enum, ALU_ADD=0 .. ALU_LX=18.)
+#
+# Values are in BINARY, width-exact to the 5-bit signal (no padding
+# ambiguity). In GTKWave set the signal's Data Format to Bin, then
+# Edit -> Data Format -> Translate Filter File -> Enable and Select,
+# Add Filter to List, pick this file, OK. The raw bits are then replaced
+# by the mnemonic in the waveform.
+#
+# Apply to: u_decode.alu_op  (decode stage, combinational) and/or
+#           u_alu.alu_op_i   (execute stage input).
+00000 ALU_ADD
+00001 ALU_SUB
+00010 ALU_SLL
+00011 ALU_SLT
+00100 ALU_SLTU
+00101 ALU_XOR
+00110 ALU_SRL
+00111 ALU_SRA
+01000 ALU_OR
+01001 ALU_AND
+01010 ALU_MUL
+01011 ALU_MULH
+01100 ALU_MULHSU
+01101 ALU_MULHU
+01110 ALU_DIV
+01111 ALU_DIVU
+10000 ALU_REM
+10001 ALU_REMU
+10010 ALU_LX

@@ -1,0 +1,24 @@
+# GTKWave translate filter for the 7-bit major opcode signal.
+# (rv32_pkg::OPC_* localparams — the RISC-V major opcode field instr[6:2].)
+#
+# Values are in BINARY, width-exact to the 7-bit signal. In GTKWave set
+# the signal's Data Format to Bin, then
+# Edit -> Data Format -> Translate Filter File -> Enable and Select,
+# Add Filter to List, pick this file, OK.
+#
+# Apply to: u_decode.opcode  (decode stage, combinational — the opcode
+#           of the instruction decode is treating this cycle).
+#           For the EXECUTING instruction's opcode, slice the ex_instr
+#           word: opcode = ex_instr[6:2] (no built-in tap exists today).
+0110111 OPC_LUI
+0010111 OPC_AUIPC
+1101111 OPC_JAL
+1100111 OPC_JALR
+1100011 OPC_BRANCH
+0000011 OPC_LOAD
+0100011 OPC_STORE
+0010011 OPC_OP_IMM
+0110011 OPC_OP
+0001111 OPC_MISC_MEM
+1110011 OPC_SYSTEM
+0101111 OPC_AMO
