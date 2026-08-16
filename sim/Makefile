@@ -16,6 +16,8 @@ RTL := \
 	../src/rtl/core/fetch_stage.sv \
 	../src/rtl/core/reg_file.sv \
 	../src/rtl/core/decode_stage.sv \
+	../src/rtl/core/alu.sv \
+	../src/rtl/core/execute_stage.sv \
 	../src/rtl/core/rv32imac_zicsr_zifencei.sv \
 	../src/rtl/utils/axi4_lite_ram.sv \
 	sim_top.sv

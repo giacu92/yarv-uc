@@ -10,6 +10,8 @@
         <File path="src/rtl/core/fetch_stage.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/reg_file.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/decode_stage.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/alu.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/execute_stage.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/rv32imac_zicsr_zifencei.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/top_module.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/pkg/rv32_pkg.sv" type="file.verilog" enable="1"/>

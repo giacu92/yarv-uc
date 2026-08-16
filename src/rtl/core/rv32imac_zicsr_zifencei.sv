@@ -62,19 +62,26 @@ module rv32imac_zicsr_zifencei (
 
     // de_* debug taps (decode stage / D/E pipeline register): pc / instr
     // / valid. Left unconnected at the board top (swept by synthesis) and
-    // consumed by the sim wrapper. There is no execute stage yet, so the
-    // full D/E control (de_o) rides to observation only inside the CPU.
+    // consumed by the sim wrapper. The full D/E control (de_o) is consumed
+    // by the execute stage below.
     output wire [XLEN-1:0] de_pc_dbg_o,     // D/E instruction PC
     output wire [XLEN-1:0] de_instr_dbg_o,  // 32-bit word decode treated
-    output wire            de_valid_dbg_o   // D/E valid
+    output wire            de_valid_dbg_o,  // D/E valid
+
+    // ex_* debug taps (execute stage / E/M register): pc / instr / valid
+    // of the retired operation. Left unconnected at the board top (swept
+    // by synthesis) and consumed by the sim wrapper.
+    output wire [XLEN-1:0] ex_pc_dbg_o,     // E/M instruction PC
+    output wire [XLEN-1:0] ex_instr_dbg_o,  // 32-bit word executed
+    output wire            ex_valid_dbg_o   // E/M valid (retired)
 );
 
     // -----------------------------------------------------------------
     // Fetch stage
     //
-    // stall_i is driven by decode's back-pressure (currently INERT —
-    // see decode_stage header). branch_* stay tied off until execute /
-    // a hazard unit exists.
+    // stall_i is driven by decode's back-pressure (propagated from the
+    // execute stage's div stall). branch_* come from the execute stage's
+    // branch-resolve path (redirect + in-flight flush).
     // -----------------------------------------------------------------
     mem_req_t            imem_req;
     mem_rsp_t            imem_rsp;
@@ -85,16 +92,19 @@ module rv32imac_zicsr_zifencei (
     wire      [XLEN-1:0] fe_instr_w;
     wire                 fe_valid_w;
 
-    // Decode -> fetch back-pressure.
+    // Decode -> fetch back-pressure (propagates execute's stall).
     wire                 dec_stall;
+    // Execute -> fetch redirect.
+    wire                 ex_branch_valid;
+    wire      [XLEN-1:0] ex_branch_addr;
 
     fetch_stage fetch_stage_i (
         .clk_i         (clk_i),
         .rstn_i        (rstn_i),
         .boot_addr_i   (boot_addr_i),
         .stall_i       (dec_stall),
-        .branch_valid_i(1'b0),
-        .branch_addr_i (32'h0000_0000),
+        .branch_valid_i(ex_branch_valid),
+        .branch_addr_i (ex_branch_addr),
         .imem_req_o    (imem_req),
         .imem_rsp_i    (imem_rsp),
         .fe_instr_o    (fe_instr_w),
@@ -120,18 +130,11 @@ module rv32imac_zicsr_zifencei (
     mem_req_t peri_req;
     mem_rsp_t peri_rsp;
 
-    // LSU not implemented yet — tie the request side inert (wvalid=0)
-    // so the bridge never launches a transaction. peri_rsp is read
-    // into a dummy net so the synthesiser doesn't warn about a
-    // dangling input.
-    assign peri_req.wvalid = 1'b0;
-    assign peri_req.we     = 1'b0;
-    assign peri_req.addr   = '0;
-    assign peri_req.wdata  = '0;
-    assign peri_req.wstrb  = '0;
-    assign peri_req.rready = 1'b1;  // never launched, but drive it (no X)
-    wire unused_peri_rsp = peri_rsp.wready | peri_rsp.rvalid | peri_rsp.rdata[0];
-
+    // The peri bridge is driven by the execute stage's native memory port
+    // (the future LSU). Today execute gates wvalid to 0 (no LSU yet), so
+    // the bridge stays idle; when the LSU lands, execute will launch
+    // loads/stores (including Zilx indexed loads) on this bus with no
+    // board-top changes.
     axi4_lite_master_bridge u_peri_bridge (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
@@ -141,18 +144,22 @@ module rv32imac_zicsr_zifencei (
     );
 
     // -----------------------------------------------------------------
-    // Register file + decode stage
+    // Register file + decode stage + execute stage
     //
     // Decode reads rs1/rs2 from the reg file asynchronously (addresses
     // come from decode, data returns the same cycle and is latched into
-    // the D/E register). The write port has no producer (no writeback
-    // stage) so it is tied off; reads therefore return 0 until a
-    // writeback stage exists.
+    // the D/E register). The D/E control word (de_w) feeds execute, which
+    // drives the reg-file write port (ALU / PC4 writeback), the fetch
+    // redirect, and decode's stall (div) / flush (branch).
     // -----------------------------------------------------------------
     wire [     4:0] rs1_addr;
     wire [     4:0] rs2_addr;
     wire [XLEN-1:0] rs1_data;
     wire [XLEN-1:0] rs2_data;
+
+    wire [     4:0] wb_addr;
+    wire [XLEN-1:0] wb_data;
+    wire            wb_en;
 
     reg_file u_regfile (
         .clk_i     (clk_i),
@@ -161,12 +168,16 @@ module rv32imac_zicsr_zifencei (
         .rs2_addr_i(rs2_addr),
         .rs1_data_o(rs1_data),
         .rs2_data_o(rs2_data),
-        .wr_addr_i (5'd0),      // no writeback yet
-        .wr_data_i ('0),
-        .wr_en_i   (1'b0)
+        .wr_addr_i (wb_addr),
+        .wr_data_i (wb_data),
+        .wr_en_i   (wb_en)
     );
 
     de_t de_w;
+
+    // Execute -> decode back-pressure / flush.
+    wire ex_stall;
+    wire ex_flush;
 
     decode_stage u_decode (
         .clk_i     (clk_i),
@@ -178,10 +189,34 @@ module rv32imac_zicsr_zifencei (
         .rs2_addr_o(rs2_addr),
         .rs1_data_i(rs1_data),
         .rs2_data_i(rs2_data),
-        .stall_i   (1'b0),        // no hazard unit yet
-        .flush_i   (1'b0),
+        .stall_i   (ex_stall),
+        .flush_i   (ex_flush),
         .stall_o   (dec_stall),
         .de_o      (de_w)
+    );
+
+    // ex_* E/M taps, mirrored to the debug ports below.
+    wire [XLEN-1:0] ex_pc_w;
+    wire [XLEN-1:0] ex_instr_w;
+    wire            ex_valid_w;
+
+    execute_stage u_execute (
+        .clk_i         (clk_i),
+        .rstn_i        (rstn_i),
+        .de_i          (de_w),
+        .stall_i       (1'b0),             // no downstream stage yet
+        .stall_o       (ex_stall),
+        .flush_o       (ex_flush),
+        .wb_addr_o     (wb_addr),
+        .wb_data_o     (wb_data),
+        .wb_en_o       (wb_en),
+        .branch_valid_o(ex_branch_valid),
+        .branch_addr_o (ex_branch_addr),
+        .mem_req_o     (peri_req),
+        .mem_rsp_i     (peri_rsp),
+        .ex_pc_dbg_o   (ex_pc_w),
+        .ex_instr_dbg_o(ex_instr_w),
+        .ex_valid_dbg_o(ex_valid_w)
     );
 
     // -----------------------------------------------------------------
@@ -196,5 +231,10 @@ module rv32imac_zicsr_zifencei (
     assign de_pc_dbg_o    = de_w.pc;
     assign de_instr_dbg_o = de_w.instr;
     assign de_valid_dbg_o = de_w.valid;
+
+    // ex_* (execute / E/M register).
+    assign ex_pc_dbg_o    = ex_pc_w;
+    assign ex_instr_dbg_o = ex_instr_w;
+    assign ex_valid_dbg_o = ex_valid_w;
 
 endmodule
