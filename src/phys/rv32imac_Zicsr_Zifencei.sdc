@@ -18,15 +18,15 @@
 create_clock -name clk25 -period 40 [get_ports {clk_i}]
 
 # CPU core clock: rPLL CLKOUT drives the clk_core net.
-#   fCLKOUT = FCLKIN * FBDIV / IDIV = 25 * 20 / 5 = 100 MHz
-#   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=19 -> FBDIV=20; ODIV_SEL=8 sets the
-#   VCO = 25*20*8/5 = 800 MHz but does NOT divide CLKOUT).
-#   Period = 40 / 4 = 10 ns.  multiply_by 4 / divide_by 1 expresses the
-#   20/5 ratio in smallest integers.
+#   fCLKOUT = FCLKIN * FBDIV / IDIV = 25 * 10 / 5 = 50 MHz
+#   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=9 -> FBDIV=10; ODIV_SEL=16 sets the
+#   VCO = 25*10*16/5 = 800 MHz but does NOT divide CLKOUT).
+#   Period = 40 / 2 = 20 ns.  multiply_by 2 / divide_by 1 expresses the
+#   10/5 ratio in smallest integers.
 # Gowin auto-derives a clock on the rPLL output (named *.default_gen_clk);
 # this explicit constraint takes precedence (a PnR warning is expected and
 # harmless — it just names the clock clk_core for the timing reports).
-create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 4 -divide_by 1 [get_nets {clk_core}]
+create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 2 -divide_by 1 [get_nets {clk_core}]
 
 # Async reset: treat rstn_i as asynchronous to the fabric clocks.
 # (We do not currently generate / assert rstn_i internally; this is
@@ -37,7 +37,7 @@ set_false_path -from [get_ports {rstn_i}]
 set_false_path -to [get_ports {led_o[*]}]
 
 # Single clock domain: the CPU, both AXI4-Lite bridges, the buses and
-# the axi4_lite_ram slave all run on clk_core (100 MHz, generated above).
+# the axi4_lite_ram slave all run on clk_core (50 MHz, generated above).
 # clk_i (25 MHz, clk25) only feeds the rPLL — there are no user-logic
 # paths on clk25, so there is no clock-domain crossing to cut. Slave
 # outputs (rdata, rvalid, etc.) are registered in axi4_lite_ram and

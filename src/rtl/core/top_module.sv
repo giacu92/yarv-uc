@@ -50,10 +50,19 @@ module top_module (
     //   PIN10, single-ended LVCMOS33)
     //
     // Internal CPU clock (rPLL CLKOUT):
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 20 / 5 = 100 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=19 -> FBDIV=20; ODIV_SEL=8
-    //   only sets the VCO = 25*20*8/5 = 800 MHz, it does NOT divide
-    //   CLKOUT). Period = 10 ns. Constrained in the SDC.
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 10 / 5 = 50 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=9 -> FBDIV=10; ODIV_SEL=16
+    //   only sets the VCO = 25*10*16/5 = 800 MHz, it does NOT divide
+    //   CLKOUT). Period = 20 ns. Constrained in the SDC.
+    //
+    // Target lowered 100 -> 50 MHz: the execute stage + regfile (BSRAM)
+    // combinational depth does not meet 100 MHz, and Fmax is not the
+    // current goal. 50 MHz gives margin below the ~54 MHz BSRAM cap.
+    //
+    // VCO must stay in 500-1250 MHz (GowinSynthesis EX0311 range for this
+    // rPLL). CLKOUT=FCLKIN*FBDIV/IDIV is independent of ODIV, so to halve
+    // CLKOUT 100->50 while keeping VCO at the proven 800 MHz, FBDIV halves
+    // (20->10) AND ODIV doubles (8->16): VCO = 25*10*16/5 = 800 MHz.
     // -----------------------------------------------------------------
 
     wire clk_core;
@@ -62,8 +71,8 @@ module top_module (
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("25"),
         .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
-        .FBDIV_SEL(19),    // -> CLKOUT = 100 MHz (range: 3.125-600 MHz)
-        .ODIV_SEL (8)      // -> VCO = 800 MHz (range: 400-1200 MHz)
+        .FBDIV_SEL(9),     // -> CLKOUT = 50 MHz (range: 3.125-600 MHz)
+        .ODIV_SEL (16)     // -> VCO = 800 MHz (range: 500-1250 MHz)
     ) pll (
         .CLKOUTP (),
         .CLKOUTD (),
@@ -78,7 +87,7 @@ module top_module (
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
         .CLKIN   (clk_i),     // 25 MHz
-        .CLKOUT  (clk_core),  // 100 MHz
+        .CLKOUT  (clk_core),  // 50 MHz
         .LOCK    (pll_lock)
     );
 
@@ -94,7 +103,7 @@ module top_module (
 
     logic [1:0] rst_sync;
 
-    always_ff @(posedge clk_core or negedge rstn_i) begin
+    always_ff @(posedge clk_core) begin
         if (!rstn_i) begin
             rst_sync <= 2'b00;
         end else if (!pll_lock) begin

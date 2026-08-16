@@ -9,14 +9,20 @@ import rv32_pkg::*;
  *
  * Two asynchronous (combinational) read ports so the decode stage gets
  * rs1/rs2 operands in the same cycle, and one synchronous write port
- * (posedge, byte-less whole-word write) for a future writeback stage.
+ * (posedge, whole-word write) driven by the execute writeback.
  *
- * Storage is inferred as FLOPS (1024 FF + two 32:1 muxes), not BRAM
- * (block RAM has no async read) and not distributed RAM (dual-async-read
- * inference is finicky on Gowin). The whole file is reset to 0 so the
- * Verilator sim is deterministic before any writeback exists; reads of
- * x0 return 0 via an explicit mux (do not rely on the x0 flop staying 0
- * after a stray write).
+ * Storage is the unpacked array `logic [XLEN-1:0] regs[31:0]` (sync-write
+ * + 2 async-read), which matches GowinSynthesis's BSRAM (async-read
+ * block-RAM) template once the writeback port is live -> it infers BSRAM,
+ * not flops. BSRAM's async read is slower than a flop mux (it capped the
+ * regfile path around ~54 MHz), but Fmax is not the current goal: the
+ * fabric is targeted at 50 MHz (see top_module.sv / the SDC), where BSRAM
+ * is comfortably fast enough. BSRAM contents cannot be runtime-reset by
+ * `if (!rstn_i)`, but the reset loop is kept in the RTL: Verilator honors
+ * it (sim determinism — all regs read 0 until written), and hardware
+ * relies on BSRAM power-up INIT + write-before-read (standard for a
+ * regfile; architectural state is not cleared on warm reset anyway).
+ * reads of x0 return 0 via an explicit mux.
  *
  * Naming: ports *_i/_o; internal signals have no prefix. The storage
  * array is `regs`; there is no _q/_d because it is an array, not a
