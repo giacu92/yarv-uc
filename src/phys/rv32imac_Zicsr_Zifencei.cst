@@ -17,15 +17,9 @@ IO_LOC "led_o[0]" 15;
 IO_PORT "led_o[0]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
 IO_LOC "rstn_i" 88;
 IO_PORT "rstn_i" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
-// Differential 25 MHz reference clock from an MS5351M clock generator
-// (fed by a 25 MHz crystal). P on PIN10, N on PIN11 — both in Bank 6,
-// whose VCCIO is fixed at 3.3V on the QN88 package. True-LVDS input is
-// taken via a TLVDS_IBUF primitive in top_module (P->I, N->IB).
-// Bank 6 has NO on-chip 100R differential input termination (only
-// Bank 0/1 do), so the board MUST fit a 100R across clk_p_i/clk_n_i.
-// Fallback if the tools reject LVDS25 at 3.3V: switch to ELVDS_IBUF and
-// IO_TYPE=LVDS25E (emulated LVDS, explicitly 3.3V-capable).
-IO_LOC "clk_p_i" 10;
-IO_PORT "clk_p_i" IO_TYPE=LVDS25 PULL_MODE=NONE BANK_VCCIO=3.3;
-IO_LOC "clk_n_i" 11;
-IO_PORT "clk_n_i" IO_TYPE=LVDS25 PULL_MODE=NONE BANK_VCCIO=3.3;
+// 25 MHz reference clock from the MS5351M clock generator (crystal-fed).
+// The MS5351M outputs three independent single-ended CMOS clocks; CLK0
+// is routed to PIN10. Used as a plain 3.3V LVCMOS33 input — no
+// differential pair, no LVDS primitive, no external termination.
+IO_LOC "clk_i" 10;
+IO_PORT "clk_i" IO_TYPE=LVCMOS33 PULL_MODE=NONE BANK_VCCIO=3.3;

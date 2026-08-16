@@ -32,10 +32,10 @@ import rv32_pkg::*;
  */
 
 module top_module (
-    // Differential 25 MHz reference clock from an MS5351M clock generator
-    // (25 MHz crystal reference). P/N on PIN10/PIN11, Bank 6.
-    input wire clk_p_i,
-    input wire clk_n_i,
+    // 25 MHz reference clock from the MS5351M clock generator (crystal-fed).
+    // The MS5351M drives independent single-ended CMOS clocks; CLK0 is on
+    // PIN10. Used as a plain LVCMOS33 input (no differential / LVDS).
+    input wire clk_i,
     input wire rstn_i,
 
     // Debug LEDs: low 4 bits of the fetch PC.
@@ -46,7 +46,8 @@ module top_module (
     // Clock generation
     //
     // Reference clock:
-    //   clk_p_i / clk_n_i = 25 MHz differential (MS5351M, crystal-fed)
+    //   clk_i = 25 MHz (MS5351M clock generator, crystal-fed; CLK0 on
+    //   PIN10, single-ended LVCMOS33)
     //
     // Internal CPU clock (rPLL CLKOUT):
     //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 20 / 5 = 100 MHz
@@ -54,17 +55,6 @@ module top_module (
     //   only sets the VCO = 25*20*8/5 = 800 MHz, it does NOT divide
     //   CLKOUT). Period = 10 ns. Constrained in the SDC.
     // -----------------------------------------------------------------
-
-    // Differential clock input: P/N -> single-ended for the rPLL.
-    // Bank 6 has no on-chip 100R differential termination (only Bank 0/1
-    // do), so the board must provide an external 100R across P/N.
-    wire clk_ibuf;
-
-    TLVDS_IBUF u_clk_ibuf (
-        .I (clk_p_i),
-        .IB(clk_n_i),
-        .O (clk_ibuf)
-    );
 
     wire clk_core;
     wire pll_lock;
@@ -87,7 +77,7 @@ module top_module (
         .PSDA    (4'b0),
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
-        .CLKIN   (clk_ibuf),  // 25 MHz (from the differential input buffer)
+        .CLKIN   (clk_i),     // 25 MHz
         .CLKOUT  (clk_core),  // 100 MHz
         .LOCK    (pll_lock)
     );
@@ -124,9 +114,8 @@ module top_module (
 
     // Single clock domain: the whole fabric (CPU, both AXI4-Lite bridges,
     // the buses, and the RAM slave) runs on clk_core / rstn_core. There
-    // is NO clock-domain crossing — clk_p_i (25 MHz) only feeds the
-    // TLVDS_IBUF + rPLL, and rstn_i is the async board reset that feeds
-    // the synchronizer.
+    // is NO clock-domain crossing — clk_i (25 MHz) only feeds the rPLL,
+    // and rstn_i is the async board reset that feeds the synchronizer.
     assign axi_bus_imem.aclk    = clk_core;
     assign axi_bus_imem.aresetn = rstn_core;
     assign axi_bus_peri.aclk    = clk_core;
