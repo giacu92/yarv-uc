@@ -45,14 +45,17 @@ module top_module (
     // Board oscillator:
     //   clk_i = 27 MHz
     //
-    // Internal CPU clock:
-    //   clk_core = 50 MHz
+    // Internal CPU clock (rPLL CLKOUT):
+    //   clk_core = 27 * FBDIV / IDIV = 27 * 22 / 6 = 99 MHz
+    //   (IDIV_SEL=5 -> IDIV=6, FBDIV_SEL=21 -> FBDIV=22; ODIV_SEL=8
+    //   only sets the VCO = 27*22*8/6 = 792 MHz, it does NOT divide
+    //   CLKOUT). Period = 10.101 ns. Constrained in the SDC.
     // -----------------------------------------------------------------
 
     wire clk_core;
     wire pll_lock;
 
-    rPLL #(  // For GW1NR-9C C6/I5 (Tang Nano 9K proto dev board)
+    rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("27"),
         .IDIV_SEL (5),     // -> PFD = 4.5 MHz (range: 3-400 MHz)
         .FBDIV_SEL(21),    // -> CLKOUT = 99 MHz (range: 3.125-600 MHz)
