@@ -94,10 +94,10 @@ module axi4_lite_master_bridge (
     // (S_RD_*) from the write side (S_WR_*).
     // -----------------------------------------------------------------
     logic [$bits(axi.awaddr)-1:0] addr_q;
-    logic [$bits(axi.wdata)-1:0]  wdata_q;
-    logic [$bits(axi.wstrb)-1:0]  wstrb_q;
+    logic [$bits(axi.wdata)-1:0] wdata_q;
+    logic [$bits(axi.wstrb)-1:0] wstrb_q;
 
-    wire  accept = (state_q == S_IDLE) && req_i.wvalid;
+    wire accept = (state_q == S_IDLE) && req_i.wvalid;
 
     always_ff @(posedge clk_i) begin
         if (accept) begin
