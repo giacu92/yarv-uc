@@ -17,7 +17,8 @@ The core is a work-in-progress in-order pipeline. Implemented so far:
 - **Decode** — expand-then-decode-uniformly: RVC (C) instructions are
   expanded to their 32-bit RV32I equivalents, then one uniform decoder
   handles RV32I + M + C + Zilx indexed loads. Odd-half (upper-half)
-  branch targets are handled.
+  branch targets and 32-bit instructions spanning a fetch-word boundary
+  (stitched from two consecutive words) are handled.
 - **Execute (DRAFT)** — ALU (base RV32I + single-cycle MUL via DSP +
   multi-cycle DIV/REM + Zilx effective address), reg-file writeback
   (ALU/PC4), and branch resolve with fetch redirect.

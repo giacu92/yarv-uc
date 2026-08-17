@@ -37,6 +37,6 @@ static int fib(int n)
 int main(void)
 {
     int n;
-    __asm__ volatile ("" : "=r"(n) : "0"(10));   /* n = 10, opaque to -O2 */
-    return fib(n);  // Expect 55 (0x37) to be returned in a0 */
+    __asm__ volatile ("" : "=r"(n) : "0"(20));   /* n = 20, opaque to -O2 */
+    return fib(n);  // Expect 6765 (0x1A6D) to be returned in a0 */
 }

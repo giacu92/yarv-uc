@@ -28,29 +28,36 @@ import rv32_pkg::*;
  * (fe_instr) or from expansion. The M extension has no compressed
  * forms, so only RV32I compressed instructions are expanded.
  *
- * RVC spanning / phase-1 simplification: fetch always delivers a 32-bit
- * word; is-compressed = (word[1:0]!=2'b11) is derived here from
- * fe_instr_i. A compressed instruction sitting in the LOW half of a
- * word is decoded this cycle and the UPPER half is latched into a hold
- * buffer to be decoded next cycle (its PC = word_pc + 2). A 32-bit
- * instruction must be 4-byte aligned; the spanning case (low half
- * compressed AND the upper half's [1:0]==2'b11) is treated as
- * **undefined -> illegal=1**.
+ * RVC spanning: fetch always delivers a 32-bit word; is-compressed =
+ * (word[1:0]!=2'b11) is derived here from fe_instr_i. A compressed
+ * instruction in the LOW half of a word is decoded this cycle and the
+ * UPPER half is latched into a hold buffer to be decoded next cycle
+ * (its PC = word_pc + 2). A 32-bit instruction at a 2-byte-aligned but
+ * not 4-byte-aligned address (offset 2 of a fetch word) SPANS two fetch
+ * words: its low halfword is bytes 2-3 of word W (stashed in the hold
+ * buffer, recognized by [1:0]==2'b11), its upper halfword is bytes 0-1
+ * of word W+1. When W+1 arrives, the two are STITCHED into the full
+ * 32-bit instruction ({fe_instr[15:0], hold_word[15:0]}) and decoded by
+ * the uniform decoder. The stitch costs one bubble (span_wait: the
+ * cycle the low half is detected but W+1 is not yet in F/D). Consecutive
+ * spanning instructions are handled: a stitch stashes W+1's upper half,
+ * which may itself be another spanning low half.
  *
  * Branch target in the UPPER half: a redirect may land on an odd-half
  * address (fe_pc_i[1]=1, a 16-bit compressed target). The low half was
  * branched over and is discarded; the upper half is decoded directly
- * (no hold buffer). Per the spec an instruction at bit[1]=1 is either a
- * compressed 16-bit or a 32-bit spanning instr (illegal), so the upper
- * half's [1:0]==2'b11 is the same spanning-illegal class. fetch
- * realigns pc_q after such a redirect so the following fetch is the
- * next word (low half), not another odd-half address.
+ * (no hold buffer). If the target is a 32-bit instr (upper half's
+ * [1:0]==2'b11), its low halfword is stashed and the stitch proceeds as
+ * above (one bubble). fetch realigns pc_q after such a redirect so the
+ * following fetch is the next word (low half), not another odd-half
+ * address.
  *
  * stall_o feeds fetch's stall_i, back-pressuring the pipe on a DIV/REM
  * stall (stall_i from execute) or a RAW hazard (raw_haz — see the
- * interlock block below). The hold_q && fe_valid_i term is INERT by
- * construction (hold raises the cycle fe_valid falls); the stall_i and
- * raw_haz terms carry real back-pressure.
+ * interlock block below). The hold_q && fe_valid_i term fires for a
+ * compressed-upper hold alongside a fresh F/D word (gated on
+ * !hold_is_span so a spanning stitch, which consumes W+1, does not
+ * false-stall); the stall_i and raw_haz terms carry real back-pressure.
  *
  * Decoded-but-not-yet-executable opcodes (control rides the D/E register to
  * the debug taps; the LSU is not present yet, so loads don't retire):
@@ -506,11 +513,29 @@ module decode_stage (
     logic [31:0] src_instr32;
     logic [31:0] src_pc;
     logic        src_is_compressed;
-    logic        is_hold;
-    logic        target_upper;  // redirect landed on an odd-half (upper) target
     logic        buffer_upper;
-    logic        spanning_illegal;
     logic        decoded_valid;
+
+    // -----------------------------------------------------------------
+    // Spanning-stitch predicates.
+    //
+    // A 32-bit instruction at a 2-byte-aligned-but-not-4-byte-aligned
+    // address (offset 2 of a fetch word) SPANS two fetch words: its low
+    // halfword is bytes 2-3 of word W, its upper halfword is bytes 0-1 of
+    // word W+1. The hold buffer stashes that low halfword; whether the
+    // stash is a compressed upper half or a spanning 32-bit low half is
+    // derivable from the stashed halfword's [1:0] (==2'b11 -> 32-bit
+    // low half). So the stitch needs NO new flop: these are all wires
+    // over flops + inputs.
+    // -----------------------------------------------------------------
+    wire         hold_is_span = (hold_word_q[1:0] == 2'b11);  // stashed low half of a 32-bit instr
+    wire         is_hold = hold_q;
+    wire         is_hold_plain = hold_q && !hold_is_span;  // compressed upper half ready
+    wire         span_pending = hold_q && hold_is_span;  // spanning low half held
+    wire         span_complete = span_pending && fe_valid_i;  // upper-half word arrived -> stitch
+    wire         span_wait = span_pending && !fe_valid_i;  // waiting for the upper-half word
+    wire         target_upper = !hold_q && fe_valid_i && fe_pc_i[1];  // redirect to odd half
+    wire         target_span = target_upper && (fe_instr_i[17:16] == 2'b11);  // 32-bit at target
 
     logic [ 4:0] rs1_addr_dec;
     logic [ 4:0] rs2_addr_dec;
@@ -555,30 +580,53 @@ module decode_stage (
     logic zilx_ok;
 
     always_comb begin
-        // ---- Source selection (priority: hold buffer > odd-half target
-        // > fresh F/D low half) ----
-        is_hold      = hold_q;
-        // A redirect landed on an odd-half compressed target: the
-        // instruction is in the UPPER half of the fetched word.
-        target_upper = !is_hold && fe_valid_i && fe_pc_i[1];
-
-        if (is_hold) begin
+        // ---- Source selection ----
+        // Priority: spanning stitch > compressed hold > odd-half branch
+        // target > fresh F/D low half. A spanning 32-bit instr's low
+        // halfword is stashed in the hold buffer (or sits at an odd-half
+        // branch target); its upper halfword is the next fetch word's
+        // low half, stitched in here when that word arrives (span_complete).
+        if (span_complete) begin
+            // Stitch: low half = hold_word_q[15:0] (bytes 2-3 of word W),
+            // upper half = fe_instr_i[15:0] (bytes 0-1 of word W+1). PC
+            // is the spanning instr's own PC (hold_pc_q). The stitched
+            // word is a real 32-bit instr -> is_compressed = 0.
+            src_instr32       = {fe_instr_i[15:0], hold_word_q[15:0]};
+            src_pc            = hold_pc_q;
+            src_is_compressed = 1'b0;
+        end else if (span_wait) begin
+            // Spanning low half held, upper-half fetch word not here yet:
+            // no complete instruction this cycle (bubble). src_instr32 is
+            // a don't-care (decoded_valid=0 gates de_d.valid/illegal).
+            src_instr32       = 32'd0;
+            src_pc            = hold_pc_q;
+            src_is_compressed = 1'b0;
+        end else if (is_hold_plain) begin
+            // Compressed upper half stashed last cycle: decode it.
+            // Recompute is_compressed from THIS half (its [1:0]), not
+            // from fe_is_compressed (which describes the whole word).
             src_instr32       = c_expand(hold_word_q[15:0]);
             src_pc            = hold_pc_q;
-            // Recompute: a 16-bit instr in the upper half is compressed
-            // iff its [1:0] != 2'b11 (do NOT trust fe_is_compressed,
-            // which describes the WHOLE word, not this half).
             src_is_compressed = (hold_word_q[1:0] != 2'b11);
         end else if (target_upper) begin
-            // Branch/jump target in the UPPER half (fe_pc_i[1]=1). Per
-            // the RISC-V spec an instruction at an odd half is either a
-            // compressed 16-bit (decoded here) or a 32-bit spanning instr
-            // (illegal -- caught by spanning_illegal below). The low half
-            // was branched over and is discarded; do NOT stash it.
-            src_instr32       = c_expand(fe_instr_i[31:16]);
-            src_pc            = fe_pc_i;
-            src_is_compressed = (fe_instr_i[17:16] != 2'b11);
+            if (target_span) begin
+                // Branch target at offset 2 is a 32-bit instr's low half:
+                // stash it (hold next-state) and wait for the upper-half
+                // fetch word. No emit this cycle (bubble); the stitch
+                // completes when word W+1 arrives.
+                src_instr32       = 32'd0;
+                src_pc            = fe_pc_i;
+                src_is_compressed = 1'b0;
+            end else begin
+                // Compressed target in the upper half (fe_pc_i[1]=1). The
+                // low half was branched over and is discarded; do NOT
+                // stash it.
+                src_instr32       = c_expand(fe_instr_i[31:16]);
+                src_pc            = fe_pc_i;
+                src_is_compressed = (fe_instr_i[17:16] != 2'b11);
+            end
         end else begin
+            // Fresh F/D low half (fe_pc_i[1]=0).
             if (fe_is_compressed) begin
                 src_instr32       = c_expand(fe_instr_i[15:0]);
                 src_pc            = fe_pc_i;
@@ -590,19 +638,21 @@ module decode_stage (
             end
         end
 
-        // Decode the low compressed half now -> stash the upper half.
-        // Skip stashing when the target is the upper half itself (the low
-        // half was branched over, nothing to defer).
+        // Stash the upper half of a fresh word whose low half was
+        // consumed this cycle (a fresh compressed instr at offset 0).
+        // Spanning low halves are stashed separately (span_complete /
+        // target_span in the hold next-state). The compressed-vs-spanning
+        // distinction is derived from the stashed halfword's [1:0], so
+        // buffer_upper needs no span flag of its own.
         buffer_upper = (!is_hold) && !target_upper && fe_valid_i && fe_is_compressed;
 
-        // Spanning case: a half that looks like a 32-bit instr (low bits
-        // 2'b11). From the hold buffer (upper half of a fall-through word)
-        // or from an odd-half branch target (upper half of the redirect
-        // word) -- both are a 32-bit instr at a non-4-byte-aligned spot,
-        // which is illegal.
-        spanning_illegal = (is_hold && (hold_word_q[1:0] == 2'b11)) ||
-            (target_upper && (fe_instr_i[17:16] == 2'b11));
-        decoded_valid = is_hold || fe_valid_i;
+        // A COMPLETE instruction is available this cycle: every case
+        // EXCEPT span_wait (upper-half word not here yet) and target_span
+        // (just stashed the low half, waiting for the stitch). This feeds
+        // de_d.valid and the RAW interlock, so neither wait state emits a
+        // spurious valid or false-triggers raw_haz.
+        decoded_valid = span_complete | is_hold_plain | (target_upper && !target_span) |
+            (fe_valid_i && !hold_q && !target_upper);
 
         // ---- Field extraction ----
         opcode = src_instr32[6:0];
@@ -974,9 +1024,10 @@ module decode_stage (
         de_d.mem_shamt     = mem_shamt;
         de_d.wb_src        = wb_src;
         de_d.branch_type   = branch_type;
-        // reg_write / mem_read / mem_write are squashed by illegal or
-        // the spanning case; illegal reflects that.
-        if (spanning_illegal || dec_illegal) begin
+        // reg_write / mem_read / mem_write are squashed by illegal. A
+        // spanning stitch decodes a real 32-bit instr through the uniform
+        // decoder, so spanning no longer forces illegal (it used to).
+        if (dec_illegal) begin
             de_d.reg_write   = 1'b0;
             de_d.mem_read    = 1'b0;
             de_d.mem_write   = 1'b0;
@@ -994,32 +1045,49 @@ module decode_stage (
     // Hold-buffer next-state
     // =================================================================
     always_comb begin
+        // Defaults: hold (preserve the stash).
+        hold_d      = hold_q;
+        hold_word_d = hold_word_q;
+        hold_pc_d   = hold_pc_q;
+
         if (flush_i) begin
-            hold_d      = 1'b0;
-            hold_word_d = hold_word_q;
-            hold_pc_d   = hold_pc_q;
-        end else if (raw_haz) begin
-            hold_d      = hold_q;  // RAW interlock: hold the upper-half stash
-            hold_word_d = hold_word_q;
-            hold_pc_d   = hold_pc_q;
-        end else if (stall_i) begin
-            hold_d      = hold_q;
-            hold_word_d = hold_word_q;
-            hold_pc_d   = hold_pc_q;
-        end else if (hold_q) begin
-            // Upper half consumed this cycle; clear.
-            hold_d      = 1'b0;
-            hold_word_d = hold_word_q;
-            hold_pc_d   = hold_pc_q;
+            hold_d = 1'b0;  // redirect: drop any stashed half
+        end else if (raw_haz || stall_i) begin
+            // RAW interlock / DIV-REM stall: preserve the stash (the
+            // consumer re-runs next cycle). raw_haz cannot fire during
+            // span_wait/target_span (decoded_valid=0), but is harmless.
+        end else if (span_wait) begin
+            // Spanning low half held, upper-half word not here yet:
+            // keep waiting (preserve). Do NOT stall fetch -- it must
+            // capture word W+1 -- and stall_o reflects that (no term).
+        end else if (span_complete) begin
+            // Stitch consumed the spanning low (hold) AND fe_instr's low
+            // half (bytes 0-1 of word W+1). The next instruction is
+            // fe_instr's upper half (bytes 2-3 of W+1) -> stash it
+            // unconditionally (its [1:0] flags compressed vs another
+            // spanning low; consecutive spanning instrs fall through
+            // here). PC = fe_pc + 2.
+            hold_d      = 1'b1;
+            hold_word_d = fe_instr_i[31:16];
+            hold_pc_d   = fe_pc_i + 32'd2;
+        end else if (is_hold_plain) begin
+            // Compressed upper half consumed; clear.
+            hold_d = 1'b0;
+        end else if (target_span) begin
+            // Branch target at offset 2 is a 32-bit instr's low half:
+            // stash it and wait for the upper-half word. The spanning
+            // instr sits AT the target, so hold_pc = fe_pc (not +2).
+            hold_d      = 1'b1;
+            hold_word_d = fe_instr_i[31:16];
+            hold_pc_d   = fe_pc_i;
         end else if (buffer_upper) begin
-            // Decoded low compressed half; stash upper (PC = word_pc + 2).
+            // Decoded a fresh low compressed half; stash the upper half
+            // (PC = word_pc + 2). Its [1:0] flags a spanning low.
             hold_d      = 1'b1;
             hold_word_d = fe_instr_i[31:16];
             hold_pc_d   = fe_pc_i + 32'd2;
         end else begin
-            hold_d      = 1'b0;
-            hold_word_d = hold_word_q;
-            hold_pc_d   = hold_pc_q;
+            hold_d = 1'b0;  // nothing to stash
         end
     end
 
@@ -1040,11 +1108,15 @@ module decode_stage (
 
     // =================================================================
     // Back-pressure to fetch (DIV/REM stall or RAW hazard).
-    // The hold_q && fe_valid_i term is INERT by construction (hold raises
-    // the cycle fe_valid falls); the stall_i and raw_haz terms carry real
+    // The hold_q && fe_valid_i term fires for a compressed-upper hold
+    // alongside a fresh F/D word (the stash takes priority -> hold F/D).
+    // It is gated on !hold_is_span: a spanning hold with fe_valid is
+    // span_complete, which CONSUMES word W+1 (no stall) -- without the
+    // gate, the stitch would wrongly hold F/D and re-see W+1. span_wait
+    // has fe_valid=0 (no term). The stall_i and raw_haz terms carry real
     // back-pressure.
     // =================================================================
-    assign stall_o    = (hold_q && fe_valid_i) || stall_i || raw_haz;
+    assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
 
     // Register-read addresses drive the reg file.
     assign rs1_addr_o = rs1_addr_dec;
