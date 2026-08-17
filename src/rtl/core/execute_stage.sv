@@ -82,10 +82,12 @@ module execute_stage (
     output mem_req_t mem_req_o,
     input  mem_rsp_t mem_rsp_i,
 
-    // ex_* debug taps (E/M register): pc / instr / valid of the retired op.
-    output wire [XLEN-1:0] ex_pc_dbg_o,
-    output wire [XLEN-1:0] ex_instr_dbg_o,
-    output wire            ex_valid_dbg_o
+    // ex_* per-stage taps (E/M register): pc / instr / valid of the retired
+    // op. Named like fetch's fe_*_o (no _dbg suffix) so every pipeline stage
+    // exposes a uniform pc / instr / valid output.
+    output wire [XLEN-1:0] ex_pc_o,
+    output wire [XLEN-1:0] ex_instr_o,
+    output wire            ex_valid_o
 );
 
     // =================================================================
@@ -249,15 +251,15 @@ module execute_stage (
     // result is ready. Single-cycle ops retire the cycle they are valid;
     // DIV/REM retire on alu_result_valid.
     logic op_retires;
-    assign op_retires     = de_i.valid & ~de_i.illegal & ~is_mem_op & alu_result_valid & ~stall_i;
+    assign op_retires = de_i.valid & ~de_i.illegal & ~is_mem_op & alu_result_valid & ~stall_i;
 
-    assign ex_pc_d        = op_retires ? de_i.pc : ex_pc_q;
-    assign ex_instr_d     = op_retires ? de_i.instr : ex_instr_q;
-    assign ex_valid_d     = op_retires;
+    assign ex_pc_d    = op_retires ? de_i.pc : ex_pc_q;
+    assign ex_instr_d = op_retires ? de_i.instr : ex_instr_q;
+    assign ex_valid_d = op_retires;
 
-    assign ex_pc_dbg_o    = ex_pc_q;
-    assign ex_instr_dbg_o = ex_instr_q;
-    assign ex_valid_dbg_o = ex_valid_q;
+    assign ex_pc_o    = ex_pc_q;
+    assign ex_instr_o = ex_instr_q;
+    assign ex_valid_o = ex_valid_q;
 
     // =================================================================
     // Sequential

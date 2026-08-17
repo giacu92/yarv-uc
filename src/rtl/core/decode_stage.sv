@@ -29,13 +29,22 @@ import rv32_pkg::*;
  * forms, so only RV32I compressed instructions are expanded.
  *
  * RVC spanning / phase-1 simplification: fetch always delivers a 32-bit
- * word at a 4-byte boundary; is-compressed = (word[1:0]!=2'b11) is
- * derived here from fe_instr_i. A compressed instruction sitting in the
- * LOW half of a word is decoded
- * this cycle and the UPPER half is latched into a hold buffer to be
- * decoded next cycle (its PC = word_pc + 2). A 32-bit instruction must
- * be 4-byte aligned; the spanning case (low half compressed AND the
- * upper half's [1:0]==2'b11) is treated as **undefined -> illegal=1**.
+ * word; is-compressed = (word[1:0]!=2'b11) is derived here from
+ * fe_instr_i. A compressed instruction sitting in the LOW half of a
+ * word is decoded this cycle and the UPPER half is latched into a hold
+ * buffer to be decoded next cycle (its PC = word_pc + 2). A 32-bit
+ * instruction must be 4-byte aligned; the spanning case (low half
+ * compressed AND the upper half's [1:0]==2'b11) is treated as
+ * **undefined -> illegal=1**.
+ *
+ * Branch target in the UPPER half: a redirect may land on an odd-half
+ * address (fe_pc_i[1]=1, a 16-bit compressed target). The low half was
+ * branched over and is discarded; the upper half is decoded directly
+ * (no hold buffer). Per the spec an instruction at bit[1]=1 is either a
+ * compressed 16-bit or a 32-bit spanning instr (illegal), so the upper
+ * half's [1:0]==2'b11 is the same spanning-illegal class. fetch
+ * realigns pc_q after such a redirect so the following fetch is the
+ * next word (low half), not another odd-half address.
  *
  * stall_o feeds fetch's stall_i so a future hazard unit can back-pressure
  * the pipe. It is wired (not tied) but currently INERT: hold_q and
@@ -84,8 +93,18 @@ module decode_stage (
     // Back-pressure to fetch (so the pipe can stall). Currently inert.
     output wire stall_o,
 
-    // D/E pipeline register output (debug taps until execute exists).
-    output de_t de_o
+    // D/E pipeline register output: the full decoded control word, consumed
+    // by the execute stage.
+    output de_t de_o,
+
+    // de_* per-stage taps (D/E register): the PC / instruction word / valid
+    // decode is treating. Exposed like fetch's fe_*_o so every pipeline stage
+    // has a uniform pc / instr / valid output (these are fields of de_o,
+    // broken out as named ports so the stage boundary shows them even when
+    // nothing downstream reads the full struct).
+    output wire [XLEN-1:0] de_pc_o,     // D/E instruction PC
+    output wire [XLEN-1:0] de_instr_o,  // 32-bit word decode treated
+    output wire            de_valid_o   // D/E valid
 );
 
     // =================================================================
@@ -438,6 +457,7 @@ module decode_stage (
     logic [31:0] src_pc;
     logic        src_is_compressed;
     logic        is_hold;
+    logic        target_upper;  // redirect landed on an odd-half (upper) target
     logic        buffer_upper;
     logic        spanning_illegal;
     logic        decoded_valid;
@@ -485,8 +505,13 @@ module decode_stage (
     logic zilx_ok;
 
     always_comb begin
-        // ---- Source selection (priority: hold buffer > fresh F/D) ----
-        is_hold = hold_q;
+        // ---- Source selection (priority: hold buffer > odd-half target
+        // > fresh F/D low half) ----
+        is_hold      = hold_q;
+        // A redirect landed on an odd-half compressed target: the
+        // instruction is in the UPPER half of the fetched word.
+        target_upper = !is_hold && fe_valid_i && fe_pc_i[1];
+
         if (is_hold) begin
             src_instr32       = c_expand(hold_word_q[15:0]);
             src_pc            = hold_pc_q;
@@ -494,6 +519,15 @@ module decode_stage (
             // iff its [1:0] != 2'b11 (do NOT trust fe_is_compressed,
             // which describes the WHOLE word, not this half).
             src_is_compressed = (hold_word_q[1:0] != 2'b11);
+        end else if (target_upper) begin
+            // Branch/jump target in the UPPER half (fe_pc_i[1]=1). Per
+            // the RISC-V spec an instruction at an odd half is either a
+            // compressed 16-bit (decoded here) or a 32-bit spanning instr
+            // (illegal -- caught by spanning_illegal below). The low half
+            // was branched over and is discarded; do NOT stash it.
+            src_instr32       = c_expand(fe_instr_i[31:16]);
+            src_pc            = fe_pc_i;
+            src_is_compressed = (fe_instr_i[17:16] != 2'b11);
         end else begin
             if (fe_is_compressed) begin
                 src_instr32       = c_expand(fe_instr_i[15:0]);
@@ -507,10 +541,17 @@ module decode_stage (
         end
 
         // Decode the low compressed half now -> stash the upper half.
-        buffer_upper = (!is_hold) && fe_valid_i && fe_is_compressed;
+        // Skip stashing when the target is the upper half itself (the low
+        // half was branched over, nothing to defer).
+        buffer_upper = (!is_hold) && !target_upper && fe_valid_i && fe_is_compressed;
 
-        // Spanning case: upper half that looks like a 32-bit instr.
-        spanning_illegal = is_hold && (hold_word_q[1:0] == 2'b11);
+        // Spanning case: a half that looks like a 32-bit instr (low bits
+        // 2'b11). From the hold buffer (upper half of a fall-through word)
+        // or from an odd-half branch target (upper half of the redirect
+        // word) -- both are a 32-bit instr at a non-4-byte-aligned spot,
+        // which is illegal.
+        spanning_illegal = (is_hold && (hold_word_q[1:0] == 2'b11)) ||
+            (target_upper && (fe_instr_i[17:16] == 2'b11));
         decoded_valid = is_hold || fe_valid_i;
 
         // ---- Field extraction ----
@@ -952,6 +993,11 @@ module decode_stage (
 
     // D/E output
     assign de_o       = de_q;
+
+    // de_* per-stage taps (fields of de_o / de_q).
+    assign de_pc_o    = de_q.pc;
+    assign de_instr_o = de_q.instr;
+    assign de_valid_o = de_q.valid;
 
     // =================================================================
     // Sequential

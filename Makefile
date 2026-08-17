@@ -1,20 +1,19 @@
 # Top-level Makefile for code formatting (Verible).
 #
 # The FPGA build still runs through the Gowin IDE / gw_sh (see CLAUDE.md);
-# this Makefile only covers the formatter so the RTL stays consistently
-# styled across editors.
+# this Makefile covers formatting and delegates simulation targets to
+# sim/Makefile.
 #
 #   make format        reformat every SystemVerilog file in place
-#   make format-check  fail (exit 1) if any file is not formatted; prints
-#                      the offending files (use this in CI / pre-commit)
+#   make format-check  fail (exit 1) if any file is not formatted
 #   make format-diff   show a unified diff of what `make format` would do
-#   make sim           build + run the Verilator sim (see sim/Makefile)
+#   make sim           build + run the Verilator sim
 #   make wave          build + run the sim, then open the VCD in gtkwave
+#   make clean         delegate to sim/Makefile
+#   make run           delegate to sim/Makefile
 #
-# Requires `verible-verilog-format` on PATH. Install (Debian/Ubuntu): see
-# CLAUDE.md; the project uses the chipsalliance/verible static binary in
-# ~/tools/verible (symlinked into ~/.local/bin). `make sim` / `wave`
-# additionally require `verilator` and `gtkwave` (for `wave`) on PATH.
+# Requires `verible-verilog-format` on PATH.
+# `make sim` / `make wave` additionally require `verilator` and `gtkwave`.
 
 VERIBLE       ?= verible-verilog-format
 FLAGFILE      := verible.flags
@@ -24,16 +23,16 @@ FLAGFILE      := verible.flags
 SV_SOURCES    := $(shell find src/rtl sim -type f \( -name '*.sv' -o -name '*.svh' -o -name '*.v' \) \
                        ! -path 'sim/obj_dir/*' 2>/dev/null)
 
-# Formatter invocation shared by all targets. --flagfile carries the
-# project policy; --inplace is added only by the `format` target.
+# Formatter invocation shared by all targets.
 FMT_FLAGS     := --flagfile=$(FLAGFILE)
 
 # GTKWave binary for `make wave`.
 GTKWAVE       ?= gtkwave
-# VCD written by the sim (used by `wave`).
+
+# VCD written by the sim.
 SIM_VCD       := sim/sim_top.vcd
 
-.PHONY: format format-check format-diff sim wave help
+.PHONY: format format-check format-diff sim wave help clean run sw sw-run
 
 help:
 	@echo "Targets:"
@@ -42,6 +41,11 @@ help:
 	@echo "  format-diff   print a unified diff of pending formatting changes"
 	@echo "  sim           build + run the Verilator sim"
 	@echo "  wave          build + run the sim, then open the VCD in gtkwave"
+	@echo "  run           build + run the Verilator sim"
+	@echo "  clean         remove simulation build artefacts + waveforms"
+	@echo "  sw            build a C program -> sim/sw/build/program.hex (rv32imac)"
+	@echo "  sw-run        build the C program and run the sim loading it"
+	@echo ""
 	@echo "Variables:"
 	@echo "  VERIBLE=$(VERIBLE)   formatter binary"
 	@echo "  FLAGFILE=$(FLAGFILE)   project formatter policy"
@@ -65,19 +69,42 @@ format-check: $(SV_SOURCES)
 	done; \
 	exit $$status
 
-# Dry run: show the full diff (for review before running `make format`).
+# Dry run: show the full diff.
 format-diff: $(SV_SOURCES)
 	@for f in $(SV_SOURCES); do \
 	    $(VERIBLE) $(FMT_FLAGS) "$$f" 2>/dev/null | diff -u "$$f" - || true; \
 	done
 
-# Build + run the Verilator simulation (delegates to sim/Makefile, which
-# builds obj_dir/Vsim_top and runs it, producing the VCD below).
+# Build + run the Verilator simulation.
 sim:
 	$(MAKE) -C sim run
 
-# Open the waveforms in GTKWave. Depends on `sim` so a fresh build+run
-# happens automatically first (the sim Makefile's own `wave` target does
-# NOT auto-build, so we do not delegate to it).
+# Open the waveforms. A fresh simulation is run first.
 wave: sim
 	$(GTKWAVE) $(SIM_VCD)
+
+# ----------------------------------------------------------------------
+# Simulation target delegation
+# ----------------------------------------------------------------------
+#
+# Delegate the sim-only targets to sim/Makefile (explicit, not a catch-all
+# `%:` rule, so unknown/typo targets fail at the root with a clear "No
+# rule to make target" instead of being silently forwarded into sim/).
+#
+clean run:
+	$(MAKE) -C sim $@
+
+# ----------------------------------------------------------------------
+# C program -> program.hex (rv32imac toolchain)
+# ----------------------------------------------------------------------
+#
+# Build (and optionally run) a C program for the sim. `sw` compiles
+# sim/sw/main.c with the prebuilt riscv32-esp-elf-gcc into a $readmemh
+# word hex; `sw-run` then runs the sim loading that hex via +INIT=...
+# instead of the hand-crafted program.hex oracle.
+#
+sw:
+	$(MAKE) -C sim/sw
+
+sw-run: sw
+	$(MAKE) -C sim run RUN_ARGS="+INIT=sw/build/program.hex"

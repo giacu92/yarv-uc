@@ -84,16 +84,30 @@ module sim_top (
     assign fe_pc_dbg_o = cpu_pc_dbg;
 
     // -----------------------------------------------------------------
-    // Instruction RAM on the imem bus (preloaded with program.hex)
+    // Instruction RAM on the imem bus, preloaded via $readmemh.
+    //
+    // The load is done here (not via the RAM's INIT_FILE parameter) so the
+    // image can be selected at run time with the +INIT=<path> Verilator
+    // plusarg -- e.g. to run a C-compiled program (sim/sw/build/program.hex)
+    // without clobbering the hand-crafted oracle (sim/program.hex). With no
+    // +INIT, the default "program.hex" is loaded (same behavior as before).
+    // Keeping this here (sim-only) leaves axi4_lite_ram synthesis-clean.
     // -----------------------------------------------------------------
     axi4_lite_ram #(
-        .ADDR_W   (16),            // 64 KiB
-        .INIT_FILE("program.hex")  // relative to the run cwd (sim/)
+        .ADDR_W   (16),  // 64 KiB
+        .INIT_FILE("")   // loaded from sim_top below (plusarg-selected)
     ) u_ram (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
         .axi   (axi_bus_imem.slave)
     );
+
+    string init_file;
+    initial begin
+        if (!$value$plusargs("INIT=%s", init_file))
+            init_file = "program.hex";  // default: hand-crafted oracle
+        $readmemh(init_file, u_ram.mem);
+    end
 
     // -----------------------------------------------------------------
     // Peripheral bus: tie off the slave side (no peripheral yet).

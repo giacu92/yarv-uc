@@ -49,17 +49,18 @@ int main(int argc, char** argv) {
 
     printf("=== RV32 fetch + decode + execute sim ===\n");
 
-    // Reset (async, active-low): hold rstn_i=0 for a few cycles.
+    // Reset (async, active-low): hold rstn_i=0 for a few cycles, then
+    // release. We set rstn_i (and the initial clk_i) WITHOUT a standalone
+    // eval+dump: dumping with clk_i unchanged repeats the last tick's clock
+    // level and stretches the clock to two half-cycles at one level (a
+    // "plateau"). Instead the next tick's low-half eval carries the reset
+    // change, keeping the clock a clean 0/1/0/1 throughout.
     top->clk_i  = 0;
     top->rstn_i = 0;
-    top->eval();
-    tfp->dump(sim_time++);
     for (int i = 0; i < 4; ++i) tick(top, tfp);
 
-    // Release reset.
+    // Release reset: carried by the run loop's first tick below.
     top->rstn_i = 1;
-    top->eval();
-    tfp->dump(sim_time++);
 
     // ----- Fetch log (one line per F/D-valid word) -----
     //
@@ -109,12 +110,8 @@ int main(int argc, char** argv) {
     // decode log aligned with the fetch log above). A second reset+run
     // keeps both logs independent and simple.
     top->rstn_i = 0;
-    top->eval();
-    tfp->dump(sim_time++);
     for (int i = 0; i < 4; ++i) tick(top, tfp);
     top->rstn_i = 1;
-    top->eval();
-    tfp->dump(sim_time++);
 
     printf("--- decode (de) ---\n");
     printf("cyc  pc          instr\n");
@@ -149,12 +146,8 @@ int main(int argc, char** argv) {
     // into zeros. ex_* exposes pc / instr / valid only — the writeback value
     // is not observable here; add a writeback tap when values need verifying.
     top->rstn_i = 0;
-    top->eval();
-    tfp->dump(sim_time++);
     for (int i = 0; i < 4; ++i) tick(top, tfp);
     top->rstn_i = 1;
-    top->eval();
-    tfp->dump(sim_time++);
 
     printf("--- execute (ex) ---\n");
     printf("cyc  pc          instr\n");

@@ -29,11 +29,16 @@ VFLAGS := --cc --exe --build --top-module sim_top \
 
 TOP := obj_dir/Vsim_top
 
+# Extra args for the sim binary, e.g. RUN_ARGS="+INIT=sw/build/program.hex"
+# to load a C-compiled program (built by `make -C sw`) instead of the
+# hand-crafted program.hex oracle.
+RUN_ARGS ?=
+
 $(TOP): sim_main.cpp $(RTL) program.hex
 	verilator $(VFLAGS) sim_main.cpp $(RTL)
 
 run: $(TOP)
-	./$(TOP)
+	./$(TOP) $(RUN_ARGS)
 
 wave: sim_top.vcd
 	gtkwave sim_top.vcd

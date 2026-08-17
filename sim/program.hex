@@ -25,38 +25,7 @@
 // the writeback/branch-resolve path. Add a writeback tap when values
 // need checking.
 
-0x00a00093  // 0x00: addi  x1,  x0, 10        [x1 = 10]
-0x01400113  // 0x04: addi  x2,  x0, 20        [x2 = 20]
-0x00000013  // 0x08: nop                       [bubble for x1,x2]
-0x002081b3  // 0x0c: add   x3,  x1, x2        [x3 = 30]
-0x40208233  // 0x10: sub   x4,  x1, x2        [x4 = -10]
-0x0020e3b3  // 0x14: or    x7,  x1, x2        [x7 = 30]
-0x0020f2b3  // 0x18: and   x5,  x1, x2        [x5 = 0]
-0x0020c433  // 0x1c: xor   x8,  x1, x2        [x8 = 30]
-0x00200313  // 0x20: addi  x6,  x0, 2         [x6 = 2]
-0x00000013  // 0x24: nop                       [bubble for x6]
-0x006094b3  // 0x28: sll   x9,  x1, x6        [x9 = 40]
-0x0060d533  // 0x2c: srl   x10, x1, x6        [x10 = 2]
-0x406255b3  // 0x30: sra   x11, x4, x6        [x11 = -3]
-0x0020a633  // 0x34: slt   x12, x1, x2        [x12 = 1]
-0x002236b3  // 0x38: sltu  x13, x4, x2        [x13 = 0]
-0x02208733  // 0x3c: mul   x14, x1, x2        [x14 = 200]
-0x000017b7  // 0x40: lui   x15, 1             [x15 = 0x1000]
-0x00002817  // 0x44: auipc x16, 2             [x16 = pc + 0x2000]
-0xfff00893  // 0x48: addi  x17, x0, -1        [x17 = 0xFFFFFFFF]
-0x00000013  // 0x4c: nop                       [bubble for x17]
-0x0078c913  // 0x50: xori  x18, x17, 7         [x18 = 0xFFFFFFF8]
-0x1000e993  // 0x54: ori   x19, x1, 0x100     [x19 = 0x10A]
-0x00f17a13  // 0x58: andi  x20, x2, 0xF       [x20 = 4]
-0x0140aa93  // 0x5c: slti  x21, x1, 20        [x21 = 1]
-0x00b0bb13  // 0x60: sltiu x22, x1, 11        [x22 = 1]
-0x00309b93  // 0x64: slli  x23, x1, 3         [x23 = 80]
-0x00215c13  // 0x68: srli  x24, x2, 2         [x24 = 5]
-0x40125c93  // 0x6c: srai  x25, x4, 1         [x25 = -5]
-0x02614d33  // 0x70: div   x26, x2, x6        [x26 = 10  (multi-cycle)]
-0x02616db3  // 0x74: rem   x27, x2, x6        [x27 = 0   (multi-cycle)]
-0x00000013  // 0x78: nop                       [bubble after div chain]
-0x02615e33  // 0x7c: divu  x28, x2, x6        [x28 = 10  (multi-cycle)]
-0x02617eb3  // 0x80: remu  x29, x2, x6        [x29 = 0   (multi-cycle)]
-0x00000013  // 0x84: nop
-0x00000013  // 0x88: nop
+0x00f00293  // 0x00: addi   t0, zero, 15
+0x04d00313  // 0x04: addi   t1, zero, 77
+0x00628533  // 0x08: add    a0, t0, t1
+0xff5ff66f  // 0x0c: jal    a2, -12 -- restart

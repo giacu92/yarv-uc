@@ -58,11 +58,20 @@ import rv32_pkg::*;
  * (bounded by single outstanding) and is discarded on redirect.
  *
  * Compressed (C) extension is NOT handled here: the stage always
- * fetches 32-bit words and advances by 4. A compressed instruction in
- * the low half of a word means the next instruction is the upper half
- * of the SAME word (handled by decode), so the next fetch is always
- * the next word (+4). Decode derives is-compressed from fe_instr_o[1:0]
- * itself, so it is not exported here.
+ * fetches 32-bit words and advances to the next word boundary. A
+ * compressed instruction in the low half of a word means the next
+ * instruction is the upper half of the SAME word (handled by decode),
+ * so the next fetch is always the next word. Decode derives
+ * is-compressed from fe_instr_o[1:0] itself, so it is not exported
+ * here; it also uses fe_pc_o[1] to pick the upper half when a redirect
+ * landed on an odd-half target (see decode).
+ *
+ * Redirect to an odd-half target (RVC: a 16-bit instr at bit[1]=1, e.g.
+ * a branch landing at +2) leaves pc_q unaligned for one cycle. The
+ * advance aligns down to the next word boundary ((pc_q & ~3) + 4),
+ * realigning the stream; req_pc_q still holds the real (possibly
+ * unaligned) PC so fe_pc_o is exact and decode can select the half
+ * from fe_pc[1].
  *
  * Naming: ports use *_i/_o; internal signals have no prefix (they are
  * neither inputs nor outputs). Flop registers end in _q, their
@@ -163,8 +172,12 @@ module fetch_stage (
             // Launch the next fetch (single outstanding: only when idle).
             if (launch) begin
                 busy_d   = 1'b1;
-                req_pc_d = pc_q;  // remember the in-flight address
-                pc_d     = pc_q + 32'd4;  // pc runs ahead
+                req_pc_d = pc_q;  // remember the in-flight address (real PC)
+                // Advance to the next WORD boundary: pc_q may be unaligned
+                // for one cycle after a redirect to an odd-half target, so
+                // align down before +4 to realign the stream (identical to
+                // +4 when pc_q is already aligned).
+                pc_d     = (pc_q & ~32'h3) + 32'd4;  // pc runs ahead (word-aligned)
             end
 
             // Capture / drain the in-flight response. Mutually exclusive

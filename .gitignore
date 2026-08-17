@@ -25,6 +25,13 @@ sim/*.vcd
 sim/*.fst
 sim/*.log
 
+# C-program build artefacts (sim/sw: C -> program.hex, regenerable)
+sim/sw/build/
+
+# Local sim artifacts (backups, GTKWave session layouts — not shared)
+sim/program.hex.org
+sim/waves.gtkw
+
 # Editor / OS
 *.swp
 *~

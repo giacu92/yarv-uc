@@ -173,11 +173,16 @@ module rv32imac_zicsr_zifencei (
         .wr_en_i   (wb_en)
     );
 
-    de_t de_w;
+    de_t            de_w;
+
+    // de_* D/E taps (decode stage outputs), mirrored to the debug ports.
+    wire [XLEN-1:0] de_pc_w;
+    wire [XLEN-1:0] de_instr_w;
+    wire            de_valid_w;
 
     // Execute -> decode back-pressure / flush.
-    wire ex_stall;
-    wire ex_flush;
+    wire            ex_stall;
+    wire            ex_flush;
 
     decode_stage u_decode (
         .clk_i     (clk_i),
@@ -192,7 +197,10 @@ module rv32imac_zicsr_zifencei (
         .stall_i   (ex_stall),
         .flush_i   (ex_flush),
         .stall_o   (dec_stall),
-        .de_o      (de_w)
+        .de_o      (de_w),
+        .de_pc_o   (de_pc_w),
+        .de_instr_o(de_instr_w),
+        .de_valid_o(de_valid_w)
     );
 
     // ex_* E/M taps, mirrored to the debug ports below.
@@ -214,9 +222,9 @@ module rv32imac_zicsr_zifencei (
         .branch_addr_o (ex_branch_addr),
         .mem_req_o     (peri_req),
         .mem_rsp_i     (peri_rsp),
-        .ex_pc_dbg_o   (ex_pc_w),
-        .ex_instr_dbg_o(ex_instr_w),
-        .ex_valid_dbg_o(ex_valid_w)
+        .ex_pc_o       (ex_pc_w),
+        .ex_instr_o    (ex_instr_w),
+        .ex_valid_o    (ex_valid_w)
     );
 
     // -----------------------------------------------------------------
@@ -228,9 +236,9 @@ module rv32imac_zicsr_zifencei (
     assign fe_valid_dbg_o = fe_valid_w;
 
     // de_* (decode / D/E register).
-    assign de_pc_dbg_o    = de_w.pc;
-    assign de_instr_dbg_o = de_w.instr;
-    assign de_valid_dbg_o = de_w.valid;
+    assign de_pc_dbg_o    = de_pc_w;
+    assign de_instr_dbg_o = de_instr_w;
+    assign de_valid_dbg_o = de_valid_w;
 
     // ex_* (execute / E/M register).
     assign ex_pc_dbg_o    = ex_pc_w;
