@@ -7,23 +7,30 @@ import rv32_pkg::*;
 /**
  * Board-level top for the Tang Nano 20k (Gowin GW2AR-18C).
  *
- * Instantiates the RV32IMAC + Zicsr + Zifencei CPU (which already
- * exposes two AXI4-Lite masters on its boundary) and routes them to
- * one AXI4-Lite slave BRAM (imem) plus an open peripheral bus.
+ * Instantiates the RV32IMAC + Zicsr + Zifencei CPU (which exposes one
+ * AXI4-Lite master on its boundary) and routes it through a 1->2
+ * AXI4-Lite crossbar to a memory BRAM and an open peripheral bus.
  *
  * Topology:
  *
  *   rv32imac_zicsr_zifencei
- *      |  imem_axi (master)            peri_axi (master, MMIO peripherals)
- *      v                               v
- *   axi_bus_imem (trunk)              axi_bus_peri (trunk, no slave yet)
- *      |                               |
- *      v                               v
- *   axi4_lite_ram (instr+data)        (open, future UART/GPIO)
+ *      |  bus_axi (master: instr + data + MMIO, von Neumann)
+ *      v
+ *   axi_bus_cpu (trunk)
+ *      |
+ *      v
+ *   axi4_lite_xbar (1 slave -> 2 masters, addr[PERI_ADDR_BIT] decode)
+ *      |  m_mem_axi                       m_peri_axi
+ *      v                                  v
+ *   axi_bus_mem (trunk)                 axi_bus_peri (trunk, no slave yet)
+ *      |                                  |
+ *      v                                  v
+ *   axi4_lite_ram (instr+data)          (open, future UART/GPIO)
  *
- * The native->AXI conversion is owned by the CPU itself (per-port
- * axi4_lite_master_bridge instances inside rv32imac_zicsr_zifencei),
- * so the board top stays free of glue.
+ * The native->AXI conversion is owned by the CPU itself (one
+ * axi4_lite_master_bridge inside rv32imac_zicsr_zifencei); the board
+ * top owns the address-decode topology (the crossbar). The CPU is
+ * agnostic to whether an address hits RAM or a peripheral.
  *
  * Pin assignments are in impl/pnr/rv32imac_Zicsr_Zifencei.cst.
  *
@@ -116,17 +123,24 @@ module top_module (
     wire rstn_core = rst_sync[1];
 
     // -----------------------------------------------------------------
-    // AXI4-Lite buses (trunk modport) — one per CPU master port
+    // AXI4-Lite buses (trunk modport)
+    //
+    //   axi_bus_cpu  : CPU master -> crossbar slave
+    //   axi_bus_mem  : crossbar mem master -> RAM slave
+    //   axi_bus_peri : crossbar peri master -> (future UART/GPIO slave)
     // -----------------------------------------------------------------
-    axi4_lite_if axi_bus_imem ();
+    axi4_lite_if axi_bus_cpu ();
+    axi4_lite_if axi_bus_mem ();
     axi4_lite_if axi_bus_peri ();
 
-    // Single clock domain: the whole fabric (CPU, both AXI4-Lite bridges,
-    // the buses, and the RAM slave) runs on clk_core / rstn_core. There
+    // Single clock domain: the whole fabric (CPU bridge, crossbar, the
+    // buses, and the RAM slave) runs on clk_core / rstn_core. There
     // is NO clock-domain crossing — clk_i (25 MHz) only feeds the rPLL,
     // and rstn_i is the async board reset that feeds the synchronizer.
-    assign axi_bus_imem.aclk    = clk_core;
-    assign axi_bus_imem.aresetn = rstn_core;
+    assign axi_bus_cpu.aclk     = clk_core;
+    assign axi_bus_cpu.aresetn  = rstn_core;
+    assign axi_bus_mem.aclk     = clk_core;
+    assign axi_bus_mem.aresetn  = rstn_core;
     assign axi_bus_peri.aclk    = clk_core;
     assign axi_bus_peri.aresetn = rstn_core;
 
@@ -137,19 +151,35 @@ module top_module (
     // CPU. Functional ports only — no debug crosses the CPU boundary
     // (the per-stage taps are internal; the sim probes them via the
     // Verilator hierarchy). The fetch stage stays observable to
-    // synthesis through its real output: the imem bus to the RAM below.
+    // synthesis through its real output: the bus to the crossbar / RAM
+    // below.
     // -----------------------------------------------------------------
     rv32imac_zicsr_zifencei u_cpu (
         .clk_i      (clk_core),
         .rstn_i     (rstn_core),
         .boot_addr_i(32'h0000_0000),
-        .imem_axi   (axi_bus_imem.master),
-        .peri_axi   (axi_bus_peri.master),
+        .bus_axi    (axi_bus_cpu.master),
         .dbg_stall_o(dbg_stall)
     );
 
     // -----------------------------------------------------------------
-    // Memory RAM on the imem bus (von Neumann: instructions + data).
+    // 1->2 AXI4-Lite crossbar: splits the CPU bus into a memory region
+    // and a peripheral region by address (addr[PERI_ADDR_BIT]=1 -> peri,
+    // else mem). Single-outstanding pass-through (the CPU bridge is
+    // single-outstanding overall). See axi4_lite_xbar for routing.
+    // -----------------------------------------------------------------
+    axi4_lite_xbar #(
+        .SEL_BIT(PERI_ADDR_BIT)
+    ) u_xbar (
+        .clk_i     (clk_core),
+        .rstn_i    (rstn_core),
+        .s_axi     (axi_bus_cpu.slave),
+        .m_mem_axi (axi_bus_mem.master),
+        .m_peri_axi(axi_bus_peri.master)
+    );
+
+    // -----------------------------------------------------------------
+    // Memory RAM on the mem master (von Neumann: instructions + data).
     // -----------------------------------------------------------------
     axi4_lite_ram #(
         .ADDR_W   (16),  // 64 KiB
@@ -157,15 +187,16 @@ module top_module (
     ) u_ram (
         .clk_i (clk_core),
         .rstn_i(rstn_core),
-        .axi   (axi_bus_imem.slave)
+        .axi   (axi_bus_mem.slave)
     );
 
     // -----------------------------------------------------------------
     // Peripheral bus: reserved for memory-mapped peripherals (UART, GPIO,
     // ...). No slave instantiated yet — the trunk is left open on the
     // slave side (tied off) so a peripheral drops in without rewiring.
-    // The CPU's LSU does NOT use this bus for RAM: data memory shares the
-    // imem bus above.
+    // NOTE: with no slave, awready/arready are 0, so a peripheral
+    // access would stall the LSU until a real slave is added. No code
+    // should target the peri region until then.
     // -----------------------------------------------------------------
     assign axi_bus_peri.awready = 1'b0;
     assign axi_bus_peri.wready  = 1'b0;

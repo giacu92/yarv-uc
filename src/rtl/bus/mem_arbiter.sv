@@ -72,7 +72,7 @@ module mem_arbiter (
     wire  slave_free = slv_rsp_i.wready;
     wire  grant_lsu = slave_free & lsu_req_i.wvalid;
     wire  grant_fetch = slave_free & ~lsu_req_i.wvalid & fetch_req_i.wvalid;
-    wire  grant_any = grant_lsu | grant_fetch;
+    //wire  grant_any = grant_lsu | grant_fetch;
 
     // -----------------------------------------------------------------
     // Owner tracking: routes the response during the busy stretch.

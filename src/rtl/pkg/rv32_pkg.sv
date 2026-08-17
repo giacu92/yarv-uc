@@ -1,8 +1,21 @@
 package rv32_pkg;
 
-    localparam int unsigned XLEN       = 32;
-    localparam int unsigned STRB_WIDTH = XLEN / 8;
-    localparam int unsigned AXI4_LEN   = 32;
+    localparam int unsigned XLEN          = 32;
+    localparam int unsigned STRB_WIDTH    = XLEN / 8;
+    localparam int unsigned AXI4_LEN      = 32;
+
+    // ---------------------------------------------------------------
+    // Bus address decode: the single AXI4-Lite master port carries
+    // both memory and memory-mapped-peripheral traffic. A top-level
+    // 1->2 crossbar splits it by address. PERI_ADDR_BIT selects which
+    // address bit distinguishes the two regions: addr[PERI_ADDR_BIT]=1
+    // -> peripheral (UART/GPIO/...), =0 -> memory (RAM). Default bit 28
+    // (0x1000_0000+ is peripheral), a conventional MMIO base, leaving
+    // 0x8000_0000+ and the low 256 MiB for RAM.
+    // Moveable here so the map lives in one place, not hardcoded in the
+    // xbar or the board top.
+    // ---------------------------------------------------------------
+    localparam int unsigned PERI_ADDR_BIT = 28;
 
     typedef logic [STRB_WIDTH-1:0] strb_t;
 

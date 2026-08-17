@@ -1,4 +1,8 @@
-# rv32imac\_Zicsr\_Zifencei
+# YARV-uC: Yet Another RISC-V uController
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/giacu92/yarv-uc)
+
+
 
 A RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based

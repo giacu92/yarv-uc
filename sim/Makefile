@@ -14,6 +14,7 @@ RTL := \
 	../src/rtl/bus/axi4_lite_if.sv \
 	../src/rtl/bus/axi4_lite_master_bridge.sv \
 	../src/rtl/bus/mem_arbiter.sv \
+	../src/rtl/bus/axi4_lite_xbar.sv \
 	../src/rtl/core/fetch_stage.sv \
 	../src/rtl/core/reg_file.sv \
 	../src/rtl/core/decode_stage.sv \

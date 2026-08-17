@@ -6,31 +6,32 @@ import rv32_pkg::*;
 
 /**
  * CPU top: instantiates pipeline stages AND the on-die AXI4-Lite
- * bridges that turn the native mem_req_t / mem_rsp_t into AR/AW/W +
- * R/B at each master port.
+ * bridge that turns the native mem_req_t / mem_rsp_t into AR/AW/W +
+ * R/B at the single master port.
  *
- * External view of the CPU is bus-centric — two AXI4-Lite masters:
+ * External view of the CPU is bus-centric — ONE AXI4-Lite master:
  *
- *   - `imem_axi` : AXI4-Lite master toward memory (instructions AND
- *                  data — von Neumann: fetch and the LSU share this
- *                  one port through a mem_arbiter, LSU priority).
- *   - `peri_axi` : AXI4-Lite master toward memory-mapped peripherals
- *                  (UART, GPIO, ...). Reserved for future MMIO; the
- *                  LSU does not target it yet (no address decode), so
- *                  its native side is held idle.
+ *   - `bus_axi` : AXI4-Lite master carrying ALL memory traffic —
+ *                 instructions AND data (von Neumann: fetch and the
+ *                 LSU share this one port through a mem_arbiter, LSU
+ *                 priority) AND memory-mapped peripheral accesses
+ *                 (UART, GPIO, ...). The LSU targets peripherals by
+ *                 address; a top-level 1->2 crossbar (in the board /
+ *                 sim top) splits this port into a mem region and a
+ *                 peri region by address (see rv32_pkg::PERI_ADDR_BIT).
  *
  * Internally:
  *
  *   fetch_stage --┐
- *                 ├─ mem_arbiter ─► axi4_lite_master_bridge ─► imem_axi
- *   LSU (execute)─┘   (LSU priority)
+ *                 ├─ mem_arbiter ─► axi4_lite_master_bridge ─► bus_axi
+ *   LSU (execute)─┘   (LSU priority)      (single outstanding)
  *
- *   (future MMIO) ─► axi4_lite_master_bridge ─► peri_axi   (idle today)
- *
- * Each bridge is a single-outstanding FSM that turns a native
+ * The bridge is a single-outstanding FSM that turns a native
  * req.wvalid / rsp.wready (launch) + rsp.rvalid / req.rready (read)
  * handshake into an AXI4-Lite transaction, so the rest of the system
- * sees the CPU as a plain AXI4-Lite master.
+ * sees the CPU as a plain AXI4-Lite master. Address-decode / peripheral
+ * routing is the board top's job (the crossbar), not the CPU's: the CPU
+ * is agnostic to whether an address hits RAM or a peripheral.
  *
  * No debug signals cross the CPU boundary: the per-stage pc / instr /
  * valid / writeback taps live on the stage blocks and on internal nets
@@ -48,12 +49,9 @@ module rv32imac_zicsr_zifencei (
 
     input wire [XLEN-1:0] boot_addr_i,  // Reset vector boot address
 
-    // AXI4-Lite master #0: memory (instructions + data, von Neumann).
-    axi4_lite_if.master imem_axi,
-
-    // AXI4-Lite master #1: memory-mapped peripherals (UART, GPIO, ...).
-    // Reserved for future MMIO; idle today.
-    axi4_lite_if.master peri_axi,
+    // AXI4-Lite master: unified memory + peripheral bus (von Neumann
+    // fetch+data, plus MMIO). A top-level crossbar splits mem/peri.
+    axi4_lite_if.master bus_axi,
 
     // Debug taps
     output wire dbg_stall_o  // decode or execute stage stall
@@ -118,34 +116,20 @@ module rv32imac_zicsr_zifencei (
     );
 
     // -----------------------------------------------------------------
-    // On-die AXI4-Lite bridges (one per master port)
+    // On-die AXI4-Lite bridge (single master port)
     //
-    // Translate the native mem_req_t / mem_rsp_t into AXI4-Lite
+    // Translates the native mem_req_t / mem_rsp_t into AXI4-Lite
     // AR/AW/W + R/B. The pipeline only ever deals with one-cycle
-    // request/response; the bridge owns the bus protocol.
+    // request/response; the bridge owns the bus protocol. Both memory
+    // and peripheral addresses flow through this one bridge — the
+    // board top's crossbar splits them by address downstream.
     // -----------------------------------------------------------------
-    axi4_lite_master_bridge u_imem_bridge (
+    axi4_lite_master_bridge u_bus_bridge (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
         .req_i (imem_req),
         .rsp_o (imem_rsp),
-        .axi   (imem_axi)
-    );
-
-    // The peri bridge is reserved for future memory-mapped peripherals
-    // (UART, GPIO). The LSU does not target it yet (no address decode),
-    // so its native side is held idle (wvalid=0). When MMIO lands, route
-    // the LSU's peripheral-address accesses here.
-    mem_req_t peri_req;
-    mem_rsp_t peri_rsp;
-    assign peri_req = '{wvalid: 1'b0, we: 1'b0, addr: '0, wdata: '0, wstrb: '0, rready: 1'b0};
-
-    axi4_lite_master_bridge u_peri_bridge (
-        .clk_i (clk_i),
-        .rstn_i(rstn_i),
-        .req_i (peri_req),
-        .rsp_o (peri_rsp),
-        .axi   (peri_axi)
+        .axi   (bus_axi)
     );
 
     // -----------------------------------------------------------------
@@ -235,9 +219,6 @@ module rv32imac_zicsr_zifencei (
         .ex_instr_o    (ex_instr_w),
         .ex_valid_o    (ex_valid_w)
     );
-
-    // peri_rsp is unused (no MMIO yet); sink it to keep it clean.
-    wire unused_peri_rsp = peri_rsp.wready | peri_rsp.rvalid | peri_rsp.bvalid | peri_rsp.rdata[0];
 
     // Aggregate stall tap for the board / sim (functional only).
     assign dbg_stall_o = dec_stall | ex_stall;

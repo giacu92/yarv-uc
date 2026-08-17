@@ -89,9 +89,9 @@ int main(int argc, char** argv) {
 
     int fetched   = 0;
     int decoded   = 0;
-    int max_fetch = 32;      // stop after this many fetched words
-    int max_instr = 96;      // cap for the decode / execute retire logs
-    int max_cyc   = 600;     // safety bound (mem ops add cycles)
+    int max_fetch = 1000;      // stop after this many fetched words
+    int max_instr = 1000;      // cap for the decode / execute retire logs
+    int max_cyc   = 1000;     // safety bound (mem ops add cycles)
     uint32_t prev_fe_pc = 0;
     bool     have_prev_fe = false;
     int      fe_pc_checked = 0, fe_pc_ok = 0, fe_pc_bad = 0;

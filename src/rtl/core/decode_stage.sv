@@ -409,8 +409,12 @@ module decode_stage (
                         if (rd5 == 5'd0 && rs2_5 == 5'd0) begin
                             // c.ebreak -> illegal (SYSTEM, not decoded)
                         end else if (rs2_5 == 5'd0) begin
-                            // c.jr (rd!=1) / c.jalr (rd==1): jalr rd, 0(rs1)
-                            res = mk_i(OPC_JALR, rd5, rd5, 3'b000, 32'd0);
+                            // c.jr (c[12]=0) / c.jalr (c[12]=1): jalr rd, 0(rs1).
+                            // rs1 = c[11:7] (= rd5); rd = x0 for c.jr (discard
+                            // link), x1 (ra) for c.jalr. c.ebreak (rs1==0) was
+                            // caught above. Using rd5 as rd would write the link
+                            // back INTO the jump register, corrupting it.
+                            res = mk_i(OPC_JALR, c[12] ? 5'd1 : 5'd0, rd5, 3'b000, 32'd0);
                         end else begin
                             // c.mv / c.add — rd==0 is HINT -> illegal
                             if (rd5 != 5'd0) begin
@@ -477,14 +481,18 @@ module decode_stage (
     // execute retires its writeback this cycle and gets an invalid slot
     // next cycle (no re-run).
     //
-    // Gated on fe_valid_i (no consumer in F/D -> no stall) and ~flush_i
-    // (a taken JAL/JALR writes its link reg but the fall-through is
-    // discarded by the redirect, so no hazard). ex_wb_en_i is high only on
-    // the retire cycle, so DIV/REM busy cycles (wb_en=0, already covered by
-    // ex_stall) don't falsely trigger — only the div-done cycle does.
+    // Gated on decoded_valid (covers BOTH a fresh F/D word AND a
+    // hold-buffer upper half — the latter decodes with fe_valid_i=0, so
+    // gating on fe_valid_i alone would miss a hazard where the low half
+    // of a compressed pair writes rd and the stashed upper half reads
+    // it). ~flush_i skips the stall when E_N is a taken JAL/JALR (writes
+    // link AND redirects — fall-through discarded). ex_wb_en_i is high
+    // only on the retire cycle, so DIV/REM busy cycles (wb_en=0, already
+    // covered by ex_stall) don't falsely trigger — only the div-done
+    // cycle does.
     // =================================================================
     logic raw_haz;
-    assign raw_haz = fe_valid_i & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
+    assign raw_haz = decoded_valid & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
         ((rs1_addr_dec != 5'd0 & rs1_addr_dec == ex_wb_addr_i) |
          (rs2_addr_dec != 5'd0 & rs2_addr_dec == ex_wb_addr_i));
 

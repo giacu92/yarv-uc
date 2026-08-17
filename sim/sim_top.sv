@@ -6,8 +6,9 @@ import rv32_pkg::*;
 
 /**
  * Simulation top (Verilator). Replicates the board-top wiring of
- * `top_module`: instantiates the CPU and the AXI4-Lite RAM (so the RAM
- * can be preloaded with a program hex via $readmemh).
+ * `top_module`: instantiates the CPU, a 1->2 AXI4-Lite crossbar, and
+ * the AXI4-Lite RAM on the mem master (so the RAM can be preloaded
+ * with a program hex via $readmemh).
  *
  * No debug signals cross the CPU boundary (the CPU exports only its
  * functional ports). The C++ harness observes the per-stage taps
@@ -17,9 +18,9 @@ import rv32_pkg::*;
  * reachable as flat C++ members of the sim_top model. sim_top itself
  * therefore needs no debug output ports.
  *
- * The peripheral master port is tied off exactly like `top_module`
+ * The peripheral crossbar master is tied off exactly like `top_module`
  * (reserved for future MMIO peripherals — UART, GPIO — not data RAM,
- * which shares the imem bus).
+ * which shares the mem master).
  *
  * This module is simulation-only; it is not part of the synthesis
  * file list.
@@ -34,13 +35,19 @@ module sim_top (
 );
 
     // -----------------------------------------------------------------
-    // AXI4-Lite buses (trunk modport) — one per CPU master port
+    // AXI4-Lite buses (trunk modport)
+    //   axi_bus_cpu  : CPU master -> crossbar slave
+    //   axi_bus_mem  : crossbar mem master -> RAM slave
+    //   axi_bus_peri : crossbar peri master -> tied off (no slave yet)
     // -----------------------------------------------------------------
-    axi4_lite_if axi_bus_imem ();
+    axi4_lite_if axi_bus_cpu ();
+    axi4_lite_if axi_bus_mem ();
     axi4_lite_if axi_bus_peri ();
 
-    assign axi_bus_imem.aclk    = clk_i;
-    assign axi_bus_imem.aresetn = rstn_i;
+    assign axi_bus_cpu.aclk     = clk_i;
+    assign axi_bus_cpu.aresetn  = rstn_i;
+    assign axi_bus_mem.aclk     = clk_i;
+    assign axi_bus_mem.aresetn  = rstn_i;
     assign axi_bus_peri.aclk    = clk_i;
     assign axi_bus_peri.aresetn = rstn_i;
 
@@ -55,13 +62,25 @@ module sim_top (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
         .boot_addr_i(32'h0000_0000),
-        .imem_axi   (axi_bus_imem.master),
-        .peri_axi   (axi_bus_peri.master),
+        .bus_axi    (axi_bus_cpu.master),
         .dbg_stall_o(unused_dbg_stall)
     );
 
     // -----------------------------------------------------------------
-    // Memory RAM on the imem bus (von Neumann: instructions + data),
+    // 1->2 AXI4-Lite crossbar: mem vs peri by addr[PERI_ADDR_BIT].
+    // -----------------------------------------------------------------
+    axi4_lite_xbar #(
+        .SEL_BIT(PERI_ADDR_BIT)
+    ) u_xbar (
+        .clk_i     (clk_i),
+        .rstn_i    (rstn_i),
+        .s_axi     (axi_bus_cpu.slave),
+        .m_mem_axi (axi_bus_mem.master),
+        .m_peri_axi(axi_bus_peri.master)
+    );
+
+    // -----------------------------------------------------------------
+    // Memory RAM on the mem master (von Neumann: instructions + data),
     // preloaded via $readmemh.
     //
     // The load is done here (not via the RAM's INIT_FILE parameter) so the
@@ -73,11 +92,11 @@ module sim_top (
     // -----------------------------------------------------------------
     axi4_lite_ram #(
         .ADDR_W   (16),  // 64 KiB
-        .INIT_FILE("")   // loaded from sim_top below (plusarg-selected)
+        .INIT_FILE("")
     ) u_ram (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
-        .axi   (axi_bus_imem.slave)
+        .axi   (axi_bus_mem.slave)
     );
 
     string init_file;
@@ -89,7 +108,7 @@ module sim_top (
 
     // -----------------------------------------------------------------
     // Peripheral bus: tie off the slave side (reserved for future MMIO
-    // peripherals; data RAM shares the imem bus, not this port).
+    // peripherals; data RAM shares the mem master, not this port).
     // -----------------------------------------------------------------
     assign axi_bus_peri.awready = 1'b0;
     assign axi_bus_peri.wready  = 1'b0;
