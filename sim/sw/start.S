@@ -6,12 +6,11 @@
  * calls main(); main() returns into an infinite loop (there is no exit
  * mechanism on this core).
  *
- * NOTE on the current core (DRAFT): the peri (data) bus has no slave yet
- * and there is no LSU, so stack / data accesses are silently no-ops (a
- * store drops, a load reads 0). The sp value below is therefore
- * forward-looking — pure-register programs that never spill run fine
- * today; anything that touches memory will misbehave until the LSU + a
- * data slave land.
+ * The LSU is live and the shared imem bus carries von Neumann data (loads
+ * and stores retire through it; fetch and the LSU share one port via
+ * mem_arbiter). Stack spill/fill and .data globals therefore work. The
+ * peri (MMIO) bus slave is still tied off, so code that targets the peri
+ * address region stalls the LSU; keep programs in the mem region.
  */
 
     .section .text.init, "ax"

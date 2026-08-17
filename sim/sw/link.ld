@@ -4,9 +4,10 @@
  * placed first) must land at 0x0.
  *
  * This is a freestanding image: no crt0, no libc, no runtime. The startup
- * in start.S is the only entry code. .bss is NOT zeroed at runtime (the
- * core has no LSU / data memory yet), so keep programs free of zero-init
- * globals until the LSU lands.
+ * in start.S is the only entry code. .bss is NOT zeroed at runtime (start.S
+ * does not clear it), so put state that needs a known value in an
+ * initialized .data array (it is part of the loaded image), not in
+ * uninitialized .bss globals.
  */
 
 OUTPUT_ARCH("riscv")

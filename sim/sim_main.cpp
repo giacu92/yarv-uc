@@ -46,6 +46,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -96,7 +97,12 @@ int main(int argc, char** argv) {
     // Single pass: record the three stage logs, stop once parked.
     // -----------------------------------------------------------------
     const int PARK_N  = 8;     // consecutive identical retires => parked
-    const int max_cyc = 1000;  // safety bound (programs that don't park)
+    // Safety bound for programs that don't park. Override with the MAX_CYC
+    // env var (e.g. MAX_CYC=20000 make run) for longer-running programs.
+    const int max_cyc = [] {
+        const char *e = getenv("MAX_CYC");
+        return e ? atoi(e) : 4000;
+    }();
 
     std::vector<std::string> fe_log, de_log, ex_log;
     int fetched = 0, decoded = 0, retired = 0;
