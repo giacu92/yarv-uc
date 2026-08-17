@@ -6,15 +6,20 @@ import rv32_pkg::*;
 
 /**
  * Simulation top (Verilator). Replicates the board-top wiring of
- * `top_module` but:
- *   - instantiates the CPU and the AXI4-Lite RAM directly (so the RAM
- *     can be preloaded with a program hex via $readmemh), and
- *   - exposes the CPU's fe_* (fetch / F/D) AND de_* (decode / D/E) debug
- *     taps — pc / instr / valid per stage — as output ports so the C++
- *     harness can log what fetch delivers and what decode produces.
+ * `top_module`: instantiates the CPU and the AXI4-Lite RAM (so the RAM
+ * can be preloaded with a program hex via $readmemh).
+ *
+ * No debug signals cross the CPU boundary (the CPU exports only its
+ * functional ports). The C++ harness observes the per-stage taps
+ * (fe_* / de_* / ex_* / writeback) by probing the Verilator hierarchy
+ * directly — the sim is built with --public-flat, so the CPU-internal
+ * nets (fe_pc_w, de_pc_w, ex_pc_w, wb_en, wb_addr, wb_data, ...) are
+ * reachable as flat C++ members of the sim_top model. sim_top itself
+ * therefore needs no debug output ports.
  *
  * The peripheral master port is tied off exactly like `top_module`
- * (no slave yet) so a future peripheral drops in without rewiring.
+ * (reserved for future MMIO peripherals — UART, GPIO — not data RAM,
+ * which shares the imem bus).
  *
  * This module is simulation-only; it is not part of the synthesis
  * file list.
@@ -23,26 +28,9 @@ import rv32_pkg::*;
  * signals (incl. interface instances) have no prefix.
  */
 module sim_top (
-    input wire clk_i,
-    input wire rstn_i,
-
-    // "LED" tap (low nibble of the fetch PC), kept for parity with the board.
-    output wire [3:0] led_o,
-
-    // fe_* debug taps (fetch / F/D register): pc / instr / valid.
-    output wire [XLEN-1:0] fe_pc_dbg_o,
-    output wire [XLEN-1:0] fe_instr_dbg_o,
-    output wire            fe_valid_dbg_o,
-
-    // de_* debug taps (decode / D/E register): pc / instr / valid.
-    output wire [XLEN-1:0] de_pc_dbg_o,
-    output wire [XLEN-1:0] de_instr_dbg_o,
-    output wire            de_valid_dbg_o,
-
-    // ex_* debug taps (execute / E/M register): pc / instr / valid.
-    output wire [XLEN-1:0] ex_pc_dbg_o,
-    output wire [XLEN-1:0] ex_instr_dbg_o,
-    output wire            ex_valid_dbg_o
+    input  wire       clk_i,
+    input  wire       rstn_i,
+    output wire [3:0] led_o
 );
 
     // -----------------------------------------------------------------
@@ -57,34 +45,24 @@ module sim_top (
     assign axi_bus_peri.aresetn = rstn_i;
 
     // -----------------------------------------------------------------
-    // CPU
+    // CPU. Functional ports only; debug is observed via the Verilator
+    // hierarchy (--public-flat) from sim_main, not through ports here.
+    // The aggregate stall tap (dbg_stall_o) is sunk to an unused wire —
+    // it carries no per-stage debug, just a "pipe stalled" status bit.
     // -----------------------------------------------------------------
-    // Full fetch PC; led_o is its low nibble, fe_pc_dbg_o is the full
-    // width (exposed for the harness).
-    wire [XLEN-1:0] cpu_pc_dbg;
-
+    wire unused_dbg_stall;
     rv32imac_zicsr_zifencei u_cpu (
-        .clk_i         (clk_i),
-        .rstn_i        (rstn_i),
-        .boot_addr_i   (32'h0000_0000),
-        .imem_axi      (axi_bus_imem.master),
-        .peri_axi      (axi_bus_peri.master),
-        .fe_pc_dbg_o   (cpu_pc_dbg),
-        .fe_instr_dbg_o(fe_instr_dbg_o),
-        .fe_valid_dbg_o(fe_valid_dbg_o),
-        .de_pc_dbg_o   (de_pc_dbg_o),
-        .de_instr_dbg_o(de_instr_dbg_o),
-        .de_valid_dbg_o(de_valid_dbg_o),
-        .ex_pc_dbg_o   (ex_pc_dbg_o),
-        .ex_instr_dbg_o(ex_instr_dbg_o),
-        .ex_valid_dbg_o(ex_valid_dbg_o)
+        .clk_i      (clk_i),
+        .rstn_i     (rstn_i),
+        .boot_addr_i(32'h0000_0000),
+        .imem_axi   (axi_bus_imem.master),
+        .peri_axi   (axi_bus_peri.master),
+        .dbg_stall_o(unused_dbg_stall)
     );
 
-    assign led_o       = cpu_pc_dbg[3:0];
-    assign fe_pc_dbg_o = cpu_pc_dbg;
-
     // -----------------------------------------------------------------
-    // Instruction RAM on the imem bus, preloaded via $readmemh.
+    // Memory RAM on the imem bus (von Neumann: instructions + data),
+    // preloaded via $readmemh.
     //
     // The load is done here (not via the RAM's INIT_FILE parameter) so the
     // image can be selected at run time with the +INIT=<path> Verilator
@@ -110,7 +88,8 @@ module sim_top (
     end
 
     // -----------------------------------------------------------------
-    // Peripheral bus: tie off the slave side (no peripheral yet).
+    // Peripheral bus: tie off the slave side (reserved for future MMIO
+    // peripherals; data RAM shares the imem bus, not this port).
     // -----------------------------------------------------------------
     assign axi_bus_peri.awready = 1'b0;
     assign axi_bus_peri.wready  = 1'b0;
@@ -120,6 +99,21 @@ module sim_top (
     assign axi_bus_peri.rvalid  = 1'b0;
     assign axi_bus_peri.rdata   = '0;
     assign axi_bus_peri.rresp   = 2'b00;
+
+    // -----------------------------------------------------------------
+    // LED: free-running counter, parity with the board top.
+    // -----------------------------------------------------------------
+    logic [27:0] led_cnt_q;
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) begin
+            led_cnt_q <= '0;
+        end else begin
+            led_cnt_q <= led_cnt_q + 1'b1;
+        end
+    end
+
+    assign led_o = led_cnt_q[27:24];
 
 endmodule
 

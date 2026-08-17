@@ -7,6 +7,7 @@
     <FileList>
         <File path="src/rtl/bus/axi4_lite_if.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/bus/axi4_lite_master_bridge.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/bus/mem_arbiter.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/fetch_stage.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/reg_file.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/decode_stage.sv" type="file.verilog" enable="1"/>

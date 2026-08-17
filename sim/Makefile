@@ -13,6 +13,7 @@ RTL := \
 	../src/rtl/pkg/rv32_pkg.sv \
 	../src/rtl/bus/axi4_lite_if.sv \
 	../src/rtl/bus/axi4_lite_master_bridge.sv \
+	../src/rtl/bus/mem_arbiter.sv \
 	../src/rtl/core/fetch_stage.sv \
 	../src/rtl/core/reg_file.sv \
 	../src/rtl/core/decode_stage.sv \
@@ -24,6 +25,7 @@ RTL := \
 
 VFLAGS := --cc --exe --build --top-module sim_top \
 	-Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT -Wno-LATCH -Wno-INITIALDLY -Wno-TIMESCALEMOD \
+	--public-flat-rw \
 	--trace \
 	-I../src/rtl/pkg -I../src/rtl/core -I../src/rtl/bus -I../src/rtl/utils
 

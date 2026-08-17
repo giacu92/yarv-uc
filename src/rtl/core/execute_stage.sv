@@ -13,12 +13,14 @@ import rv32_pkg::*;
  *   - drives the ALU (base RV32I + M + Zilx EA), launching the
  *     multi-cycle DIV/REM with start_i and stalling the pipe until the
  *     ALU asserts result_valid_o;
- *   - writes back ALU / PC4 results to the register file (loads are the
- *     LSU's job — not present yet, so mem ops do not retire a write);
+ *   - writes back ALU / PC4 / load (MEM) results to the register file
+ *     (stores carry no reg writeback); loads retire via WB_MEM once the
+ *     read response arrives;
  *   - resolves branches and redirects fetch (branch_valid_o /
  *     branch_addr_o), flushing decode's D/E register on a taken branch;
- *   - exposes a native mem_req_o / mem_rsp_i port for the future LSU
- *     (wvalid is gated to 0 today, so the peri bridge stays idle).
+ *   - drives the native mem_req_o / mem_rsp_i port (the LSU) toward the
+ *     peri bridge: loads/stores/Zilx indexed loads launch, stall the pipe
+ *     until the response, and retire.
  *
  * The CPU top used to tie the reg-file write port, the fetch redirect,
  * and decode's stall/flush to inert constants; this stage now drives
@@ -26,24 +28,36 @@ import rv32_pkg::*;
  * stage-sigil convention: ex_* is the E/M register — pc / instr / valid
  * of the retired operation.
  *
- * Known DRAFT limitations (TODO):
+ * Memory (LSU): loads / stores / Zilx indexed loads launch on the native
+ * mem_req_o / mem_rsp_i port (the peri bridge). A unified FSM extends the
+ * DIV/REM busy state with EX_MEM_WAIT: a mem op launches the cycle it is
+ * valid in EX_IDLE (wvalid=1, bridge wready=1 in its idle), then the pipe
+ * stalls in EX_MEM_WAIT until the read response (rvalid, load) or the
+ * write-ack (bvalid, store) retires it. Loads write back via WB_MEM with
+ * sub-word extract + sign/zero extension; stores carry pre-shifted data
+ * and byte strobes (no reg writeback). The decode stall-on-RAW interlock
+ * then covers load-use: a consumer right behind a load is held in decode
+ * while the load occupies execute, and bubbles the cycle the load's wb_en
+ * pulses — so it re-reads the fresh loaded value (one bubble, no bypass).
  *
- *   - No forwarding / hazard unit. Decode's reg-file async read for the
- *     next instruction overlaps the current instruction's writeback
- *     (both resolve at the same posedge), so an instruction that reads
- *     a register written by the immediately preceding instruction sees
- *     the STALE (pre-writeback) value. Add a bypass path or a
- *     stall-on-RAW interlock before relying on dependent sequences.
- *     Single-cycle ALU ops and DIV/REM share this hazard.
+ * Known DRAFT limitations:
  *
- *   - No LSU. Loads / stores / Zilx compute their effective address in
- *     the ALU (mem_req_o.addr = alu_result) but do not launch a request
- *     (wvalid=0) and do not retire a register write, so the pipe never
- *     stalls on the (today tied-off) peri slave. Wire the memory
- *     launch + rsp.rvalid stall + WB_MEM writeback when the LSU lands.
+ *   - No bypass path. Register RAW hazards are resolved by decode's
+ *     stall-on-RAW interlock (one bubble), not by forwarding. Load-use is
+ *     covered the same way (the load's extra execute cycles hold the
+ *     consumer in decode; the wb_en pulse triggers the bubble). No
+ *     forwarding means each dependent op pays the bubble.
+ *
+ *   - No trap / exception support. A misaligned access (LH/LHU at
+ *     addr[0]=1, LW at addr[1:0]!=0, or the SH/SW equivalents) is
+ *     SUPPRESSED — not launched, not retired, no writeback — rather than
+ *     trapping. Cross-word sub-word accesses that would need two beats
+ *     are not handled. Add CSR/exception machinery before relying on
+ *     aligned-only code.
  *
  *   - DIV/REM result is not bypassed (see hazard note): a consumer in
- *     the slot right after the div reads the stale value.
+ *     the slot right after the div reads the stale value — resolved by
+ *     the interlock's bubble, not forwarding.
  *
  * Naming: ports *_i/_o; internals no prefix; flops _q/_d; instances u_*.
  */
@@ -78,7 +92,7 @@ module execute_stage (
     output wire            branch_valid_o,
     output wire [XLEN-1:0] branch_addr_o,
 
-    // Native memory interface (future LSU). wvalid is gated to 0 today.
+    // Native memory interface (LSU): loads/stores/Zilx launch here.
     output mem_req_t mem_req_o,
     input  mem_rsp_t mem_rsp_i,
 
@@ -116,13 +130,22 @@ module execute_stage (
     end
 
     // =================================================================
-    // Multi-cycle DIV/REM control
+    // Multi-cycle op control: DIV/REM and memory (LSU) share one FSM.
     //
-    // EX_IDLE: ready to accept a new op. A DIV/REM is launched (start_i)
-    // for one cycle, then EX_BUSY holds the pipe until result_valid_o.
-    // The done cycle drops the stall so decode advances and the same
-    // div is not relaunched (ex_state_q is still BUSY at done, so
-    // alu_start is 0; it clears to IDLE for the next cycle's new de_i).
+    // EX_IDLE    : ready. A DIV/REM launches (alu_start) -> EX_DIV_BUSY.
+    //              A mem op launches (mem_launch: wvalid=1 && bridge
+    //              wready) -> EX_MEM_WAIT. Single-cycle ALU/branch ops
+    //              retire the same cycle and stay in EX_IDLE.
+    // EX_DIV_BUSY: hold the pipe until the ALU asserts result_valid_o.
+    // EX_MEM_WAIT: hold the pipe until the load read response (rvalid) or
+    //              the store write-ack (bvalid) retires the op.
+    //
+    // de_i is held stable across the busy/wait states by decode's stall
+    // (stall_o below holds decode's D/E register), so the ALU result (EA)
+    // and the mem op fields stay valid through EX_MEM_WAIT. The done cycle
+    // drops the stall so decode advances and the op is not relaunched
+    // (ex_state_q is still BUSY/WAIT at done, so alu_start / mem_launch
+    // are 0; it clears to IDLE for the next cycle's new de_i).
     // =================================================================
     logic is_div_op;
     assign is_div_op = de_i.alu_op inside {ALU_DIV, ALU_DIVU, ALU_REM, ALU_REMU};
@@ -130,9 +153,31 @@ module execute_stage (
     logic is_mem_op;
     assign is_mem_op = de_i.mem_read | de_i.mem_write;
 
-    typedef enum logic {
+    // Misaligned access: suppressed (no trap / exception support yet).
+    // LH/LHU needs addr[0]=0; LW/SW needs addr[1:0]=00. A sub-word that
+    // would cross a word boundary needs two beats and is not handled.
+    // Byte accesses (LB/LBU/SB) are always within a word. Only mem ops
+    // can be misaligned — non-mem ops reuse mem_size as a don't-care
+    // decode default (MS_W) and must NOT be suppressed, so gate on
+    // is_mem_op.
+    logic mem_misaligned;
+    always_comb begin
+        if (!is_mem_op) begin
+            mem_misaligned = 1'b0;
+        end else begin
+            unique case (de_i.mem_size)
+                MS_B:    mem_misaligned = 1'b0;
+                MS_H:    mem_misaligned = alu_result[0];
+                MS_W:    mem_misaligned = |alu_result[1:0];
+                default: mem_misaligned = 1'b1;
+            endcase
+        end
+    end
+
+    typedef enum logic [1:0] {
         EX_IDLE,
-        EX_BUSY
+        EX_DIV_BUSY,
+        EX_MEM_WAIT
     } ex_state_e;
     ex_state_e ex_state_q, ex_state_d;
 
@@ -142,16 +187,39 @@ module execute_stage (
     logic            alu_result_valid;
     logic [XLEN-1:0] alu_result;
 
-    logic            div_running;
-    assign div_running = (ex_state_q == EX_BUSY) & ~alu_result_valid;
-    assign stall_o     = alu_start | div_running | stall_i;
+    // Mem launch: assert wvalid for one cycle in EX_IDLE on a valid,
+    // aligned mem op. The bridge is idle (wready=1) whenever the LSU is
+    // idle (single-outstanding), so the launch handshakes the same cycle
+    // and the FSM moves to EX_MEM_WAIT.
+    logic            mem_launch;
+    assign
+        mem_launch = de_i.valid & is_mem_op & ~mem_misaligned & (ex_state_q == EX_IDLE) & ~stall_i;
+    wire  mem_launch_hs = mem_launch & mem_rsp_i.wready;
+
+    // Mem done: the cycle the response retires the op. A load retires on
+    // the read-data handshake (rvalid); a store on the write-ack (bvalid).
+    logic mem_done;
+    assign mem_done = (ex_state_q == EX_MEM_WAIT) &
+        (de_i.mem_read ? mem_rsp_i.rvalid : mem_rsp_i.bvalid);
+
+    logic div_running;
+    assign div_running = (ex_state_q == EX_DIV_BUSY) & ~alu_result_valid;
+    // Stall the launch + busy/wait cycles; the done cycle drops the stall
+    // so decode advances (mem_running falls away the cycle mem_done=1).
+    logic mem_running;
+    assign mem_running = (ex_state_q == EX_MEM_WAIT) & ~mem_done;
+    assign stall_o     = alu_start | div_running | mem_launch | mem_running | stall_i;
 
     always_comb begin
         ex_state_d = ex_state_q;
         unique case (ex_state_q)
-            EX_IDLE: if (alu_start) ex_state_d = EX_BUSY;
-            EX_BUSY: if (alu_result_valid) ex_state_d = EX_IDLE;
-            default: ex_state_d = EX_IDLE;
+            EX_IDLE: begin
+                if (alu_start) ex_state_d = EX_DIV_BUSY;
+                else if (mem_launch_hs) ex_state_d = EX_MEM_WAIT;
+            end
+            EX_DIV_BUSY: if (alu_result_valid) ex_state_d = EX_IDLE;
+            EX_MEM_WAIT: if (mem_done) ex_state_d = EX_IDLE;
+            default:     ex_state_d = EX_IDLE;
         endcase
     end
 
@@ -171,25 +239,55 @@ module execute_stage (
     );
 
     // =================================================================
-    // Writeback (ALU / PC4). Mem results need the LSU (not present).
+    // Writeback (ALU / PC4 / MEM). A load retires via WB_MEM with sub-word
+    // extract + sign/zero extension; stores have reg_write=0 (no wb).
     // =================================================================
+    // Load alignment: the peri RAM returns the containing word; shift the
+    // addressed bytes down to bit 0, then sign/zero-extend per mem_size
+    // and mem_unsigned. The result is sampled the cycle mem_done (rvalid)
+    // pulses, when rdata is valid.
+    logic [XLEN-1:0] load_shifted;
+    logic [XLEN-1:0] load_data;
+    assign load_shifted = mem_rsp_i.rdata >> {alu_result[1:0], 3'b000};
+    always_comb begin
+        unique case (de_i.mem_size)
+            MS_B:
+            load_data = de_i.mem_unsigned ?
+                {24'b0, load_shifted[7:0]} : {{24{load_shifted[7]}}, load_shifted[7:0]};
+            MS_H:
+            load_data = de_i.mem_unsigned ?
+                {16'b0, load_shifted[15:0]} : {{16{load_shifted[15]}}, load_shifted[15:0]};
+            MS_W: load_data = mem_rsp_i.rdata;
+            default: load_data = mem_rsp_i.rdata;
+        endcase
+    end
+
     always_comb begin
         unique case (de_i.wb_src)
             WB_ALU:  wb_data_o = alu_result;
             WB_PC4:  wb_data_o = pc_link;
-            WB_MEM:  wb_data_o = mem_rsp_i.rdata;  // 0 until the LSU lands
+            WB_MEM:  wb_data_o = load_data;
             default: wb_data_o = '0;
         endcase
     end
     assign wb_addr_o = de_i.rd;
-    assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~is_mem_op &
-        alu_result_valid & ~stall_i;
+
+    // Result ready: single-cycle ALU/branch and the mem launch cycle have
+    // alu_result_valid=1 (combinational ALU); DIV/REM on alu_result_valid;
+    // a load on mem_done (rvalid). Stores have reg_write=0 so their
+    // result_ready is don't-care for the regfile write.
+    logic result_ready;
+    assign result_ready = is_mem_op ? mem_done : alu_result_valid;
+
+    assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~stall_i &
+        result_ready & ~mem_misaligned;
 
     // =================================================================
-    // Memory interface (future LSU). The effective address (Zilx indexed
-    // or base+offset) is the ALU result. The request is not launched yet
-    // (wvalid=0) so the peri bridge stays idle; wire the launch + the
-    // rsp.rvalid stall + WB_MEM writeback when the LSU lands.
+    // Memory interface (LSU). The effective address (Zilx indexed or
+    // base+offset) is the ALU result. A store's data is pre-shifted into
+    // the byte lanes selected by wstrb (the slave writes wdata[byte] when
+    // wstrb[byte]). rready is asserted in EX_MEM_WAIT on a load so the
+    // bridge forwards it to the AXI R channel and the read completes.
     // =================================================================
     logic [STRB_WIDTH-1:0] store_wstrb;
     always_comb begin
@@ -202,16 +300,17 @@ module execute_stage (
         endcase
     end
 
+    logic [XLEN-1:0] store_wdata;
+    assign store_wdata = de_i.rs2_data << {alu_result[1:0], 3'b000};
+
     always_comb begin
-        mem_req_o.wvalid = 1'b0;  // LSU TODO: launch on mem_read/mem_write
+        mem_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
         mem_req_o.we     = de_i.mem_write;
-        mem_req_o.addr   = alu_result;
-        mem_req_o.wdata  = de_i.rs2_data;
+        mem_req_o.addr   = alu_result;  // EA
+        mem_req_o.wdata  = store_wdata;
         mem_req_o.wstrb  = store_wstrb;
-        mem_req_o.rready = 1'b1;  // LSU TODO: from writeback acceptance
+        mem_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
     end
-    // mem_rsp_i unused until the LSU lands; sink it to keep it clean.
-    wire  unused_mem_rsp = mem_rsp_i.wready | mem_rsp_i.rvalid | mem_rsp_i.rdata[0];
 
     // =================================================================
     // Branch resolve + redirect
@@ -247,11 +346,14 @@ module execute_stage (
     logic [XLEN-1:0] ex_instr_q, ex_instr_d;
     logic ex_valid_q, ex_valid_d;
 
-    // An op retires when it is valid, not a (non-issueing) mem op, and its
-    // result is ready. Single-cycle ops retire the cycle they are valid;
-    // DIV/REM retire on alu_result_valid.
+    // An op retires when it is valid, not illegal, and its result is ready
+    // (alu_result_valid for ALU/DIV, mem_done for a load/store). A
+    // misaligned mem op is suppressed — it never reaches EX_MEM_WAIT, so
+    // its result_ready stays 0 and it does not retire. Single-cycle ops
+    // retire the cycle they are valid; DIV/REM on alu_result_valid; mem
+    // ops on mem_done.
     logic op_retires;
-    assign op_retires = de_i.valid & ~de_i.illegal & ~is_mem_op & alu_result_valid & ~stall_i;
+    assign op_retires = de_i.valid & ~de_i.illegal & ~stall_i & result_ready & ~mem_misaligned;
 
     assign ex_pc_d    = op_retires ? de_i.pc : ex_pc_q;
     assign ex_instr_d = op_retires ? de_i.instr : ex_instr_q;

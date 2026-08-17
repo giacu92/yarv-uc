@@ -31,9 +31,7 @@ package rv32_pkg;
         logic            wready;  // bridge accepts the request (= idle)
         logic            rvalid;  // read data valid this cycle
         logic [XLEN-1:0] rdata;   // read data
-        // TODO(LSU): add bvalid (write-ack, bridge->master). The fetch
-        // is read-only so it is not needed yet; the peri bridge is tied
-        // off and no write is ever launched today.
+        logic            bvalid;  // write-ack valid this cycle (store retire)
     } mem_rsp_t;
 
     // ---------------------------------------------------------------

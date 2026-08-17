@@ -1,31 +1,107 @@
 @00000000
-// ALU-only RV32IM test program for the execute-stage retire log.
+// RAW-hazard interlock + LSU test program for the execute-stage retire +
+// writeback log.
 //
-// No control flow (no branches/jumps) and no loads/stores: every
-// instruction is a register-register or register-immediate ALU op or a
-// NOP, so the retire (ex) log is a clean, in-order record of what the
-// execute stage wrote back. The program is HAZARD-FREE by construction
-// (see the RAW limitation in CLAUDE.md / execute_stage.sv): no
-// instruction reads the register written by the immediately preceding
-// instruction -- a NOP (or an independent op) is inserted wherever a
-// producer is followed by its consumer, so each read sees a settled
-// value. DIV/REM are multi-cycle and stall the pipe; their results are
-// not consumed by the next slot (div result not bypassed), so no div
-// consumer is placed adjacent to its div.
+// Memory is von Neumann: instructions AND data share the imem RAM (the
+// fetch + LSU arbitrate for one bridge, LSU priority). Code lives at
+// 0x00-0x58; data lives at 0x100+ so stores never clobber the program.
 //
-// One 32-bit hex word per line; the word value IS the encoding
-// (low half = rdata[15:0], upper half = rdata[31:16]). Encodings were
-// computed with a bit-field script and spot-checked by hand. The sim
-// retire log is the oracle: it should show every instruction below
-// retiring in PC order, ending at the last NOP -- the zeros past the
-// program decode to illegal (opcode 0) and do not retire.
+// Part 1 — RAW-hazard interlock (stall-on-RAW in decode, one bubble):
+// exercises all three interlock paths the stall-on-RAW interlock must
+// cover (bubble the D/E register + hold F/D for one cycle so decode
+// re-reads the reg file after the producer's writeback has committed):
 //
-// ex_* exposes pc / instr / valid only, so the writeback VALUE is not
-// directly observable here; the retire log verifies the sequencing and
-// the writeback/branch-resolve path. Add a writeback tap when values
-// need checking.
+//   1. ALU RAW         : addi t0,zero,15 ; addi t1,zero,77 ;
+//                        add a0,t0,t1      -- add reads t1 immediately
+//                        after addi t1 writes it (1-cycle distance).
+//                        Interlock -> a0 = 15+77 = 92 (0x5c). Without
+//                        the interlock add reads stale t1 (0) -> a0 = 15.
+//
+//   2. DIV-then-use    : div t3,t0,t2 (t3 = 15/3 = 5) ; addi t4,t3,1.
+//                        The consumer sits the cycle after the div's
+//                        DONE cycle (wb_en pulses only on done, not
+//                        during the 32 busy cycles). Interlock -> t4 =
+//                        5+1 = 6. Without it addi t4 reads stale t3 (0)
+//                        -> t4 = 1, and a buggy interlock that held
+//                        instead of bubbled would RELAUNCH the div.
+//
+//   3. Branch-on-dep   : addi t5,zero,1 ; bne t5,zero,+8. The branch
+//                        operand depends on the immediately preceding
+//                        writeback. Interlock -> bne reads fresh t5=1
+//                        -> taken -> the not-taken marker (addi a1 at
+//                        0x20) is skipped -> the taken-path marker
+//                        (addi t6=9 at 0x24) executes. Without the
+//                        interlock bne reads stale t5=0 -> not taken ->
+//                        a1=0x42 executes instead (wrong control flow,
+//                        not just a wrong register value).
+//
+// Part 2 — LSU (loads/stores retire via the imem arbiter; the
+// decode stall-on-RAW interlock covers load-use the same way it covers
+// ALU/div hazards — the load's extra execute cycles hold the consumer
+// in decode, and the wb_en pulse triggers the one-cycle bubble):
+//
+//   4. SW/LW round-trip + load-use:
+//        addi a2,zero,0x55 ; sw a2,0x100(zero) ; lw a3,0x100(zero) ;
+//        addi a4,a3,1.
+//        -> a3 = 0x55 (load), then a4 = 0x56 (RAW on the loaded a3:
+//        load-use bubble). Without the LSU a3/a4 stay 0; without the
+//        interlock a4 = 1 (stale a3=0).
+//
+//   5. Byte sign/zero extend:
+//        addi a5,zero,0xAB ; sb a5,0x100(zero) ; lb a6,0x100(zero) ;
+//        lbu a7,0x100(zero).
+//        -> a6 = 0xFFFFFFAB (sign-extended), a7 = 0x000000AB (zero-
+//        extended). Confirms sub-word extract + the mem_unsigned path.
+//
+//   6. Halfword at offset 2, sign/zero extend:
+//        lui s0,0x8 (s0 = 0x00008000) ; sh s0,0x102(zero) ;
+//        lh s1,0x102(zero) ; lhu s0,0x102(zero).
+//        -> s1 = 0xFFFF8000 (sign-extended, bit15=1), s0 = 0x00008000
+//        (zero-extended). Confirms halfword positioning + store data
+//        pre-shift into the addressed byte lanes.
+//
+// Expected writeback (wb) log, interlock + LSU working:
+//     t0 = 0x0000000f       a0 = 0x0000005c (92)     t5 = 0x00000001
+//     t1 = 0x0000004d (77)  t3 = 0x00000005          t6 = 0x00000009
+//     t2 = 0x00000003       t4 = 0x00000006
+//   and NO a1 = 0x42 (branch took the skip). One bubble (no wb, no ex)
+//   precedes each hazard consumer (a0, t4, the bne-resolve path, a4).
+//   LSU:
+//     a2 = 0x00000055       a6 = 0xffffffab          s1 = 0xffff8000
+//     a3 = 0x00000055       a7 = 0x000000ab          s0 = 0x00008000 (lhu)
+//     a4 = 0x00000056       s0 = 0x00008000 (lui)
+//
+// Without the interlock the wb log instead shows a0 = 0x0000000f (stale
+// t1=0), t4 = 0x00000001 (stale t3=0), and a1 = 0x00000042 (branch not
+// taken) -- the regression signature. Without the LSU the load/store
+// wb lines (a3, a4, a6, a7, s1, s0-lhu) are absent.
+//
+// One 32-bit hex word per line; the word value IS the encoding. The sim
+// retire+writeback log is the oracle. Encodings computed with a Python
+// bit-field assembler (rd<<7, rs1<<15, rs2<<20, funct3<<12, funct7<<25,
+// imm field per format) and cross-checked by hand.
 
-0x00f00293  // 0x00: addi   t0, zero, 15
-0x04d00313  // 0x04: addi   t1, zero, 77
-0x00628533  // 0x08: add    a0, t0, t1
-0xff5ff66f  // 0x0c: jal    a2, -12 -- restart
+0x00f00293  // 0x00: addi   t0, zero, 15          t0 = 15
+0x04d00313  // 0x04: addi   t1, zero, 77          t1 = 77
+0x00628533  // 0x08: add    a0, t0, t1            RAW on t1 -> a0 = 92
+0x00300393  // 0x0c: addi   t2, zero, 3           t2 = 3
+0x0272ce33  // 0x10: div    t3, t0, t2            RAW on t2 -> t3 = 15/3 = 5
+0x001e0e93  // 0x14: addi   t4, t3, 1             RAW on div t3 -> t4 = 6
+0x00100f13  // 0x18: addi   t5, zero, 1           t5 = 1
+0x000f1463  // 0x1c: bne    t5, zero, +8          RAW on t5 -> taken, skip 0x20
+0x04200593  // 0x20: addi   a1, zero, 0x42        not-taken marker (skipped)
+0x00900f93  // 0x24: addi   t6, zero, 9           taken-path marker -> t6 = 9
+// ---- LSU (data @ 0x100, shared imem RAM) ----
+0x05500613  // 0x28: addi   a2, zero, 0x55        a2 = 0x55
+0x10c02023  // 0x2c: sw     a2, 0x100(zero)       mem[0x100] = 0x00000055
+0x10002683  // 0x30: lw     a3, 0x100(zero)       a3 = 0x55 (load-use next)
+0x00168713  // 0x34: addi   a4, a3, 1             RAW on load a3 -> a4 = 0x56
+0x0ab00793  // 0x38: addi   a5, zero, 0xAB        a5 = 0xAB
+0x10f00023  // 0x3c: sb     a5, 0x100(zero)       mem[0x100] byte0 = 0xAB
+0x10000803  // 0x40: lb     a6, 0x100(zero)       a6 = 0xFFFFFFAB (sign-ext)
+0x10004883  // 0x44: lbu    a7, 0x100(zero)       a7 = 0x000000AB (zero-ext)
+0x00008437  // 0x48: lui    s0, 0x8               s0 = 0x00008000
+0x10801123  // 0x4c: sh     s0, 0x102(zero)       mem[0x102] halfword = 0x8000
+0x10201483  // 0x50: lh     s1, 0x102(zero)       s1 = 0xFFFF8000 (sign-ext)
+0x10205403  // 0x54: lhu    s0, 0x102(zero)       s0 = 0x00008000 (zero-ext)
+0x0000006f  // 0x58: jal    x0, 0                 self-loop halt

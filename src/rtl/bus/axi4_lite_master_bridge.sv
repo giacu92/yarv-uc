@@ -23,8 +23,8 @@ import rv32_pkg::*;
  *     the read data is consumed (rvalid && rready); rsp_o.rdata carries
  *     it. The bridge then returns to S_IDLE.
  *   - For writes: on launch, AW + W are launched in lock-step; on B
- *     the bridge returns to S_IDLE. The write-retirement is NOT
- *     signalled back (no bvalid in mem_rsp_t yet) — TODO for the LSU.
+ *     (b_hs in S_WR_WAIT) the bridge raises rsp_o.bvalid so the LSU can
+ *     retire the store, then returns to S_IDLE.
  *   - Read and write share one FSM, so the bridge is single-outstanding
  *     overall: at most one transaction (read OR write) in flight at a
  *     time.
@@ -90,6 +90,7 @@ module axi4_lite_master_bridge (
         rsp_o.wready = (state_q == S_IDLE);
         rsp_o.rvalid = 1'b0;
         rsp_o.rdata  = '0;
+        rsp_o.bvalid = 1'b0;
 
         state_d      = state_q;
 
@@ -151,8 +152,11 @@ module axi4_lite_master_bridge (
             end
 
             S_WR_WAIT: begin
-                // Write retired. No bvalid exposed to the native side
-                // (TODO LSU); just return to idle.
+                // Write retired: expose bvalid to the native side so the
+                // LSU can retire the store. Symmetric with the read path's
+                // rsp_o.rvalid = r_hs in S_RD_WAIT (bready is held high, so
+                // b_hs fires the cycle the slave raises bvalid).
+                rsp_o.bvalid = b_hs;
                 if (b_hs) begin
                     state_d = S_IDLE;
                 end

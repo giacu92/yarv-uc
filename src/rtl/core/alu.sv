@@ -62,9 +62,7 @@ module alu (
             ALU_SRA:  base_result = $signed(operand_a_i) >>> shamt_rb;
             ALU_OR:   base_result = operand_a_i | operand_b_i;
             ALU_AND:  base_result = operand_a_i & operand_b_i;
-            // Zilx indexed-load EA. Parentesi obbligatorie: '+' lega più
-            // forte di '<<', quindi 'a + b << n' sarebbe '(a+b)<<n'.
-            ALU_LX:   base_result = operand_a_i + (operand_b_i << shamt_i);
+            ALU_LX:   base_result = operand_a_i + (operand_b_i << shamt_i);  // Zilx
             default:  base_result = '0;
         endcase
     end
@@ -163,7 +161,12 @@ module alu (
             end else if (div_state_q == DIV_RUN) begin
                 // uno shift-subtract per ciclo
                 if (rem_part >= div_divisor_q) begin
-                    div_rem_q <= {rem_part - div_divisor_q, shifted[XLEN-2:0], 1'b1};
+                    // Quotient bit 1 into the LSB; keep shifted[31] (the next
+                    // dividend bit now at the top of the quotient half) — the
+                    // no-subtract branch keeps it via `shifted`, so the
+                    // subtract branch must too (shifted[31:1], not [30:0],
+                    // else every subtract drops one dividend bit).
+                    div_rem_q <= {rem_part - div_divisor_q, shifted[XLEN-1:1], 1'b1};
                 end else begin
                     div_rem_q <= shifted;
                 end

@@ -11,30 +11,32 @@ import rv32_pkg::*;
  *
  * External view of the CPU is bus-centric — two AXI4-Lite masters:
  *
- *   - `imem_axi` : AXI4-Lite master toward instruction memory
- *   - `peri_axi` : AXI4-Lite master toward peripherals (UART, GPIO, ...).
- *                  UNUSED today: the LSU is not implemented yet, so no
- *                  transaction is ever launched on this port. It is
- *                  exposed at the boundary so the board top can route
- *                  it to the peripheral bus without re-touching the
- *                  CPU when the LSU lands.
+ *   - `imem_axi` : AXI4-Lite master toward memory (instructions AND
+ *                  data — von Neumann: fetch and the LSU share this
+ *                  one port through a mem_arbiter, LSU priority).
+ *   - `peri_axi` : AXI4-Lite master toward memory-mapped peripherals
+ *                  (UART, GPIO, ...). Reserved for future MMIO; the
+ *                  LSU does not target it yet (no address decode), so
+ *                  its native side is held idle.
  *
  * Internally:
  *
- *   fetch_stage --[imem native]--> axi4_lite_master_bridge --[AXI4-Lite]--> imem_axi
- *   (LSU TODO)  --[peri native]--> axi4_lite_master_bridge --[AXI4-Lite]--> peri_axi
+ *   fetch_stage --┐
+ *                 ├─ mem_arbiter ─► axi4_lite_master_bridge ─► imem_axi
+ *   LSU (execute)─┘   (LSU priority)
+ *
+ *   (future MMIO) ─► axi4_lite_master_bridge ─► peri_axi   (idle today)
  *
  * Each bridge is a single-outstanding FSM that turns a native
  * req.wvalid / rsp.wready (launch) + rsp.rvalid / req.rready (read)
  * handshake into an AXI4-Lite transaction, so the rest of the system
  * sees the CPU as a plain AXI4-Lite master.
  *
- * Each pipeline stage exposes the PC it is treating, the instruction
- * word, and a valid as outputs (prefixed by its stage sigil: fe = fetch,
- * de = decode, ex = execute, ...). Further debug signals are added on
- * demand. The board top takes fe_pc_dbg_o[3:0] to the LEDs; the other
- * taps are left unconnected there (swept by synthesis) and consumed by
- * the simulation wrapper.
+ * No debug signals cross the CPU boundary: the per-stage pc / instr /
+ * valid / writeback taps live on the stage blocks and on internal nets
+ * here (consumed by the next stage or left unconnected). The simulation
+ * wrapper observes them by probing the Verilator hierarchy directly
+ * (--public-flat), not through CPU output ports.
  *
  * Naming: ports use *_i/_o; internal signals have no prefix (they are
  * neither inputs nor outputs).
@@ -46,34 +48,15 @@ module rv32imac_zicsr_zifencei (
 
     input wire [XLEN-1:0] boot_addr_i,  // Reset vector boot address
 
-    // AXI4-Lite master #0: instruction memory
+    // AXI4-Lite master #0: memory (instructions + data, von Neumann).
     axi4_lite_if.master imem_axi,
 
-    // AXI4-Lite master #1: peripherals (UART, GPIO, ...). Unused for now.
+    // AXI4-Lite master #1: memory-mapped peripherals (UART, GPIO, ...).
+    // Reserved for future MMIO; idle today.
     axi4_lite_if.master peri_axi,
 
-    // fe_* debug taps (fetch stage / F/D pipeline register): the PC it
-    // is treating, the instruction word, and a valid. The low 4 bits of
-    // fe_pc_dbg_o go to the board LEDs; the rest are left unconnected at
-    // the board top (swept by synthesis) and used by the sim wrapper.
-    output wire [XLEN-1:0] fe_pc_dbg_o,     // F/D instruction PC (exact)
-    output wire [XLEN-1:0] fe_instr_dbg_o,  // F/D instruction word
-    output wire            fe_valid_dbg_o,  // F/D valid (held level)
-
-    // de_* debug taps (decode stage / D/E pipeline register): pc / instr
-    // / valid. Left unconnected at the board top (swept by synthesis) and
-    // consumed by the sim wrapper. The full D/E control (de_o) is consumed
-    // by the execute stage below.
-    output wire [XLEN-1:0] de_pc_dbg_o,     // D/E instruction PC
-    output wire [XLEN-1:0] de_instr_dbg_o,  // 32-bit word decode treated
-    output wire            de_valid_dbg_o,  // D/E valid
-
-    // ex_* debug taps (execute stage / E/M register): pc / instr / valid
-    // of the retired operation. Left unconnected at the board top (swept
-    // by synthesis) and consumed by the sim wrapper.
-    output wire [XLEN-1:0] ex_pc_dbg_o,     // E/M instruction PC
-    output wire [XLEN-1:0] ex_instr_dbg_o,  // 32-bit word executed
-    output wire            ex_valid_dbg_o   // E/M valid (retired)
+    // Debug taps
+    output wire dbg_stall_o  // decode or execute stage stall
 );
 
     // -----------------------------------------------------------------
@@ -83,11 +66,17 @@ module rv32imac_zicsr_zifencei (
     // execute stage's div stall). branch_* come from the execute stage's
     // branch-resolve path (redirect + in-flight flush).
     // -----------------------------------------------------------------
+    // Von Neumann memory: fetch and the LSU share one imem port through
+    // a mem_arbiter (LSU priority). fe_* = fetch native side, lsu_* =
+    // LSU native side, imem_* = arbiter slave side -> the imem bridge.
+    mem_req_t            fe_req;
+    mem_rsp_t            fe_rsp;
+    mem_req_t            lsu_req;
+    mem_rsp_t            lsu_rsp;
     mem_req_t            imem_req;
     mem_rsp_t            imem_rsp;
 
-    // F/D pipeline-register taps, consumed by the decode stage below
-    // (and mirrored to the debug ports above).
+    // F/D pipeline-register taps, consumed by the decode stage below.
     wire      [XLEN-1:0] fe_pc_w;
     wire      [XLEN-1:0] fe_instr_w;
     wire                 fe_valid_w;
@@ -105,11 +94,27 @@ module rv32imac_zicsr_zifencei (
         .stall_i       (dec_stall),
         .branch_valid_i(ex_branch_valid),
         .branch_addr_i (ex_branch_addr),
-        .imem_req_o    (imem_req),
-        .imem_rsp_i    (imem_rsp),
+        .imem_req_o    (fe_req),
+        .imem_rsp_i    (fe_rsp),
         .fe_instr_o    (fe_instr_w),
         .fe_pc_o       (fe_pc_w),
         .fe_valid_o    (fe_valid_w)
+    );
+
+    // -----------------------------------------------------------------
+    // Memory arbiter: fetch + LSU -> single imem bridge. LSU has fixed
+    // priority (a data access stalls fetch ~2 cycles); fetch and the LSU
+    // cannot both hold the bridge (single outstanding).
+    // -----------------------------------------------------------------
+    mem_arbiter u_mem_arb (
+        .clk_i      (clk_i),
+        .rstn_i     (rstn_i),
+        .fetch_req_i(fe_req),
+        .fetch_rsp_o(fe_rsp),
+        .lsu_req_i  (lsu_req),
+        .lsu_rsp_o  (lsu_rsp),
+        .slv_req_o  (imem_req),
+        .slv_rsp_i  (imem_rsp)
     );
 
     // -----------------------------------------------------------------
@@ -127,14 +132,14 @@ module rv32imac_zicsr_zifencei (
         .axi   (imem_axi)
     );
 
+    // The peri bridge is reserved for future memory-mapped peripherals
+    // (UART, GPIO). The LSU does not target it yet (no address decode),
+    // so its native side is held idle (wvalid=0). When MMIO lands, route
+    // the LSU's peripheral-address accesses here.
     mem_req_t peri_req;
     mem_rsp_t peri_rsp;
+    assign peri_req = '{wvalid: 1'b0, we: 1'b0, addr: '0, wdata: '0, wstrb: '0, rready: 1'b0};
 
-    // The peri bridge is driven by the execute stage's native memory port
-    // (the future LSU). Today execute gates wvalid to 0 (no LSU yet), so
-    // the bridge stays idle; when the LSU lands, execute will launch
-    // loads/stores (including Zilx indexed loads) on this bus with no
-    // board-top changes.
     axi4_lite_master_bridge u_peri_bridge (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
@@ -175,7 +180,8 @@ module rv32imac_zicsr_zifencei (
 
     de_t            de_w;
 
-    // de_* D/E taps (decode stage outputs), mirrored to the debug ports.
+    // de_* D/E taps (decode stage outputs). Debug only — left
+    // unconnected here; the sim probes them via the Verilator hierarchy.
     wire [XLEN-1:0] de_pc_w;
     wire [XLEN-1:0] de_instr_w;
     wire            de_valid_w;
@@ -185,25 +191,28 @@ module rv32imac_zicsr_zifencei (
     wire            ex_flush;
 
     decode_stage u_decode (
-        .clk_i     (clk_i),
-        .rstn_i    (rstn_i),
-        .fe_instr_i(fe_instr_w),
-        .fe_pc_i   (fe_pc_w),
-        .fe_valid_i(fe_valid_w),
-        .rs1_addr_o(rs1_addr),
-        .rs2_addr_o(rs2_addr),
-        .rs1_data_i(rs1_data),
-        .rs2_data_i(rs2_data),
-        .stall_i   (ex_stall),
-        .flush_i   (ex_flush),
-        .stall_o   (dec_stall),
-        .de_o      (de_w),
-        .de_pc_o   (de_pc_w),
-        .de_instr_o(de_instr_w),
-        .de_valid_o(de_valid_w)
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .fe_instr_i  (fe_instr_w),
+        .fe_pc_i     (fe_pc_w),
+        .fe_valid_i  (fe_valid_w),
+        .rs1_addr_o  (rs1_addr),
+        .rs2_addr_o  (rs2_addr),
+        .rs1_data_i  (rs1_data),
+        .rs2_data_i  (rs2_data),
+        .stall_i     (ex_stall),
+        .flush_i     (ex_flush),
+        .ex_wb_en_i  (wb_en),
+        .ex_wb_addr_i(wb_addr),
+        .stall_o     (dec_stall),
+        .de_o        (de_w),
+        .de_pc_o     (de_pc_w),
+        .de_instr_o  (de_instr_w),
+        .de_valid_o  (de_valid_w)
     );
 
-    // ex_* E/M taps, mirrored to the debug ports below.
+    // ex_* E/M taps (retired op pc / instr / valid). Debug only — left
+    // unconnected here; the sim probes them via the Verilator hierarchy.
     wire [XLEN-1:0] ex_pc_w;
     wire [XLEN-1:0] ex_instr_w;
     wire            ex_valid_w;
@@ -220,29 +229,17 @@ module rv32imac_zicsr_zifencei (
         .wb_en_o       (wb_en),
         .branch_valid_o(ex_branch_valid),
         .branch_addr_o (ex_branch_addr),
-        .mem_req_o     (peri_req),
-        .mem_rsp_i     (peri_rsp),
+        .mem_req_o     (lsu_req),
+        .mem_rsp_i     (lsu_rsp),
         .ex_pc_o       (ex_pc_w),
         .ex_instr_o    (ex_instr_w),
         .ex_valid_o    (ex_valid_w)
     );
 
-    // -----------------------------------------------------------------
-    // Debug taps (per-stage pc / instr / valid only; add more on demand)
-    // -----------------------------------------------------------------
-    // fe_* (fetch / F/D register).
-    assign fe_pc_dbg_o    = fe_pc_w;  // full PC; board takes [3:0]
-    assign fe_instr_dbg_o = fe_instr_w;
-    assign fe_valid_dbg_o = fe_valid_w;
+    // peri_rsp is unused (no MMIO yet); sink it to keep it clean.
+    wire unused_peri_rsp = peri_rsp.wready | peri_rsp.rvalid | peri_rsp.bvalid | peri_rsp.rdata[0];
 
-    // de_* (decode / D/E register).
-    assign de_pc_dbg_o    = de_pc_w;
-    assign de_instr_dbg_o = de_instr_w;
-    assign de_valid_dbg_o = de_valid_w;
-
-    // ex_* (execute / E/M register).
-    assign ex_pc_dbg_o    = ex_pc_w;
-    assign ex_instr_dbg_o = ex_instr_w;
-    assign ex_valid_dbg_o = ex_valid_w;
+    // Aggregate stall tap for the board / sim (functional only).
+    assign dbg_stall_o = dec_stall | ex_stall;
 
 endmodule

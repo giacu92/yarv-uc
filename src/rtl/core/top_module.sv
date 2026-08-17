@@ -14,12 +14,12 @@ import rv32_pkg::*;
  * Topology:
  *
  *   rv32imac_zicsr_zifencei
- *      |  imem_axi (master)            peri_axi (master, unused)
+ *      |  imem_axi (master)            peri_axi (master, MMIO peripherals)
  *      v                               v
  *   axi_bus_imem (trunk)              axi_bus_peri (trunk, no slave yet)
- *      |
- *      v
- *   axi4_lite_ram
+ *      |                               |
+ *      v                               v
+ *   axi4_lite_ram (instr+data)        (open, future UART/GPIO)
  *
  * The native->AXI conversion is owned by the CPU itself (per-port
  * axi4_lite_master_bridge instances inside rv32imac_zicsr_zifencei),
@@ -130,32 +130,26 @@ module top_module (
     assign axi_bus_peri.aclk    = clk_core;
     assign axi_bus_peri.aresetn = rstn_core;
 
-    // -----------------------------------------------------------------
-    // CPU
-    // -----------------------------------------------------------------
-    // Full fetch PC; the LED nibble is its low 4 bits (keeps the fetch
-    // stage observable so synthesis doesn't sweep it away).
-    wire [XLEN-1:0] cpu_pc_dbg;
+    // Debug taps: decode or execute stage stall.
+    wire dbg_stall;
 
+    // -----------------------------------------------------------------
+    // CPU. Functional ports only — no debug crosses the CPU boundary
+    // (the per-stage taps are internal; the sim probes them via the
+    // Verilator hierarchy). The fetch stage stays observable to
+    // synthesis through its real output: the imem bus to the RAM below.
+    // -----------------------------------------------------------------
     rv32imac_zicsr_zifencei u_cpu (
-        .clk_i         (clk_core),
-        .rstn_i        (rstn_core),
-        .boot_addr_i   (32'h0000_0000),
-        .imem_axi      (axi_bus_imem.master),
-        .peri_axi      (axi_bus_peri.master),
-        // fe_* / de_* debug taps: only fe_pc_dbg_o[3:0] is used here
-        // (LEDs); the rest are unused on the board (swept by synthesis),
-        // consumed by the simulation wrapper.
-        .fe_pc_dbg_o   (cpu_pc_dbg),
-        .fe_instr_dbg_o(),
-        .fe_valid_dbg_o(),
-        .de_pc_dbg_o   (),
-        .de_instr_dbg_o(),
-        .de_valid_dbg_o()
+        .clk_i      (clk_core),
+        .rstn_i     (rstn_core),
+        .boot_addr_i(32'h0000_0000),
+        .imem_axi   (axi_bus_imem.master),
+        .peri_axi   (axi_bus_peri.master),
+        .dbg_stall_o(dbg_stall)
     );
 
     // -----------------------------------------------------------------
-    // Instruction / data RAM on the imem bus
+    // Memory RAM on the imem bus (von Neumann: instructions + data).
     // -----------------------------------------------------------------
     axi4_lite_ram #(
         .ADDR_W   (16),  // 64 KiB
@@ -167,10 +161,11 @@ module top_module (
     );
 
     // -----------------------------------------------------------------
-    // Peripheral bus: no slave instantiated yet. The trunk is left
-    // open on the slave side; the master side is the CPU's peri_axi.
-    // We must tie off the slave outputs so the interface is well-formed
-    // and a future slave can be dropped in without rewiring the top.
+    // Peripheral bus: reserved for memory-mapped peripherals (UART, GPIO,
+    // ...). No slave instantiated yet — the trunk is left open on the
+    // slave side (tied off) so a peripheral drops in without rewiring.
+    // The CPU's LSU does NOT use this bus for RAM: data memory shares the
+    // imem bus above.
     // -----------------------------------------------------------------
     assign axi_bus_peri.awready = 1'b0;
     assign axi_bus_peri.wready  = 1'b0;
@@ -182,9 +177,21 @@ module top_module (
     assign axi_bus_peri.rresp   = 2'b00;
 
     // -----------------------------------------------------------------
-    // Debug LEDs: fetch PC low nibble. Keeps the design observable so
-    // the synthesizer doesn't sweep the fetch stage away.
+    // Debug LEDs: 
+    // led_o[0]: stall indicator (high when the CPU is stalled, low when it is running)
+    // led_o[3:1]: free-running counter on clk_core (alive indicator).
     // -----------------------------------------------------------------
-    assign led_o                = cpu_pc_dbg[3:0];
+    logic [27:0] led_cnt_q;
+
+    always_ff @(posedge clk_core) begin
+        if (!rstn_core) begin
+            led_cnt_q <= '0;
+        end else begin
+            led_cnt_q <= led_cnt_q + 1'b1;
+        end
+    end
+
+    assign led_o[3:1] = led_cnt_q[27:25];
+    assign led_o[0]   = dbg_stall;
 
 endmodule
