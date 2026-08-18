@@ -32,7 +32,7 @@ GTKWAVE       ?= gtkwave
 # VCD written by the sim.
 SIM_VCD       := sim/sim_top.vcd
 
-.PHONY: format format-check format-diff sim wave help clean run sw sw-run
+.PHONY: format format-check format-diff sim wave help clean run sw sw-run cosim
 
 help:
 	@echo "Targets:"
@@ -45,6 +45,7 @@ help:
 	@echo "  clean         remove simulation build artefacts + waveforms"
 	@echo "  sw            build a C program -> sim/sw/build/program.hex (rv32imac)"
 	@echo "  sw-run        build the C program and run the sim loading it"
+	@echo "  cosim         build Spike + sw, run both, diff vs golden Spike"
 	@echo ""
 	@echo "Variables:"
 	@echo "  VERIBLE=$(VERIBLE)   formatter binary"
@@ -108,3 +109,15 @@ sw:
 
 sw-run: sw
 	$(MAKE) -C sim run RUN_ARGS="+INIT=sw/build/program.hex"
+
+# ----------------------------------------------------------------------
+# Co-sim: RTL vs Spike (golden ISA reference)
+# ----------------------------------------------------------------------
+#
+# Build (once) a local Spike with commit logging, build the C program,
+# run it on both Spike and the Verilator sim, and diff per-retire pc +
+# register writes. First run needs Spike build deps (see
+# sim/cosim/build_spike.sh). Delegated to sim/cosim/Makefile.
+#
+cosim:
+	$(MAKE) -C sim/cosim cosim

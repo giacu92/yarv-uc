@@ -106,6 +106,20 @@ int main(int argc, char** argv) {
         return e ? atoi(e) : 4000;
     }();
 
+    // Optional machine-readable commit log for co-sim (diff vs Spike).
+    // Set RTL_TRACE=<path> to emit one line per retire:
+    //   0x<pc> x<rd> 0x<rd_value>
+    // (rd=0 / value=0 when the retire writes no register, matching Spike's
+    //  "no register delta" convention so retire counts align 1:1). Unset =
+    // no trace file, behaviour byte-identical to the plain run. Sampled with
+    // the same pre-edge-wb / post-edge-valid split as the human ex log.
+    FILE* trace_fp = nullptr;
+    if (const char *t = getenv("RTL_TRACE")) {
+        trace_fp = fopen(t, "w");
+        if (!trace_fp)
+            fprintf(stderr, "RTL_TRACE: cannot open '%s' for write\n", t);
+    }
+
     std::vector<std::string> fe_log, de_log, ex_log;
     int fetched = 0, decoded = 0, retired = 0;
     int stalled = 0;  // cycles the pipe was stalled (dbg_stall_o=1)
@@ -193,6 +207,14 @@ int main(int argc, char** argv) {
             ex_log.push_back(line);
             ++retired;
 
+            // Co-sim commit log: one line per retire, pc + reg effect.
+            // wb_* were sampled pre-edge (above) and line up with this retire.
+            if (trace_fp) {
+                uint32_t rd  = wb_en ? wb_addr : 0u;
+                uint32_t val = wb_en ? wb_data : 0u;
+                fprintf(trace_fp, "0x%08x x%u 0x%08x\n", pc, rd, val);
+            }
+
             // Park detection: N consecutive IDENTICAL retires => the
             // core is spinning on a single-instruction self-loop.
             if (pc == last_ex_pc && instr == last_ex_instr) {
@@ -253,6 +275,8 @@ int main(int argc, char** argv) {
 
     // Let a few final cycles ripple for the waveform tail.
     for (int i = 0; i < 4; ++i) tick(top, tfp);
+
+    if (trace_fp) fclose(trace_fp);
 
     tfp->close();
     delete top;

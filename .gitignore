@@ -32,7 +32,17 @@ sim/sw/build/
 sim/program.hex.org
 sim/waves.gtkw
 
+# Co-sim: cloned upstream Spike tree + build/install (regenerable via
+# sim/cosim/build_spike.sh) and per-run commit logs (regenerable)
+sim/cosim/riscv-isa-sim/
+sim/cosim/riscv-isa-sim-build/
+sim/cosim/riscv-isa-sim-install/
+sim/cosim/spike.log
+sim/cosim/rtl.trace
+
 # Editor / OS
 *.swp
 *~
 .DS_Store
+# Python bytecode (cosim_diff.py runs)
+sim/cosim/__pycache__/

@@ -1,0 +1,74 @@
+# Co-sim harness: run the same C-built ELF on Spike (golden ISA ref) and on
+# the Verilator RTL sim, then diff per-retire architectural effects (pc +
+# register write). See cosim_diff.py / build_spike.sh.
+#
+#   make cosim        full pipeline: build sw + Spike, run both, diff
+#   make spike-build  build the local Spike (once; see build_spike.sh for deps)
+#   make spike-run    run Spike -> spike.log
+#   make rtl-run      run the Verilator sim -> rtl.trace (loads the sw hex)
+#   make diff        diff spike.log vs rtl.trace
+#   make clean        remove logs (keeps the Spike build)
+#
+# Spike is upstream riscv-isa-sim (built with --enable-commitlog); Zilx is
+# already implemented upstream as the "zilx" ISA extension -- no patch.
+#
+# NOTE: the RTL sim must build. If decode_stage.sv has uncommitted WIP that
+# breaks the build, fix it first -- cosim cannot run without a building sim.
+
+SCRIPT_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
+SPIKE      := $(SCRIPT_DIR)riscv-isa-sim-install/bin/spike
+ELF        := $(SCRIPT_DIR)../sw/build/program.elf
+HEX        := $(SCRIPT_DIR)../sw/build/program.hex
+SPIKE_LOG  := $(SCRIPT_DIR)spike.log
+RTL_LOG    := $(SCRIPT_DIR)rtl.trace
+
+# Bound the Spike run. Spike spins forever on the halt self-loop, so the
+# output is piped through `head` to stop it after SPIKE_MAXLINES commit
+# lines (the program is a few thousand retires; the rest is the spinning
+# `j`, which the diff driver park-truncates). `timeout` is a backstop.
+SPIKE_MAXLINES ?= 50000
+SPIKE_TIMEOUT  ?= 30
+
+# zicsr/zifencei: needed only for Spike's boot-ROM stub (csrr mhartid). The
+# program emits no csr/fence; the RTL defers them (illegal=1) but never sees
+# them because the stub is skipped by the diff driver. zilx: the indexed
+# loads (same encoding as this core).
+SPIKE_ISA := rv32imac_zicsr_zifencei_zilx
+# Memory: 4 KiB at 0x0 (code + .data, below the 0x1000 boot ROM) + 56 KiB at
+# 0x2000 (stack; sp=0x10000 grows down). The 0x1000 boot-ROM gap avoids any
+# overlap between DRAM and the boot-ROM device.
+SPIKE_MEM := 0x0:0x1000,0x2000:0xE000
+
+.PHONY: cosim spike-build spike-run rtl-run diff clean
+
+cosim: diff
+
+spike-build:
+	@bash $(SCRIPT_DIR)build_spike.sh
+
+# Build the C program (ELF for Spike, hex for the RTL) if missing.
+$(ELF) $(HEX):
+	@$(MAKE) -C $(SCRIPT_DIR)../.. sw
+
+spike-run: $(ELF) spike-build
+	@echo "== running Spike (golden) =="
+	@rm -f $(SPIKE_LOG)
+	@timeout $(SPIKE_TIMEOUT)s $(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) \
+	    --log-commits $(ELF) 2>&1 | head -n $(SPIKE_MAXLINES) > $(SPIKE_LOG) \
+	  || true
+	@echo "spike: $$(wc -l < $(SPIKE_LOG)) commit lines -> $(SPIKE_LOG)"
+
+rtl-run: $(HEX)
+	@echo "== running RTL sim (RTL_TRACE=$(RTL_LOG)) =="
+	@rm -f $(RTL_LOG)
+	@RTL_TRACE=$(RTL_LOG) MAX_CYC=20000 \
+	  $(MAKE) -C $(SCRIPT_DIR).. run RUN_ARGS="+INIT=sw/build/program.hex" \
+	  >/dev/null
+	@test -s $(RTL_LOG) || { echo "rtl: no trace produced (RTL_TRACE unset? sim_main.cpp edit missing?)"; exit 1; }
+	@echo "rtl: $$(wc -l < $(RTL_LOG)) retires -> $(RTL_LOG)"
+
+diff: spike-run rtl-run
+	@python3 $(SCRIPT_DIR)cosim_diff.py --rtl $(RTL_LOG) --spike $(SPIKE_LOG)
+
+clean:
+	rm -f $(SPIKE_LOG) $(RTL_LOG)
