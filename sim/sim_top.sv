@@ -107,6 +107,29 @@ module sim_top (
     end
 
     // -----------------------------------------------------------------
+    // RAM probe: expose a window of u_ram.mem as scalar wires so they
+    // land in the VCD and can be watched in GTKWave (Verilator does not
+    // trace unpacked arrays past --trace-max-array, so the full mem[] is
+    // not in the VCD). The window is pointed at the program's data array
+    // so you can watch it change as the program runs — e.g. quicksort's
+    // 16-int .data array at 0xfc (word index 63) before/after the sort.
+    //
+    // Edit PROBE_BASE_WORD / PROBE_LEN to point at the data of interest:
+    //   word index = byte_addr / 4. (0xfc / 4 = 63.)
+    // In GTKWave the signals appear as:
+    //   sim_top.g_mem_probe[<i>].mem_probe_w
+    // -----------------------------------------------------------------
+    localparam int unsigned PROBE_BASE_WORD = 64'd63;  // 0xfc >> 2
+    localparam int unsigned PROBE_LEN       = 64'd16;
+
+    genvar gi;
+    generate
+        for (gi = 0; gi < PROBE_LEN; gi = gi + 1) begin : g_mem_probe
+            wire [31:0] mem_probe_w = u_ram.mem[PROBE_BASE_WORD+gi];
+        end
+    endgenerate
+
+    // -----------------------------------------------------------------
     // Peripheral bus: tie off the slave side (reserved for future MMIO
     // peripherals; data RAM shares the mem master, not this port).
     // -----------------------------------------------------------------

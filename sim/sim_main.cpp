@@ -55,6 +55,8 @@
 // flat public member of the root class, named with the full hierarchy:
 // sim_top__DOT__u_cpu__DOT__<sig>. The CPU itself exports no debug ports.
 #define TAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__##field)
+// sim_top-level net (not inside u_cpu), e.g. the dbg_stall_o sink.
+#define STAP(field) (top->rootp->sim_top__DOT__##field)
 
 static vluint64_t sim_time = 0;
 
@@ -106,6 +108,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> fe_log, de_log, ex_log;
     int fetched = 0, decoded = 0, retired = 0;
+    int stalled = 0;  // cycles the pipe was stalled (dbg_stall_o=1)
     uint32_t prev_fe_pc = 0;
     bool have_prev_fe = false;
     int fe_pc_checked = 0, fe_pc_ok = 0, fe_pc_bad = 0;
@@ -133,6 +136,11 @@ int main(int argc, char** argv) {
         top->clk_i = 1;
         top->eval();
         tfp->dump(sim_time++);
+
+        // Aggregate pipe-stall status for this cycle (dbg_stall_o =
+        // dec_stall | ex_stall, sunk to unused_dbg_stall in sim_top).
+        // Sampled post-edge; counts RAW-hazard / DIV / LSU stalls.
+        if (STAP(unused_dbg_stall)) ++stalled;
 
         // ---- fetch log (one line per cycle fe_valid is high) ----
         // Fetch is WORD-granular: it always advances by 4, never by 2 (the
@@ -231,6 +239,16 @@ int main(int argc, char** argv) {
     } else {
         printf("retired %d instructions in %d cycles (no park: hit %d-cycle safety bound)\n",
                retired, cyc, max_cyc);
+    }
+
+    // Pipe-stall breakdown: stalled cycles vs total run cycles. A stall
+    // cycle is one where dbg_stall_o (= dec_stall | ex_stall) was high --
+    // the RAW-hazard bubble, the DIV/REM multi-cycle hold, or the LSU
+    // EX_MEM_WAIT. The parked tail (after the program parks) is included
+    // but contributes only a few non-stall cycles.
+    if (cyc > 0) {
+        printf("stalled %d/%d cycles (%.1f%%)\n",
+               stalled, cyc, 100.0 * stalled / cyc);
     }
 
     // Let a few final cycles ripple for the waveform tail.
