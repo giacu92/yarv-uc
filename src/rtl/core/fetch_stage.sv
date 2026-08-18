@@ -16,17 +16,19 @@ import rv32_pkg::*;
  *   - Request launch:  imem_req_o.wvalid && imem_rsp_i.wready.
  *   - Read response:   imem_rsp_i.rvalid && imem_req_o.rready.
  *
- * Single-outstanding overlap-prefetch:
+ * Single-outstanding prefetch (issue only when drainable):
  *   - At most one fetch in flight (busy_q). The bridge is single
  *     outstanding, so this matches it 1:1.
- *   - As soon as a fetch response is captured into the F/D register,
- *     the next fetch is launched while decode consumes the current
- *     instruction from the F/D register — fetch runs ahead of decode.
- *   - If decode is slower than memory and the next response arrives
- *     while the F/D register is still full, rready is held low: the
- *     bridge (and the AXI slave) hold rvalid/rdata until decode frees
- *     the F/D register. No skid buffer is needed (single outstanding
- *     => nothing queues behind the waiting response).
+ *   - A fetch is issued only when the F/D register has room for the
+ *     response (fe_valid_q=0): wvalid is gated on !fe_valid_q. This is
+ *     NOT the old run-ahead overlap (which issued the next read while
+ *     F/D was still full and held rready low until decode freed it). The
+ *     run-ahead form deadlocks on the shared imem bus: an undrainable
+ *     fetch response occupies the single-outstanding bus and blocks a
+ *     pending LSU access; the LSU stall then stalls decode, which keeps
+ *     F/D full, so the response never drains. Issuing only when drainable
+ *     keeps the bus free for the LSU whenever F/D is occupied. The cost
+ *     is that a decode stall can no longer be hidden behind a prefetch.
  *   - Steady-state throughput ~2 cycles/instruction (the bridge
  *     round-trip floor: 1 issue + 1 response cycle).
  *
@@ -54,8 +56,8 @@ import rv32_pkg::*;
  * old pc_q issues during the redirect cycle.
  *
  * stall_i: downstream hazard back-pressure. While high the F/D
- * register is not consumed (held); prefetch still issues up to 1 ahead
- * (bounded by single outstanding) and is discarded on redirect.
+ * register is not consumed (held); prefetch does NOT issue (the issue
+ * gate needs F/D room) and any in-flight fetch is discarded on redirect.
  *
  * Compressed (C) extension is NOT handled here: the stage always
  * fetches 32-bit words and advances to the next word boundary. A
@@ -127,8 +129,17 @@ module fetch_stage (
         // flushed (redirected) response to free the bridge.
         imem_req_o.rready = !fe_valid_q || flushed_q;
 
-        // Issue a fetch when idle and not redirecting this cycle.
-        imem_req_o.wvalid = !busy_q && !branch_valid_i;
+        // Issue a fetch when idle, not redirecting this cycle, AND the
+        // F/D register has room for the response. Without the !fe_valid_q
+        // gate, fetch would launch an overlap-prefetch read while F/D is
+        // still full (rready=0); on the single-outstanding shared imem bus
+        // that undrainable response blocks the LSU — and a pending LSU
+        // access then stalls decode, which keeps F/D full, so the response
+        // never drains: deadlock. Gating the issue on "can drain" keeps the
+        // bus free for the LSU whenever F/D is occupied. (The cost is the
+        // run-ahead prefetch: fetch no longer runs a word ahead of decode,
+        // so a decode stall can no longer be hidden behind a prefetch.)
+        imem_req_o.wvalid = !busy_q && !branch_valid_i && (!fe_valid_q || flushed_q);
         imem_req_o.we     = 1'b0;
         imem_req_o.addr   = pc_q;
         imem_req_o.wdata  = '0;
