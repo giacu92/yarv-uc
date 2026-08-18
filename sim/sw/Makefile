@@ -22,8 +22,9 @@ OBJDUMP := $(RISCV_PREFIX)-objdump
 
 # rv32imac = the core's implemented ISA subset (I + M + A + C). The core
 # defers Zicsr / Zifencei / real-AMO to illegal for now, so plain integer
-# C is what actually executes; the compiler will not emit CSR / fence /
-# atomics for this code.
+# C is what the compiler emits; it will not emit CSR / fence / atomics.
+# Zilx indexed loads are implemented (retire via the LSU) but have no
+# assembler mnemonics, so main.c hand-encodes them with .insn.
 ARCH := rv32imac
 ABI  := ilp32
 

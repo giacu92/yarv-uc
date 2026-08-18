@@ -12,8 +12,12 @@
  * it exercises the fetch / decode / execute path AND the data path (array
  * loads/stores, stack spill/fill from recursion, branches on loaded
  * values). The retire+writeback log (a0 at exit) is the observable
- * result. Zilx indexed loads are NOT emitted by -march=rv32imac; they
- * stay covered by the hand-crafted sim/program.hex oracle.
+ * result. Zilx indexed loads are NOT emitted by -march=rv32imac (no
+ * zilx mnemonics in the assembler), so partition() hand-encodes a
+ * scaled word indexed load (lxs.w) via .insn to exercise that path
+ * for real here. The hand-crafted sim/program.hex oracle still covers
+ * the other Zilx sizes/signs (b/h/w, signed/unsigned) and the unscaled
+ * variant; this program only stresses lxs.w.
  *
  * .bss is NOT zeroed at runtime (start.S does not clear it), so keep
  * state in an initialized .data array, not uninitialized globals.
@@ -28,23 +32,40 @@ static volatile int arr[N] = {
     5, 14, 2, 11, 9, 1, 7, 12, 3, 8, 15, 4, 13, 6, 0, 10,
 };
 
+/* Zilx (draft) scaled indexed word load: val = *(base + (idx << 2)).
+ * Hand-encoded via .insn since -march=rv32imac's assembler has no
+ * zilx mnemonics: AMO opcode (0x2f), funct3=010 (word), funct5=11010
+ * scaled-indexed mode, aq=rl=0 -> funct7 = 0b1101000 = 0x68.
+ */
+static inline int lxsw(volatile int *base, int idx)
+{
+    int val;
+    __asm__ volatile (".insn r 0x2f, 0x2, 0x68, %0, %1, %2"
+                       : "=r"(val)
+                       : "r"(idx), "r"(base)
+                       : "memory");
+    return val;
+}
+
 /* Partition (Lomuto) over arr[lo..hi] with arr[hi] as pivot. */
 __attribute__((noinline))
 static int partition(int lo, int hi)
 {
-    int pivot = arr[hi];
+    int pivot = lxsw(arr, hi);
     int i = lo - 1;
     for (int j = lo; j < hi; j++) {
-        if (arr[j] <= pivot) {
+        int aj = lxsw(arr, j);
+        if (aj <= pivot) {
             i++;
-            int t = arr[i];
-            arr[i] = arr[j];
-            arr[j] = t;
+            int ai = lxsw(arr, i);
+            arr[i] = aj;
+            arr[j] = ai;
         }
     }
-    int t = arr[i + 1];
-    arr[i + 1] = arr[hi];
-    arr[hi] = t;
+    int lo_v = lxsw(arr, i + 1);
+    int hi_v = lxsw(arr, hi);
+    arr[i + 1] = hi_v;
+    arr[hi] = lo_v;
     return i + 1;
 }
 
