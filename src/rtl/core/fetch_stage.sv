@@ -40,6 +40,14 @@ import rv32_pkg::*;
  *   - Steady-state throughput ~2 cycles/instruction (the bridge
  *     round-trip floor: 1 issue + 1 response cycle), with decode
  *     stalls of up to ~2 cycles hidden behind the buffered words.
+ *     Measured vs the no-skid "issue only when drainable" gate fix
+ *     (which had no run-ahead): the oracle program 143 -> 122 cyc
+ *     (-14.7%) and the Zilx quicksort 3586 -> 2865 cyc (-20.1%) — the
+ *     skid hides the fetch round-trip behind buffered words so decode
+ *     rarely waits on the bus. (Stall cycles rise in the breakdown
+ *     because the bubbles removed were fetch-latency idle cycles, not
+ *     hazard stalls — decode now hits the real hazards denser, but the
+ *     total drops.)
  *
  * Each pipeline stage exposes the PC it is treating, the instruction
  * word, and a valid as outputs (prefixed by a stage sigil: fe = fetch,
