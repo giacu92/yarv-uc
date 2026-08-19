@@ -36,23 +36,34 @@ The sim's `+INIT=<path>` plusarg selects the image (default
 
 - `start.S`    — freestanding entry `_start` at 0x0: set `sp`, `call main`,
   halt loop.
-- `main.c`     — register-only `fib` example.
+- `main.c`     — recursive quicksort over an initialized `.data` array
+  (Lomuto partition, `volatile` to defeat constant-folding); verifies
+  ascending order and returns `0x600D` in `a0` (sorted) or `0x00000BAD`
+  (broken). `partition()` hand-encodes a Zilx scaled indexed word load
+  (`lxs.w`) via `.insn`, since `-march=rv32imac` has no Zilx mnemonics.
 - `link.ld`    — link script: everything at 0x0 (the CPU boot address),
   64 KiB; `.text.init` first.
 - `bin2hex.py` — raw little-endian `.bin` → `$readmemh` word file
   (`@00000000` + one 8-hex-digit 32-bit word per line).
 - `Makefile`   — build rules (`-march=rv32imac -mabi=ilp32 -nostdlib
-  -ffreestanding -O2 -Wl,--no-relax`).
+  -ffreestanding -O2`; `-Wl,--no-relax` in `LDFLAGS`).
 
 Build artefacts (`build/`) are gitignored.
 
-## Current-core caveat (DRAFT)
+## Core coverage
 
-The core has **no LSU** and **no forwarding / hazard unit** yet, and the
-peripheral (data) bus has no slave. So memory accesses silently no-op
-(stores drop, loads read 0) and RAW-dependent sequences read stale
-values. Register-only programs decode and execute correctly (odd-half
-RVC branch targets are handled); programs that need the stack or globals
-are a **sequencing/decode smoke test, not a correct-result check**,
-until the LSU + hazard unit + a data-memory slave land. Add a writeback
-tap to observe results.
+The LSU is live (loads/stores retire through the shared imem bus) and
+the stall-on-RAW interlock covers register and load-use hazards, so a
+memory-heavy program like quicksort is a real correctness check: it
+exercises fetch / decode / execute AND the data path (array
+loads/stores, stack spill/fill from recursion, branches on loaded
+values). The retire+writeback log (`a0` at exit) is the observable
+result. `.bss` is **not** zeroed at runtime (`start.S` does not clear
+it), so state that needs a known value lives in an initialized `.data`
+array, not in uninitialized `.bss` globals.
+
+`-march=rv32imac` does not emit Zilx indexed loads, so `partition()`
+hand-encodes `lxs.w` via `.insn`; the hand-crafted `sim/program.hex`
+oracle covers the other Zilx sizes/signs (b/h/w, signed/unsigned) and
+the unscaled variant. The peri (MMIO) bus slave is still tied off, so
+keep programs in the mem region — a peri access stalls the LSU.

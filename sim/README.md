@@ -1,10 +1,10 @@
 # Simulation (Verilator)
 
 Functional simulation of the implemented pipeline (fetch + decode +
-execute) plus the on-die AXI4-Lite bridge and an AXI4-Lite RAM slave.
-The board top's wiring is replicated in `sim_top.sv` so the RAM can be
-preloaded with a program and the CPU's per-stage debug taps can be
-logged.
+execute + LSU + Zicsr CSR file) plus the on-die AXI4-Lite bridge,
+`mem_arbiter`, `axi4_lite_xbar`, and an AXI4-Lite RAM slave. The board
+top's wiring is replicated in `sim_top.sv` so the RAM can be preloaded
+with a program and the CPU's per-stage debug taps can be logged.
 
 This harness is **not** part of the synthesis file list.
 
@@ -36,13 +36,22 @@ lags the previous by one cycle):
   word-advance-+4 check;
 - a **decode log** — one line per D/E-valid instruction:
   `cycle / de_pc / de_instr`;
-- an **execute retire log** — one line per E/M-valid retired op:
-  `cycle / ex_pc / ex_instr`.
+- an **execute retire + writeback log** — one line per E/M-valid
+  retired op: `cycle / ex_pc / ex_instr`, plus a `wb x<n> = 0x...` line
+  when the op writes a register (sampled from the internal `wb_en` /
+  `wb_addr` / `wb_data` nets). This makes the RAW interlock and the
+  LSU load-use path verifiable: dependent ops write the correct value,
+  with a one-cycle bubble before each hazard consumer.
 
-The CPU exports only `pc / instr / valid` per stage, so the logs show
-sequencing and retirement order, not control/immediates/operands/
-writeback values. Add a writeback tap when values need checking. A VCD
-waveform `sim_top.vcd` is also written; open it with `make wave` (needs
+The CPU exports no per-stage debug ports; the harness reads the
+internal taps (`fe_*`, `de_*`, `ex_*`, `wb_*`) as flat members of the
+Verilator root object (built `--public-flat-rw`). A `stalled N/M cycles
+(P%)` breakdown is printed at exit — the RAW-hazard bubble, DIV/REM
+hold, and LSU `EX_MEM_WAIT` costs per run. The run stops early on park
+detection (8 consecutive identical retires — the `start.S` `1: j 1b`
+self-loop); a `MAX_CYC` env var (default 4000) bounds programs that
+never park (e.g. `MAX_CYC=20000 make run`). A VCD waveform
+`sim_top.vcd` is also written; open it with `make wave` (needs
 `gtkwave`).
 
 ### VCD / GTKWave
@@ -77,10 +86,11 @@ the hand-crafted oracle. To compile C → `program.hex`, use the
 A second, independent harness that does **not** use the CPU — it
 instantiates `axi4_lite_ram` alone and drives it as an AXI4-Lite master
 from C++ (`ram_tb.cpp` is a small cycle-accurate BFM). It verifies the
-RAM's protocol compliance (registered/held BVALID + RVALID, AW-first /
-W-first orderings, byte-strobed partial writes, back-to-back writes,
-single outstanding, RVALID held while RREADY delayed), which the main
-sim cannot (the CPU has no LSU, so it never writes to the RAM).
+RAM's protocol compliance in isolation (registered/held BVALID + RVALID,
+AW-first / W-first orderings, byte-strobed partial writes, back-to-back
+writes, single outstanding, RVALID held while RREADY delayed), which
+the integrated sim — where the CPU drives the RAM through the bridge +
+arbiter + crossbar — does not isolate.
 
 ```
 cd sim/ram_tb && make run     # prints "N checks, 0 failures" on success
@@ -88,9 +98,13 @@ cd sim/ram_tb && make run     # prints "N checks, 0 failures" on success
 
 ## Files
 
-- `sim_top.sv`    — sim wrapper (CPU + RAM + peri tie-off + debug ports).
-- `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs).
-- `program.hex`   — `$readmemh` program preload (RV32I/RVC words).
+- `sim_top.sv`    — sim wrapper (CPU + RAM + peri tie-off + `mem_probe`
+  generate block exposing a window of `u_ram.mem` to the VCD). Ports only
+  `clk_i`/`rstn_i`/`led_o`; CPU taps stay internal, probed via the
+  Verilator hierarchy.
+- `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs
+  incl. writeback values, stall breakdown, park/`MAX_CYC` stop).
+- `program.hex`   — `$readmemh` program preload (RV32I/RVC/M/CSR oracle).
 - `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs).
 - `ram_tb/`       — AXI4-Lite RAM compliance test.
 - `sw/`           — C → program.hex flow (see `sw/README.md`).
