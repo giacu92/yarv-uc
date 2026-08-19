@@ -210,8 +210,13 @@ int main(int argc, char** argv) {
             // Co-sim commit log: one line per retire, pc + reg effect.
             // wb_* were sampled pre-edge (above) and line up with this retire.
             if (trace_fp) {
-                uint32_t rd  = wb_en ? wb_addr : 0u;
-                uint32_t val = wb_en ? wb_data : 0u;
+                // x0 is hardwired zero: an architectural write to x0 is a
+                // NOP (the regfile discards it), and Spike's commit log
+                // emits no register delta for it. Mask wb_addr==0 so the
+                // trace matches Spike (x0 0x0) instead of leaking the
+                // discarded writeback value (e.g. a JAL x0 link address).
+                uint32_t rd  = (wb_en && wb_addr != 0) ? wb_addr : 0u;
+                uint32_t val = (wb_en && wb_addr != 0) ? wb_data : 0u;
                 fprintf(trace_fp, "0x%08x x%u 0x%08x\n", pc, rd, val);
             }
 

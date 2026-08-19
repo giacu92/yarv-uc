@@ -45,6 +45,16 @@ else
     fi
 fi
 
+# Move the Spike debug module off 0x0. Upstream places it at DEBUG_START=0x0
+# (DEBUG_SIZE=0x1000), which collides with our -m0x0 DRAM (the ELF links at
+# 0x0, entry 0x0). The debug module is not memory, so an ELF load to 0x0 is
+# "invalid" without -m0x0, but -m0x0 then overlaps the debug device. We
+# relocate it to 0x100000 (our program is bare-metal with a j self-loop, no
+# tohost/fromhost, so the debug module is unused). The 0x1000 boot-ROM gap in
+# SPIKE_MEM is unaffected (DEFAULT_RSTVEC stays 0x1000).
+sed -i 's/^#define DEBUG_START        0x0/#define DEBUG_START        0x100000/' \
+    "$SRC/riscv/platform.h"
+
 # Out-of-tree build. --enable-commitlog is required for --log-commits.
 rm -rf "$BUILD"
 mkdir -p "$BUILD"

@@ -92,8 +92,13 @@ wave: sim
 # `%:` rule, so unknown/typo targets fail at the root with a clear "No
 # rule to make target" instead of being silently forwarded into sim/).
 #
-clean run:
-	$(MAKE) -C sim $@
+clean:
+	$(MAKE) -C sim clean
+	$(MAKE) -C sim/cosim clean
+
+run:
+	$(MAKE) -C sim run
+
 
 # ----------------------------------------------------------------------
 # C program -> program.hex (rv32imac toolchain)

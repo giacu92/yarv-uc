@@ -22,12 +22,14 @@ HEX        := $(SCRIPT_DIR)../sw/build/program.hex
 SPIKE_LOG  := $(SCRIPT_DIR)spike.log
 RTL_LOG    := $(SCRIPT_DIR)rtl.trace
 
-# Bound the Spike run. Spike spins forever on the halt self-loop, so the
-# output is piped through `head` to stop it after SPIKE_MAXLINES commit
-# lines (the program is a few thousand retires; the rest is the spinning
-# `j`, which the diff driver park-truncates). `timeout` is a backstop.
-SPIKE_MAXLINES ?= 50000
-SPIKE_TIMEOUT  ?= 30
+# Bound the Spike run. Spike spins forever on the halt self-loop. Stop it
+# with Spike's own --instructions cap: Spike exits cleanly after N commits
+# (<1s), no pipe/zombie. We do NOT wrap in `timeout` -- on WSL `timeout`
+# fails to reap a dead spike child, leaving `make` hung at this recipe even
+# though spike.log is complete. `--instructions` makes the cap reliable on
+# its own; `|| true` covers a spike crash. The program is a few thousand
+# retires; the rest is the spinning `j`, park-truncated by the diff driver.
+SPIKE_MAXINSTR ?= 50000
 
 # zicsr/zifencei: needed only for Spike's boot-ROM stub (csrr mhartid). The
 # program emits no csr/fence; the RTL defers them (illegal=1) but never sees
@@ -53,8 +55,8 @@ $(ELF) $(HEX):
 spike-run: $(ELF) spike-build
 	@echo "== running Spike (golden) =="
 	@rm -f $(SPIKE_LOG)
-	@timeout $(SPIKE_TIMEOUT)s $(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) \
-	    --log-commits $(ELF) 2>&1 | head -n $(SPIKE_MAXLINES) > $(SPIKE_LOG) \
+	@$(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) \
+	    --instructions=$(SPIKE_MAXINSTR) --log-commits $(ELF) 2> $(SPIKE_LOG) \
 	  || true
 	@echo "spike: $$(wc -l < $(SPIKE_LOG)) commit lines -> $(SPIKE_LOG)"
 
