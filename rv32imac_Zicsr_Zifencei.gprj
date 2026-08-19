@@ -11,6 +11,7 @@
         <File path="src/rtl/bus/axi4_lite_xbar.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/fetch_stage.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/reg_file.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/csr_regfile.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/decode_stage.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/alu.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/execute_stage.sv" type="file.verilog" enable="1"/>

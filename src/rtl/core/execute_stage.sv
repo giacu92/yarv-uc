@@ -52,8 +52,10 @@ import rv32_pkg::*;
  *     addr[0]=1, LW at addr[1:0]!=0, or the SH/SW equivalents) is
  *     SUPPRESSED — not launched, not retired, no writeback — rather than
  *     trapping. Cross-word sub-word accesses that would need two beats
- *     are not handled. Add CSR/exception machinery before relying on
- *     aligned-only code.
+ *     are not handled. The Zicsr CSR RMW is in (CSRRW/S/C + immediate
+ *     variants retire via csr_regfile), but ecall/ebreak/mret/wfi and
+ *     trap entry/return are still absent — add the exception pipeline
+ *     before relying on aligned-only code.
  *
  *   - DIV/REM result is not bypassed (see hazard note): a consumer in
  *     the slot right after the div reads the stale value — resolved by
@@ -68,6 +70,11 @@ module execute_stage (
 
     // D/E control word from decode.
     input de_t de_i,
+
+    // CSR Regfile
+    input  wire [XLEN-1:0] csr_rdata_i,  // read CSR value (old)
+    output wire [XLEN-1:0] csr_wdata_o,  // write CSR value (new, RMW result)
+    output wire            csr_wren_o,   // CSR write enable (execute-qualified)
 
     // Back-pressure from a future downstream stage (tied 0 now).
     input wire stall_i,
@@ -116,16 +123,17 @@ module execute_stage (
         unique case (de_i.alu_src_a)
             ALU_A_RS1: operand_a = de_i.rs1_data;
             ALU_A_PC:  operand_a = de_i.pc;
+            ALU_A_CSR: operand_a = csr_rdata_i;  // read CSR value
             ALU_A_RS2: operand_a = de_i.rs2_data;
             default:   operand_a = '0;
         endcase
         unique case (de_i.alu_src_b)
-            ALU_B_IMM:    operand_b = de_i.imm;
-            ALU_B_RS2:    operand_b = de_i.rs2_data;
-            ALU_B_PC4:    operand_b = pc_link;
-            ALU_B_ZERO:   operand_b = '0;
-            ALU_B_RS1_SH: operand_b = de_i.rs1_data;  // ALU applies shamt_i
-            default:      operand_b = '0;
+            ALU_B_RS1:  operand_b = de_i.rs1_data;
+            ALU_B_IMM:  operand_b = de_i.imm;
+            ALU_B_RS2:  operand_b = de_i.rs2_data;
+            ALU_B_PC4:  operand_b = pc_link;
+            ALU_B_ZERO: operand_b = '0;
+            default:    operand_b = '0;
         endcase
     end
 
@@ -267,6 +275,7 @@ module execute_stage (
             WB_ALU:  wb_data_o = alu_result;
             WB_PC4:  wb_data_o = pc_link;
             WB_MEM:  wb_data_o = load_data;
+            WB_CSR:  wb_data_o = csr_rdata_i;  // rd <- old CSR value
             default: wb_data_o = '0;
         endcase
     end
@@ -281,6 +290,57 @@ module execute_stage (
 
     assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~stall_i &
         result_ready & ~mem_misaligned;
+
+    // =================================================================
+    // CSR read-modify-write (Zicsr). The old CSR value is csr_rdata_i
+    // (async read of de_i.csr_addr in the CSR file); rd <- old via
+    // WB_CSR (above). The new value (csr_wdata_o) is the RMW result,
+    // written to the CSR file when csr_wren_o pulses. The ALU result is
+    // unused for CSR ops. CSRRS/CSRRC (and their immediate forms) do not
+    // write the CSR when the source is zero; CSRRW always writes. A CSR
+    // op is single-cycle (combinational ALU => result_ready=1).
+    // =================================================================
+    logic [XLEN-1:0] csr_src;
+    logic [XLEN-1:0] csr_new;
+    logic            csr_op_valid;
+    logic            csr_we;
+
+    // Source: rs1 for the register forms, zero-extended 5-bit zimm
+    // (carried in de_i.imm by decode) for the immediate forms.
+    always_comb begin
+        if (de_i.csr_op inside {CSR_RWI, CSR_RSI, CSR_RCI}) csr_src = de_i.imm;
+        else csr_src = de_i.rs1_data;
+    end
+
+    // Same retire predicate as the regfile writeback (result_ready=1 for
+    // a CSR op). de_i.csr_wren is decode's "CSR op present" flag, already
+    // squashed by illegal in decode.
+    assign csr_op_valid = de_i.valid & de_i.csr_wren & ~de_i.illegal & ~stall_i &
+        result_ready & ~mem_misaligned;
+
+    always_comb begin
+        unique case (de_i.csr_op)
+            CSR_RW, CSR_RWI: begin
+                csr_new = csr_src;
+                csr_we  = csr_op_valid;  // CSRRW always writes
+            end
+            CSR_RS, CSR_RSI: begin
+                csr_new = csr_rdata_i | csr_src;
+                csr_we  = csr_op_valid & (csr_src != '0);  // no write if src==0
+            end
+            CSR_RC, CSR_RCI: begin
+                csr_new = csr_rdata_i & ~csr_src;
+                csr_we  = csr_op_valid & (csr_src != '0);  // no write if src==0
+            end
+            default: begin
+                csr_new = '0;
+                csr_we  = 1'b0;
+            end
+        endcase
+    end
+
+    assign csr_wdata_o = csr_new;
+    assign csr_wren_o  = csr_we;
 
     // =================================================================
     // Memory interface (LSU). The effective address (Zilx indexed or

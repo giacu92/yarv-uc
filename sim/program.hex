@@ -81,6 +81,15 @@
 // bit-field assembler (rd<<7, rs1<<15, rs2<<20, funct3<<12, funct7<<25,
 // imm field per format) and cross-checked by hand.
 
+0x00f00293  // 0x00: addi   t0,     zero, 15          t0 = 15
+0x34129073  // 0x04: csrrw  zero,   mepc, t0          mepc = t0 
+
+0x00000013  // nop
+0x00000013  // nop
+0x00000013  // nop
+0x00000013  // nop
+0x00000013  // nop
+
 0x00f00293  // 0x00: addi   t0, zero, 15          t0 = 15
 0x04d00313  // 0x04: addi   t1, zero, 77          t1 = 77
 0x00628533  // 0x08: add    a0, t0, t1            RAW on t1 -> a0 = 92

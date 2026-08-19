@@ -5,16 +5,16 @@
 import rv32_pkg::*;
 
 /**
- * Decode stage — phase 1 (RV32I + M + C, no execute yet).
+ * Decode stage — RV32I + M + C + Zilx indexed loads + Zicsr CSR ops.
  *
  * Consumes fetch's F/D outputs (fe_instr / fe_pc / fe_valid — `fe_` is
  * the fetch stage's sigil; the F/D register is fetch's output, so these
  * inputs take the producer's sigil) and produces a D/E control word
  * (de_o) latched into a D/E register. The register file is read
  * asynchronously from this stage so operands are captured at decode.
- * There is no execute stage yet, so de_o feeds debug taps only; the
- * reg-file write port has no producer (writeback) and is tied off in the
- * CPU top.
+ * de_o feeds the execute stage, which drives the reg-file write port
+ * (ALU/PC4/load/old-CSR writeback), the CSR file RMW, the fetch
+ * redirect, and decode's stall/flush.
  *
  * Each pipeline stage exposes the PC it is treating, the instruction
  * word, and a valid as outputs (prefixed by its stage sigil: fe = fetch,
@@ -59,16 +59,21 @@ import rv32_pkg::*;
  * !hold_is_span so a spanning stitch, which consumes W+1, does not
  * false-stall); the stall_i and raw_haz terms carry real back-pressure.
  *
- * Decoded-but-not-yet-executable opcodes (control rides the D/E register to
- * the debug taps; the LSU is not present yet, so loads don't retire):
+ * Decoded opcodes that ride the D/E register to execute:
  *   OPC_AMO with Zilx funct5 (10010 unscaled / 11010 scaled) -> indexed-load
  *     control (mem_read, ALU_LX effective address, WB_MEM). rs1=index,
  *     rs2=base (roles swapped vs base loads). Real AMOs (other funct5) and
  *     RV64-only encodings (funct5=11110, funct3=011/110) decode to illegal.
+ *   OPC_SYSTEM funct3!=0 -> Zicsr CSR op (CSRRW/S/C + immediate variants):
+ *     csr_op / csr_wren / csr_addr, reg_write=1, wb_src=WB_CSR (rd<-old
+ *     CSR). The ALU result is unused for CSR ops; execute does the RMW.
+ *     Immediate variants carry zimm in imm ({27'b0,rs1_field}, uses_rs1=0);
+ *     register variants uses_rs1=1. csr_wren is decode's op-present flag
+ *     (squashed by dec_illegal); execute qualifies the actual write.
  *
  * Deferred opcodes (decode to illegal=1, not executed this phase):
  *   OPC_MISC_MEM (fence / fence.i — Zifencei),
- *   OPC_SYSTEM   (CSR / ecall / ebreak — Zicsr),
+ *   OPC_SYSTEM funct3=0 (ecall / ebreak / mret / wfi — no trap machinery),
  *   atomics / any unknown opcode.
  *
  * Naming: ports *_i/_o; internal signals no prefix; flops _q, next-state
@@ -539,6 +544,7 @@ module decode_stage (
 
     logic [ 4:0] rs1_addr_dec;
     logic [ 4:0] rs2_addr_dec;
+    logic [11:0] csr_addr_dec;
 
     // ---- Field extraction ----
     logic [ 6:0] opcode;
@@ -557,6 +563,7 @@ module decode_stage (
     logic [31:0] imm;
     logic uses_rs1, uses_rs2;
     logic       reg_write;
+    logic       csr_wren;
     alu_op_t    alu_op;
     alu_src_a_t alu_src_a;
     alu_src_b_t alu_src_b;
@@ -567,6 +574,8 @@ module decode_stage (
     wb_src_t         wb_src;
     branch_t         branch_type;
     logic            dec_illegal;
+    logic            is_csr;
+    csr_op_t         csr_op;
 
     // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
     // and driven with a default every cycle in the decode always_comb below:
@@ -665,6 +674,7 @@ module decode_stage (
         rd_field = src_instr32[11:7];
         rs1_field = src_instr32[19:15];
         rs2_field = src_instr32[24:20];
+        is_csr = (opcode == OPC_SYSTEM) && (funct3 != 3'b000);
         is_m_ext = (opcode == OPC_OP) && (funct7 == 7'b0000001);
 
         // ---- Immediates (sign-extended) ----
@@ -693,6 +703,8 @@ module decode_stage (
         uses_rs1 = 1'b0;
         uses_rs2 = 1'b0;
         reg_write = 1'b0;
+        csr_wren = 1'b0;
+        csr_op = CSR_NONE;
         alu_op = ALU_ADD;
         alu_src_a = ALU_A_RS1;
         alu_src_b = ALU_B_IMM;
@@ -984,11 +996,74 @@ module decode_stage (
                     mem_read    = 1'b1;
                     alu_op      = ALU_LX;
                     alu_src_a   = ALU_A_RS2;  // base (rs2)
-                    alu_src_b   = ALU_B_RS1_SH;  // index (rs1) << shamt
+                    alu_src_b   = ALU_B_RS1;  // index (rs1); ALU_LX applies <<shamt
                     uses_rs1    = 1'b1;  // index
                     uses_rs2    = 1'b1;  // base
                     imm         = 32'd0;
                     wb_src      = WB_MEM;
+                end
+            end
+
+            OPC_SYSTEM: begin
+                // Zicsr CSR ops (funct3 != 0) + ecall/ebreak/mret/wfi
+                // (funct3 == 0). Only the CSR ops execute this phase; the
+                // trap-entry ops stay illegal (no trap machinery yet).
+                //
+                // RV32 Zicsr:
+                //   funct3=001 CSRRW   rd <- csr; csr <- rs1
+                //   funct3=010 CSRRS   rd <- csr; csr <- csr |  rs1
+                //   funct3=011 CSRRC   rd <- csr; csr <- csr & ~rs1
+                //   funct3=101 CSRRWI  rd <- csr; csr <- zimm
+                //   funct3=110 CSRRSI  rd <- csr; csr <- csr |  zimm
+                //   funct3=111 CSRRCI  rd <- csr; csr <- csr & ~zimm
+                //
+                // rd always receives the OLD csr value (WB_CSR); the
+                // RMW side effect is computed in execute (csr_wdata_o /
+                // csr_wren_o). CSRRS/CSRRC with rs1==0 (and CSRRSI/CSRRCI
+                // with zimm==0) do NOT write the CSR — execute gates the
+                // write; CSRRW always writes. decode only flags the op
+                // (csr_wren=1, csr_op, csr_addr); the dec_illegal squash
+                // below clears csr_wren for non-CSR / illegal encodings.
+                // The ALU result is unused for CSR ops (wb_src=WB_CSR,
+                // csr_wdata computed in execute), so no alu_src/alu_op
+                // override is needed — defaults leave alu_result_valid=1
+                // (combinational), which retires the op in one cycle.
+                if (is_csr) begin
+                    reg_write   = 1'b1;  // rd <- old CSR value
+                    wb_src      = WB_CSR;
+                    uses_rs2    = 1'b0;  // CSR ops never read rs2
+                    csr_wren    = 1'b1;  // execute qualifies the actual write
+                    dec_illegal = 1'b0;
+                    unique case (funct3)
+                        3'b001: begin  // CSRRW
+                            csr_op   = CSR_RW;
+                            uses_rs1 = 1'b1;
+                        end
+                        3'b010: begin  // CSRRS
+                            csr_op   = CSR_RS;
+                            uses_rs1 = 1'b1;
+                        end
+                        3'b011: begin  // CSRRC
+                            csr_op   = CSR_RC;
+                            uses_rs1 = 1'b1;
+                        end
+                        3'b101: begin  // CSRRWI  (zimm = instr[19:15])
+                            csr_op = CSR_RWI;
+                            imm    = {27'b0, rs1_field};  // zimm, zero-extended
+                        end
+                        3'b110: begin  // CSRRSI
+                            csr_op = CSR_RSI;
+                            imm    = {27'b0, rs1_field};
+                        end
+                        3'b111: begin  // CSRRCI
+                            csr_op = CSR_RCI;
+                            imm    = {27'b0, rs1_field};
+                        end
+                        default: dec_illegal = 1'b1;  // unreachable (is_csr => funct3!=0)
+                    endcase
+                end else begin
+                    // ecall / ebreak / mret / wfi / fence.i — no trap yet.
+                    dec_illegal = 1'b1;
                 end
             end
 
@@ -1003,6 +1078,7 @@ module decode_stage (
         // rs1/rs2 (avoids reading a bogus field, e.g. LUI's rs1 is imm).
         rs1_addr_dec       = uses_rs1 ? rs1_field : 5'd0;
         rs2_addr_dec       = uses_rs2 ? rs2_field : 5'd0;
+        csr_addr_dec       = is_csr ? src_instr32[31:20] : 12'd0;  // CSR index is 12 bits
 
         // ---- Assemble the D/E word for this cycle ----
         de_d               = '0;
@@ -1024,19 +1100,23 @@ module decode_stage (
         de_d.mem_shamt     = mem_shamt;
         de_d.wb_src        = wb_src;
         de_d.branch_type   = branch_type;
-        // reg_write / mem_read / mem_write are squashed by illegal. A
-        // spanning stitch decodes a real 32-bit instr through the uniform
-        // decoder, so spanning no longer forces illegal (it used to).
+        de_d.csr_op        = csr_op;
+        de_d.csr_addr      = csr_addr_dec;
+        // reg_write / mem_read / mem_write / csr_wren are squashed by
+        // illegal. A spanning stitch decodes a real 32-bit instr through
+        // the uniform decoder, so spanning no longer forces illegal.
         if (dec_illegal) begin
             de_d.reg_write   = 1'b0;
             de_d.mem_read    = 1'b0;
             de_d.mem_write   = 1'b0;
+            de_d.csr_wren    = 1'b0;
             de_d.branch_type = BR_NONE;
             de_d.illegal     = decoded_valid;  // illegal=1 only when a word was present
         end else begin
             de_d.reg_write = reg_write;
             de_d.mem_read  = mem_read;
             de_d.mem_write = mem_write;
+            de_d.csr_wren  = csr_wren;
             de_d.illegal   = 1'b0;
         end
     end

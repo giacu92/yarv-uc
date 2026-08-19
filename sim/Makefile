@@ -17,6 +17,7 @@ RTL := \
 	../src/rtl/bus/axi4_lite_xbar.sv \
 	../src/rtl/core/fetch_stage.sv \
 	../src/rtl/core/reg_file.sv \
+	../src/rtl/core/csr_regfile.sv \
 	../src/rtl/core/decode_stage.sv \
 	../src/rtl/core/alu.sv \
 	../src/rtl/core/execute_stage.sv \

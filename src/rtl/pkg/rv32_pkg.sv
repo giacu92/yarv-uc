@@ -124,21 +124,26 @@ package rv32_pkg;
     typedef enum logic [1:0] {
         ALU_A_RS1,
         ALU_A_PC,
+        ALU_A_CSR,
         ALU_A_RS2   // Zilx base (spec: rs2 = base, rs1 = index)
     } alu_src_a_t;
-    // ALU operand-B source.
+    // ALU operand-B source. Zilx reuses ALU_B_RS1 (the index, rs1) — the
+    // <<shamt shift is keyed on alu_op==ALU_LX inside the ALU, not on this
+    // enum, so a dedicated "shifted rs1" select is not needed.
     typedef enum logic [2:0] {
+        ALU_B_RS1,
         ALU_B_IMM,
         ALU_B_RS2,
         ALU_B_PC4,
-        ALU_B_ZERO,
-        ALU_B_RS1_SH  // Zilx index (rs1), shifted by de_t.mem_shamt inside the ALU
+        ALU_B_ZERO
     } alu_src_b_t;
-    // Write-back source.
+    // Write-back source. WB_CSR writes the OLD CSR value to rd (Zicsr:
+    // rd <- csr[addr] before the RMW side effect commits).
     typedef enum logic [1:0] {
         WB_ALU,
         WB_MEM,
-        WB_PC4
+        WB_PC4,
+        WB_CSR
     } wb_src_t;
     // Memory access size.
     typedef enum logic [1:0] {
@@ -146,6 +151,28 @@ package rv32_pkg;
         MS_H,
         MS_W
     } mem_size_t;
+    // CSR access type (Zicsr subset).
+    typedef enum logic [2:0] {
+        CSR_NONE,
+        CSR_RW,
+        CSR_RS,
+        CSR_RC,
+        CSR_RWI,
+        CSR_RSI,
+        CSR_RCI
+    } csr_op_t;
+
+    typedef enum logic [11:0] {
+        CSR_ADDR_MSTATUS  = 12'h300,
+        CSR_ADDR_MISA     = 12'h301,
+        CSR_ADDR_MIE      = 12'h304,
+        CSR_ADDR_MTVEC    = 12'h305,
+        CSR_ADDR_MSCRATCH = 12'h340,
+        CSR_ADDR_MEPC     = 12'h341,
+        CSR_ADDR_MCAUSE   = 12'h342,
+        CSR_ADDR_MTVAL    = 12'h343,
+        CSR_ADDR_MIP      = 12'h344
+    } csr_addr_t;
 
     // D/E pipeline register: everything decode produces for a (future)
     // execute stage. Single-direction packed struct, legal as one port
@@ -162,6 +189,9 @@ package rv32_pkg;
         logic [XLEN-1:0] imm;            // sign-extended I/S/B/U/J immediate
         logic [4:0]      rd;
         logic            reg_write;      // write back to rd
+        logic            csr_wren;       // write back to CSR (Zicsr subset)
+        csr_op_t         csr_op;         // CSR access type (Zicsr subset)
+        logic [11:0]     csr_addr;       // CSR address (Zicsr subset)
         alu_op_t         alu_op;
         alu_src_a_t      alu_src_a;
         alu_src_b_t      alu_src_b;

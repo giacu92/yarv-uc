@@ -150,6 +150,23 @@ module rv32imac_zicsr_zifencei (
     wire [XLEN-1:0] wb_data;
     wire            wb_en;
 
+    de_t            de_w;
+
+    // de_* D/E taps (decode stage outputs). Debug only — left
+    // unconnected here; the sim probes them via the Verilator hierarchy.
+    wire [XLEN-1:0] de_pc_w;
+    wire [XLEN-1:0] de_instr_w;
+    wire            de_valid_w;
+
+    // Execute -> decode back-pressure / flush.
+    wire            ex_stall;
+    wire            ex_flush;
+
+    wire [XLEN-1:0] csr_wdata;
+    wire            csr_we;
+    wire [XLEN-1:0] csr_rdata;
+
+    // GPR Regfile
     reg_file u_regfile (
         .clk_i     (clk_i),
         .rstn_i    (rstn_i),
@@ -162,17 +179,20 @@ module rv32imac_zicsr_zifencei (
         .wr_en_i   (wb_en)
     );
 
-    de_t            de_w;
 
-    // de_* D/E taps (decode stage outputs). Debug only — left
-    // unconnected here; the sim probes them via the Verilator hierarchy.
-    wire [XLEN-1:0] de_pc_w;
-    wire [XLEN-1:0] de_instr_w;
-    wire            de_valid_w;
-
-    // Execute -> decode back-pressure / flush.
-    wire            ex_stall;
-    wire            ex_flush;
+    // CSR file: decode drives the address (de_w.csr_addr = the op in
+    // execute); the async read returns the OLD value to execute, the sync
+    // write commits the RMW result from execute (csr_wdata / csr_we).
+    // Both ports address the op currently in execute (single CSR op at a
+    // time).
+    csr_regfile u_csr_regfile (
+        .clk_i     (clk_i),
+        .rstn_i    (rstn_i),
+        .csr_addr_i(de_w.csr_addr),
+        .csr_data_o(csr_rdata),
+        .csr_wren_i(csr_we),
+        .csr_data_i(csr_wdata)
+    );
 
     decode_stage u_decode (
         .clk_i       (clk_i),
@@ -205,6 +225,9 @@ module rv32imac_zicsr_zifencei (
         .clk_i         (clk_i),
         .rstn_i        (rstn_i),
         .de_i          (de_w),
+        .csr_rdata_i   (csr_rdata),        // CSR read value
+        .csr_wdata_o   (csr_wdata),        // CSR write value (RMW result)
+        .csr_wren_o    (csr_we),           // CSR write enable (execute-qualified)
         .stall_i       (1'b0),             // no downstream stage yet
         .stall_o       (ex_stall),
         .flush_o       (ex_flush),

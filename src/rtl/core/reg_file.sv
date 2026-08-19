@@ -5,7 +5,7 @@
 import rv32_pkg::*;
 
 /**
- * Integer register file — 32 x 32-bit registers (x0 hardwired to 0).
+ * Integer register file (GPR) — 32 x 32-bit registers (x0 hardwired to 0).
  *
  * Two asynchronous (combinational) read ports so the decode stage gets
  * rs1/rs2 operands in the same cycle, and one synchronous write port
