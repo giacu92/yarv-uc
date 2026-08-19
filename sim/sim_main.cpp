@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     // env var (e.g. MAX_CYC=20000 make run) for longer-running programs.
     const int max_cyc = [] {
         const char *e = getenv("MAX_CYC");
-        return e ? atoi(e) : 4000;
+        return e ? atoi(e) : 8000;
     }();
 
     // Optional machine-readable commit log for co-sim (diff vs Spike).
@@ -267,6 +267,7 @@ int main(int argc, char** argv) {
         printf("retired %d instructions in %d cycles (no park: hit %d-cycle safety bound)\n",
                retired, cyc, max_cyc);
     }
+    printf("IPC = %.3f (retired / cycles)\n", 1.0 * retired / cyc);
 
     // Pipe-stall breakdown: stalled cycles vs total run cycles. A stall
     // cycle is one where dbg_stall_o (= dec_stall | ex_stall) was high --

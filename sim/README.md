@@ -45,8 +45,9 @@ lags the previous by one cycle):
 
 The CPU exports no per-stage debug ports; the harness reads the
 internal taps (`fe_*`, `de_*`, `ex_*`, `wb_*`) as flat members of the
-Verilator root object (built `--public-flat-rw`). A `stalled N/M cycles
-(P%)` breakdown is printed at exit — the RAW-hazard bubble, DIV/REM
+Verilator root object (built `--public-flat-rw`). An exit summary prints
+`retired N instructions in M cycles`, `IPC = N/M`, and a
+`stalled K/M cycles (P%)` breakdown — the RAW-hazard bubble, DIV/REM
 hold, and LSU `EX_MEM_WAIT` costs per run. The run stops early on park
 detection (8 consecutive identical retires — the `start.S` `1: j 1b`
 self-loop); a `MAX_CYC` env var (default 4000) bounds programs that

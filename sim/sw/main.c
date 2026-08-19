@@ -23,13 +23,14 @@
  * state in an initialized .data array, not uninitialized globals.
  */
 
-#define N 16
+#define N 32
 
 /* Initialized .data array (part of the RAM image, so it lands in memory
  * without needing .bss zeroing). volatile forces a real load/store per
  * access and stops -O2 from constant-folding the whole sort. */
 static volatile int arr[N] = {
-    5, 14, 2, 11, 9, 1, 7, 12, 3, 8, 15, 4, 13, 6, 0, 10,
+    10, -8, 3, -15, 12, -1, 6, -13, 0, 9, -4, 14, -7, 11, -2, 5,
+    -16, 7, -12, 4, -9, 15, -6, 13, -10, 2, -11, 8, -5, 1, -14, -3
 };
 
 /* Zilx (draft) scaled indexed word load: val = *(base + (idx << 2)).

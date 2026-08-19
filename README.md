@@ -10,7 +10,9 @@ board. The board is clocked by a 25 MHz single-ended reference from an
 MS5351M clock generator (CLK0 on PIN10, LVCMOS33); an on-chip rPLL
 multiplies it up to a 50 MHz `clk_core` that drives the whole fabric.
 
-The core is a work-in-progress in-order pipeline. Implemented so far:
+The core is a work-in-progress **in-order, 3-stage pipeline — Fetch /
+Decode / Execute (F/D/E)** — over a single von Neumann memory port.
+Implemented so far:
 
 - **Fetch** — single-outstanding overlap-prefetch of 32-bit words over a
   native memory interface, with a 1-entry skid buffer (2-deep FIFO: F/D
@@ -79,6 +81,11 @@ Requires Verilator (`sudo apt-get install -y verilator`).
 make run        # hand-crafted program.hex oracle (fetch/decode/retire logs)
 make sw-run     # build the C program + run the sim loading it
 ```
+
+Each run prints a retire/IPC/stall summary, e.g. the recursive quicksort
+(`make sw-run`) retires 2172 instructions in 5863 cycles -> **IPC ~0.37**
+(27% of cycles stalled, dominated by the LSU round-trip + RAW-hazard
+bubbles in the no-bypass 3-stage pipe).
 
 See `sim/README.md` for the logs, VCD/GTKWave, and the AXI4-Lite RAM
 compliance test (`sim/ram_tb/`).
