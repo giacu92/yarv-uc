@@ -1196,6 +1196,9 @@ module decode_stage (
     // has fe_valid=0 (no term). The stall_i and raw_haz terms carry real
     // back-pressure.
     // =================================================================
+    wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
+    wire backpressure_stall = stall_i;
+    wire raw_stall = raw_haz;
     assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
 
     // Register-read addresses drive the reg file.

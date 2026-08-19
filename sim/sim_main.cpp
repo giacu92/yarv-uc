@@ -29,7 +29,7 @@
 // inside the CPU (fe_pc_w / de_pc_w / ex_pc_w / wb_en / wb_addr /
 // wb_data, ...). The sim is built with --public-flat-rw, so this harness
 // reaches them as flat C++ members of the sim_top model
-// (TAP(fe_pc_w), ...). sim_top itself carries only clk / rst / led.
+// (TAP(fe_pc), ...). sim_top itself carries only clk / rst / led.
 //
 // Writeback is sampled on the clock low half (before the edge that
 // commits it) so the value lines up with the retiring op; ex_valid
@@ -163,9 +163,9 @@ int main(int argc, char** argv) {
         // exports it. fe_valid is a held level, so a stall (DIV/LSU busy)
         // repeats the same word for several cycles -- that is the stall,
         // not a bug.
-        if (TAP(fe_valid_w)) {
-            uint32_t pc    = TAP(fe_pc_w);
-            uint32_t instr = TAP(fe_instr_w);
+        if (TAP(fe_valid)) {
+            uint32_t pc    = TAP(fe_pc);
+            uint32_t instr = TAP(fe_instr);
             int      c     = (instr & 3u) != 3u;
             snprintf(line, sizeof(line), "%5d  0x%08x  0x%08x  %c",
                      cyc, pc, instr, c ? 'C' : '.');
@@ -182,9 +182,9 @@ int main(int argc, char** argv) {
         // ---- decode log (one line per cycle de_valid is high) ----
         // de_instr is the 32-bit word decode TREATED (native or
         // RVC-expanded), so is-compressed cannot be recovered from it.
-        if (TAP(de_valid_w)) {
-            uint32_t pc    = TAP(de_pc_w);
-            uint32_t instr = TAP(de_instr_w);
+        if (TAP(de_valid)) {
+            uint32_t pc    = TAP(de_pc);
+            uint32_t instr = TAP(de_instr);
             snprintf(line, sizeof(line), "%3d  0x%08x  0x%08x", cyc, pc, instr);
             de_log.push_back(line);
             ++decoded;
@@ -200,9 +200,9 @@ int main(int argc, char** argv) {
             snprintf(line, sizeof(line), "%3d  wb    x%-2u = 0x%08x", cyc, wb_addr, wb_data);
             ex_log.push_back(line);
         }
-        if (TAP(ex_valid_w)) {
-            uint32_t pc    = TAP(ex_pc_w);
-            uint32_t instr = TAP(ex_instr_w);
+        if (TAP(ex_valid)) {
+            uint32_t pc    = TAP(ex_pc);
+            uint32_t instr = TAP(ex_instr);
             snprintf(line, sizeof(line), "%3d  ex    0x%08x  0x%08x", cyc, pc, instr);
             ex_log.push_back(line);
             ++retired;

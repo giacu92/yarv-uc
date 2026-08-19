@@ -40,11 +40,16 @@ module csr_regfile (
 
     // One sync write port (driven by execute's CSR RMW result).
     input wire            csr_wren_i,
-    input wire [XLEN-1:0] csr_data_i
+    input wire [XLEN-1:0] csr_data_i,
+
+    // Instruction stats
+    input wire instr_retire_i,  // instruction retired (commit)
+    input wire instr_branch_i,  // instruction retired was a branch
+    input wire instr_pc_i       // instruction retired was a jump
 );
     // Index map: implemented CSRs packed into a 9-entry array. The case
     // statements below translate the 12-bit CSR address to/from this index.
-    localparam int unsigned NCSR = 9;
+    localparam int unsigned NCSR = 11;
     logic [XLEN-1:0] regs[NCSR-1:0];
     logic [XLEN-1:0] csr_rdata;
 
@@ -63,34 +68,46 @@ module csr_regfile (
             CSR_ADDR_MCAUSE:   csr_rdata = regs[6];
             CSR_ADDR_MTVAL:    csr_rdata = regs[7];
             CSR_ADDR_MIP:      csr_rdata = regs[8];
+            CSR_ADDR_MCYCLE:   csr_rdata = regs[9];
+            CSR_ADDR_MINSTRET: csr_rdata = regs[10];
             default:           csr_rdata = '0;  // Unimplemented CSRs read as 0
         endcase
     end
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            regs[0] <= '0;  // mstatus
-            regs[1] <= MISA_RESET;  // misa (read-only WARL; fixed RV32IMAC)
-            regs[2] <= '0;  // mie
-            regs[3] <= '0;  // mtvec
-            regs[4] <= '0;  // mscratch
-            regs[5] <= '0;  // mepc
-            regs[6] <= '0;  // mcause
-            regs[7] <= '0;  // mtval
-            regs[8] <= '0;  // mip
-        end else if (csr_wren_i) begin
-            case (csr_addr_i)
-                CSR_ADDR_MSTATUS:  regs[0] <= csr_data_i;
-                CSR_ADDR_MISA:     ;  // misa is read-only here (ignore writes)
-                CSR_ADDR_MIE:      regs[2] <= csr_data_i;
-                CSR_ADDR_MTVEC:    regs[3] <= csr_data_i;
-                CSR_ADDR_MSCRATCH: regs[4] <= csr_data_i;
-                CSR_ADDR_MEPC:     regs[5] <= csr_data_i;
-                CSR_ADDR_MCAUSE:   regs[6] <= csr_data_i;
-                CSR_ADDR_MTVAL:    regs[7] <= csr_data_i;
-                CSR_ADDR_MIP:      regs[8] <= csr_data_i;
-                default:           ;  // Unimplemented CSRs ignore writes
-            endcase
+            for (int i = 0; i < NCSR; i++) begin
+
+                if (i == 1) begin
+                    regs[i] <= MISA_RESET;  // misa is read-only WARL, so reset to RV32IMAC
+                end else begin
+                    regs[i] <= '0;
+                end
+            end
+        end else begin
+
+            // Update MCYCLE and MINSTRET on every cycle (increment by 1). These are
+            // architected to be incremented every cycle, so they are not gated by
+            // csr_wren_i. The other CSRs are only updated on a CSR write (csr_wren_i).
+            regs[9]  <= regs[9] + 1;  // MCYCLE
+            regs[10] <= instr_retire_i ? regs[10] + 1 : regs[10];  // MINSTRET
+
+            if (csr_wren_i) begin
+                case (csr_addr_i)
+                    CSR_ADDR_MSTATUS:  regs[0] <= csr_data_i;
+                    CSR_ADDR_MISA:     ;  // misa is read-only here (ignore writes)
+                    CSR_ADDR_MIE:      regs[2] <= csr_data_i;
+                    CSR_ADDR_MTVEC:    regs[3] <= csr_data_i;
+                    CSR_ADDR_MSCRATCH: regs[4] <= csr_data_i;
+                    CSR_ADDR_MEPC:     regs[5] <= csr_data_i;
+                    CSR_ADDR_MCAUSE:   regs[6] <= csr_data_i;
+                    CSR_ADDR_MTVAL:    regs[7] <= csr_data_i;
+                    CSR_ADDR_MIP:      regs[8] <= csr_data_i;
+                    CSR_ADDR_MCYCLE:   regs[9] <= csr_data_i;
+                    CSR_ADDR_MINSTRET: regs[10] <= csr_data_i;
+                    default:           ;  // Unimplemented CSRs ignore writes
+                endcase
+            end
         end
     end
 

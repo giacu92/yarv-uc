@@ -31,9 +31,11 @@ The core is a work-in-progress in-order pipeline. Implemented so far:
   bus and retires them on the read response / write-ack. Misaligned
   accesses are suppressed (not launched, not trapped).
 - **CSR file (Zicsr)** — machine-mode CSR subset (mstatus/misa/mie/
-  mtvec/mscratch/mepc/mcause/mtval/mip) with a read-modify-write in
-  execute: CSRRW/S/C + immediate variants retire, `rd` <- old CSR.
-  `misa` read-only; unimplemented CSRs read 0 / ignore writes.
+  mtvec/mscratch/mepc/mcause/mtval/mip) plus `mcycle`/`minstret`
+  performance counters, with a read-modify-write in execute: CSRRW/S/C +
+  immediate variants retire, `rd` <- old CSR. `misa` read-only;
+  unimplemented CSRs read 0 / ignore writes. `mcycle` ticks every cycle,
+  `minstret` per retired instruction (both writable via CSR RMW).
 
 Still deferred: **traps/exceptions** (misaligned access suppressed, not
 trapped; ecall/ebreak/mret/wfi/fence.i decode to `illegal=1`), **CSR
