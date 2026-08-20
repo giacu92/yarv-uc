@@ -19,6 +19,7 @@
         <File path="src/rtl/core/top_module.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/pkg/rv32_pkg.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/utils/axi4_lite_ram.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/utils/native_ram.sv" type="file.verilog" enable="1"/>
         <File path="src/phys/rv32imac_Zicsr_Zifencei.cst" type="file.cst" enable="1"/>
     </FileList>
 </Project>

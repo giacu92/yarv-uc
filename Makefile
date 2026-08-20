@@ -43,7 +43,7 @@ help:
 	@echo "  wave          build + run the sim, then open the VCD in gtkwave"
 	@echo "  run           build + run the Verilator sim"
 	@echo "  clean         remove simulation build artefacts + waveforms"
-	@echo "  sw            build a C program -> sim/sw/build/program.hex (rv32imac)"
+	@echo "  sw            build a C program -> sim/sw/build/{imem,dmem}.hex (rv32imac, Harvard)"
 	@echo "  sw-run        build the C program and run the sim loading it"
 	@echo "  cosim         build Spike + sw, run both, diff vs golden Spike"
 	@echo ""
@@ -101,19 +101,21 @@ run:
 
 
 # ----------------------------------------------------------------------
-# C program -> program.hex (rv32imac toolchain)
+# C program -> Harvard imem.hex + dmem.hex (rv32imac toolchain)
 # ----------------------------------------------------------------------
 #
-# Build (and optionally run) a C program for the sim. `sw` compiles
-# sim/sw/main.c with the prebuilt riscv32-esp-elf-gcc into a $readmemh
-# word hex; `sw-run` then runs the sim loading that hex via +INIT=...
-# instead of the hand-crafted program.hex oracle.
+# Build (and optionally run) a C program for the Harvard sim. `sw`
+# compiles sim/sw/main.c with the prebuilt riscv32-esp-elf-gcc and links
+# across two 0-based regions (link.ld): .text -> IMEM, .data -> DMEM,
+# producing a $readmemh word hex for each. `sw-run` then runs the sim
+# loading both images via +IINIT/+DINIT instead of the hand-crafted
+# imem.hex/dmem.hex oracle.
 #
 sw:
 	$(MAKE) -C sim/sw
 
 sw-run: sw
-	$(MAKE) -C sim run RUN_ARGS="+INIT=sw/build/program.hex"
+	$(MAKE) -C sim run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"
 
 # ----------------------------------------------------------------------
 # Co-sim: RTL vs Spike (golden ISA reference)

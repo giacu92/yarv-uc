@@ -5,10 +5,18 @@
 import rv32_pkg::*;
 
 /**
- * Simulation top (Verilator). Replicates the board-top wiring of
- * `top_module`: instantiates the CPU, a 1->2 AXI4-Lite crossbar, and
- * the AXI4-Lite RAM on the mem master (so the RAM can be preloaded
- * with a program hex via $readmemh).
+ * Simulation top (Verilator). Mirrors the board-top wiring of
+ * `top_module` for the selected build:
+ *
+ * Harvard (default, VON_NEUMANN undefined):
+ *   CPU.imem -> native_ram u_imem (read-only, preloaded via +IINIT)
+ *   CPU.dmem -> native_ram u_dmem (byte-strobed RW, preloaded via +DINIT)
+ *   CPU.axi_peri -> axi_bus_peri (tied off)
+ * Fetch and the LSU no longer contend; each has a dedicated BSRAM.
+ *
+ * Von-Neumann legacy (VON_NEUMANN defined):
+ *   CPU.bus_axi -> axi4_lite_xbar -> axi4_lite_ram u_ram (preloaded via
+ *   +INIT). Fetch + LSU share one AXI master.
  *
  * No debug signals cross the CPU boundary (the CPU exports only its
  * functional ports). The C++ harness observes the per-stage taps
@@ -18,9 +26,8 @@ import rv32_pkg::*;
  * reachable as flat C++ members of the sim_top model. sim_top itself
  * therefore needs no debug output ports.
  *
- * The peripheral crossbar master is tied off exactly like `top_module`
- * (reserved for future MMIO peripherals — UART, GPIO — not data RAM,
- * which shares the mem master).
+ * The peripheral bus is tied off exactly like `top_module` (reserved
+ * for future MMIO peripherals — UART, GPIO — not data RAM).
  *
  * This module is simulation-only; it is not part of the synthesis
  * file list.
@@ -35,21 +42,35 @@ module sim_top (
 );
 
     // -----------------------------------------------------------------
-    // AXI4-Lite buses (trunk modport)
-    //   axi_bus_cpu  : CPU master -> crossbar slave
-    //   axi_bus_mem  : crossbar mem master -> RAM slave
-    //   axi_bus_peri : crossbar peri master -> tied off (no slave yet)
+    // AXI4-Lite peripheral bus (trunk modport). Harvard keeps only this
+    // (CPU peri master -> tied-off slave); von-Neumann also has the CPU
+    // and mem trunks for the crossbar.
     // -----------------------------------------------------------------
+`ifdef VON_NEUMANN
     axi4_lite_if axi_bus_cpu ();
     axi4_lite_if axi_bus_mem ();
+`endif
     axi4_lite_if axi_bus_peri ();
 
-    assign axi_bus_cpu.aclk     = clk_i;
-    assign axi_bus_cpu.aresetn  = rstn_i;
-    assign axi_bus_mem.aclk     = clk_i;
-    assign axi_bus_mem.aresetn  = rstn_i;
+`ifdef VON_NEUMANN
+    assign axi_bus_cpu.aclk    = clk_i;
+    assign axi_bus_cpu.aresetn = rstn_i;
+    assign axi_bus_mem.aclk    = clk_i;
+    assign axi_bus_mem.aresetn = rstn_i;
+`endif
     assign axi_bus_peri.aclk    = clk_i;
     assign axi_bus_peri.aresetn = rstn_i;
+
+    // -----------------------------------------------------------------
+    // Native memory ports (Harvard). Fetch and the LSU each get a
+    // dedicated native_ram.
+    // -----------------------------------------------------------------
+`ifndef VON_NEUMANN
+    mem_req_t imem_req;
+    mem_rsp_t imem_rsp;
+    mem_req_t dmem_req;
+    mem_rsp_t dmem_rsp;
+`endif
 
     // -----------------------------------------------------------------
     // CPU. Functional ports only; debug is observed via the Verilator
@@ -62,10 +83,63 @@ module sim_top (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
         .boot_addr_i(32'h0000_0000),
-        .bus_axi    (axi_bus_cpu.master),
-        .dbg_stall_o(unused_dbg_stall)
+        .dbg_stall_o(unused_dbg_stall),
+`ifdef VON_NEUMANN
+        .bus_axi    (axi_bus_cpu.master)
+`else
+        .axi_peri   (axi_bus_peri.master),
+        .imem_req_o (imem_req),
+        .imem_rsp_i (imem_rsp),
+        .dmem_req_o (dmem_req),
+        .dmem_rsp_i (dmem_rsp)
+`endif
     );
 
+`ifndef VON_NEUMANN
+    // -----------------------------------------------------------------
+    // Instruction memory (read-only). Fetch's dedicated port. Preloaded
+    // via $readmemh with the +IINIT=<path> plusarg (default "imem.hex").
+    // -----------------------------------------------------------------
+    native_ram #(
+        .ADDR_W    (16),  // 64 KiB
+        .DATA_WIDTH(32),
+        .READ_ONLY (1),
+        .INIT_FILE ("")
+    ) u_imem (
+        .clk_i    (clk_i),
+        .rstn_i   (rstn_i),
+        .mem_req_i(imem_req),
+        .mem_rsp_o(imem_rsp)
+    );
+
+    // -----------------------------------------------------------------
+    // Data memory (byte-strobed read/write). Holds .rodata/.data/.bss
+    // and the stack. Preloaded via $readmemh with the +DINIT=<path>
+    // plusarg (default "dmem.hex").
+    // -----------------------------------------------------------------
+    native_ram #(
+        .ADDR_W    (16),  // 64 KiB
+        .DATA_WIDTH(32),
+        .READ_ONLY (0),
+        .INIT_FILE ("")
+    ) u_dmem (
+        .clk_i    (clk_i),
+        .rstn_i   (rstn_i),
+        .mem_req_i(dmem_req),
+        .mem_rsp_o(dmem_rsp)
+    );
+
+    string iinit_file;
+    string dinit_file;
+    initial begin
+        if (!$value$plusargs("IINIT=%s", iinit_file))
+            iinit_file = "imem.hex";  // default: oracle code image
+        if (!$value$plusargs("DINIT=%s", dinit_file))
+            dinit_file = "dmem.hex";  // default: oracle data image
+        $readmemh(iinit_file, u_imem.mem);
+        $readmemh(dinit_file, u_dmem.mem);
+    end
+`else
     // -----------------------------------------------------------------
     // 1->2 AXI4-Lite crossbar: mem vs peri by addr[PERI_ADDR_BIT].
     // -----------------------------------------------------------------
@@ -81,14 +155,7 @@ module sim_top (
 
     // -----------------------------------------------------------------
     // Memory RAM on the mem master (von Neumann: instructions + data),
-    // preloaded via $readmemh.
-    //
-    // The load is done here (not via the RAM's INIT_FILE parameter) so the
-    // image can be selected at run time with the +INIT=<path> Verilator
-    // plusarg -- e.g. to run a C-compiled program (sim/sw/build/program.hex)
-    // without clobbering the hand-crafted oracle (sim/program.hex). With no
-    // +INIT, the default "program.hex" is loaded (same behavior as before).
-    // Keeping this here (sim-only) leaves axi4_lite_ram synthesis-clean.
+    // preloaded via $readmemh with +INIT=<path> (default "program.hex").
     // -----------------------------------------------------------------
     axi4_lite_ram #(
         .ADDR_W   (16),  // 64 KiB
@@ -105,33 +172,45 @@ module sim_top (
             init_file = "program.hex";  // default: hand-crafted oracle
         $readmemh(init_file, u_ram.mem);
     end
+`endif
 
     // -----------------------------------------------------------------
-    // RAM probe: expose a window of u_ram.mem as scalar wires so they
+    // RAM probe: expose a window of the data RAM as scalar wires so they
     // land in the VCD and can be watched in GTKWave (Verilator does not
     // trace unpacked arrays past --trace-max-array, so the full mem[] is
     // not in the VCD). The window is pointed at the program's data array
     // so you can watch it change as the program runs — e.g. quicksort's
-    // 16-int .data array at 0xfc (word index 63) before/after the sort.
+    // 16-int array before/after the sort.
     //
-    // Edit PROBE_BASE_WORD / PROBE_LEN to point at the data of interest:
-    //   word index = byte_addr / 4. (0xfc / 4 = 63.)
+    // Harvard: data lives in u_dmem (D-mem, 0-based). Von-Neumann: data
+    // shares u_ram. PROBE_BASE_WORD is the word index of the data array
+    // in the data image — re-point it if the link layout changes.
+    //   word index = byte_addr / 4.
+    // Default points at the C quicksort .data array (link.ld places .data
+    // at DMEM 0x2000 = word 0x800, N=32 ints). The hand-crafted oracle
+    // writes its data at 0x100 (word 64) at runtime — re-point there
+    // (PROBE_BASE_WORD=64) to watch the oracle.
     // In GTKWave the signals appear as:
     //   sim_top.g_mem_probe[<i>].mem_probe_w
     // -----------------------------------------------------------------
-    localparam int unsigned PROBE_BASE_WORD = 64'd63;  // 0xfc >> 2
-    localparam int unsigned PROBE_LEN       = 64'd16;
+    localparam int unsigned PROBE_BASE_WORD = 64'h800;  // DMEM 0x2000 (quicksort .data)
+    localparam int unsigned PROBE_LEN       = 64'd32;
 
     genvar gi;
     generate
         for (gi = 0; gi < PROBE_LEN; gi = gi + 1) begin : g_mem_probe
+`ifdef VON_NEUMANN
             wire [31:0] mem_probe_w = u_ram.mem[PROBE_BASE_WORD+gi];
+`else
+            wire [31:0] mem_probe_w = u_dmem.mem[PROBE_BASE_WORD+gi];
+`endif
         end
     endgenerate
 
     // -----------------------------------------------------------------
     // Peripheral bus: tie off the slave side (reserved for future MMIO
-    // peripherals; data RAM shares the mem master, not this port).
+    // peripherals; data RAM is on the native dmem port / mem master, not
+    // here).
     // -----------------------------------------------------------------
     assign axi_bus_peri.awready = 1'b0;
     assign axi_bus_peri.wready  = 1'b0;
