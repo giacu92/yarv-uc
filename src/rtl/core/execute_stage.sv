@@ -230,7 +230,7 @@ module execute_stage (
     // so decode advances (mem_running falls away the cycle mem_done=1).
     logic mem_running;
     assign mem_running = (ex_state_q == EX_MEM_WAIT) & ~mem_done;
-    assign stall_o     = alu_start | div_running | mem_launch | mem_running | stall_i;
+    assign stall_o     = alu_start | div_running | (mem_launch & ~store_done) | mem_running | stall_i;
 
     always_comb begin
         ex_state_d = ex_state_q;
