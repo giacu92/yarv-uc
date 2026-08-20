@@ -1,0 +1,52 @@
+diff --git a/execute_stage.sv b/execute_stage.sv
+index 2fd479f..478cac6 100644
+--- a/execute_stage.sv
++++ b/execute_stage.sv
+@@ -204,11 +204,25 @@ module execute_stage (
+         mem_launch = de_i.valid & is_mem_op & ~mem_misaligned & (ex_state_q == EX_IDLE) & ~stall_i;
+     wire  mem_launch_hs = mem_launch & mem_rsp_i.wready;
+ 
+-    // Mem done: the cycle the response retires the op. A load retires on
+-    // the read-data handshake (rvalid); a store on the write-ack (bvalid).
++    // Posted store: once the bridge accepts AW+W (mem_launch_hs on a
++    // write), it owns the write->B round trip on its own; the LSU
++    // retires the same cycle instead of waiting for bvalid. Correctness:
++    // the bridge is single-outstanding and only re-asserts wready once B
++    // completes, so any *following* mem op still naturally stalls
++    // (wready low) until the store has actually finished at the bridge -
++    // RAW-through-memory ordering is preserved there, not by the LSU
++    // waiting here. Loads still need EX_MEM_WAIT: data isn't available
++    // until rvalid.
+     logic mem_done;
+-    assign mem_done = (ex_state_q == EX_MEM_WAIT) &
+-        (de_i.mem_read ? mem_rsp_i.rvalid : mem_rsp_i.bvalid);
++    assign mem_done = (ex_state_q == EX_MEM_WAIT) & mem_rsp_i.rvalid;
++
++    logic store_done;
++    assign store_done = mem_launch_hs & de_i.mem_write;
++
++    // Unified mem-op retire pulse: rvalid cycle for loads, launch-accept
++    // cycle for (posted) stores.
++    logic mem_op_done;
++    assign mem_op_done = de_i.mem_read ? mem_done : store_done;
+ 
+     logic div_running;
+     assign div_running = (ex_state_q == EX_DIV_BUSY) & ~alu_result_valid;
+@@ -223,7 +237,8 @@ module execute_stage (
+         unique case (ex_state_q)
+             EX_IDLE: begin
+                 if (alu_start) ex_state_d = EX_DIV_BUSY;
+-                else if (mem_launch_hs) ex_state_d = EX_MEM_WAIT;
++                else if (mem_launch_hs)
++                    ex_state_d = de_i.mem_read ? EX_MEM_WAIT : EX_IDLE;  // store retires now
+             end
+             EX_DIV_BUSY: if (alu_result_valid) ex_state_d = EX_IDLE;
+             EX_MEM_WAIT: if (mem_done) ex_state_d = EX_IDLE;
+@@ -286,7 +301,7 @@ module execute_stage (
+     // a load on mem_done (rvalid). Stores have reg_write=0 so their
+     // result_ready is don't-care for the regfile write.
+     logic result_ready;
+-    assign result_ready = is_mem_op ? mem_done : alu_result_valid;
++    assign result_ready = is_mem_op ? mem_op_done : alu_result_valid;
+ 
+     assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~stall_i & result_ready & ~mem_misaligned;
