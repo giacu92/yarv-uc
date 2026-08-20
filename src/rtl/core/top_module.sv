@@ -62,19 +62,20 @@ module top_module (
     //   PIN10, single-ended LVCMOS33)
     //
     // Internal CPU clock (rPLL CLKOUT):
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 10 / 5 = 50 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=9 -> FBDIV=10; ODIV_SEL=16
-    //   only sets the VCO = 25*10*16/5 = 800 MHz, it does NOT divide
-    //   CLKOUT). Period = 20 ns. Constrained in the SDC.
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 8 / 5 = 40 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=7 -> FBDIV=8; ODIV_SEL=16
+    //   only sets the VCO = 25*8*16/5 = 640 MHz, it does NOT divide
+    //   CLKOUT). Period = 25 ns. Constrained in the SDC.
     //
-    // Target lowered 100 -> 50 MHz: the execute stage + regfile (BSRAM)
-    // combinational depth does not meet 100 MHz, and Fmax is not the
-    // current goal. 50 MHz gives margin below the ~54 MHz BSRAM cap.
+    // Target lowered 50 -> 40 MHz: the route-dominated execute/ALU/decode
+    // critical path does not leave comfortable margin at 50 MHz (~0.06ns
+    // slack, run-to-run noise), so the target is backed off to 40 MHz for
+    // a safer, repeatable closure.
     //
     // VCO must stay in 500-1250 MHz (GowinSynthesis EX0311 range for this
-    // rPLL). CLKOUT=FCLKIN*FBDIV/IDIV is independent of ODIV, so to halve
-    // CLKOUT 100->50 while keeping VCO at the proven 800 MHz, FBDIV halves
-    // (20->10) AND ODIV doubles (8->16): VCO = 25*10*16/5 = 800 MHz.
+    // rPLL). CLKOUT=FCLKIN*FBDIV/IDIV is independent of ODIV. Keeping IDIV=5
+    // and ODIV=16, FBDIV=8 gives CLKOUT=40 MHz with VCO=25*8*16/5=640 MHz
+    // (comfortably inside the 500-1250 band).
     // -----------------------------------------------------------------
 
     wire clk_core;
@@ -83,8 +84,8 @@ module top_module (
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("25"),
         .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
-        .FBDIV_SEL(9),     // -> CLKOUT = 50 MHz (range: 3.125-600 MHz)
-        .ODIV_SEL (16)     // -> VCO = 800 MHz (range: 500-1250 MHz)
+        .FBDIV_SEL(7),     // -> CLKOUT = 40 MHz (range: 3.125-600 MHz)
+        .ODIV_SEL (16)     // -> VCO = 640 MHz (range: 500-1250 MHz)
     ) pll (
         .CLKOUTP (),
         .CLKOUTD (),
@@ -99,7 +100,7 @@ module top_module (
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
         .CLKIN   (clk_i),     // 25 MHz
-        .CLKOUT  (clk_core),  // 50 MHz
+        .CLKOUT  (clk_core),  // 40 MHz
         .LOCK    (pll_lock)
     );
 

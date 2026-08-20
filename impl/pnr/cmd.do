@@ -15,4 +15,4 @@
 -clock_route_order 0
 -correct_hold 1
 -route_maxfan 23
--global_freq 50.000
+-global_freq 40.000
