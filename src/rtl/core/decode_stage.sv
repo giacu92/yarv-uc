@@ -110,6 +110,9 @@ module decode_stage (
     // async read repeats after the writeback commits (see raw_haz below).
     input wire       ex_wb_en_i,
     input wire [4:0] ex_wb_addr_i,
+    // Execute writeback data: same cycle as ex_wb_en_i/ex_wb_addr_i,
+    // qualified by result_ready (valid on ALU, DIV-done, or load-done).
+    input wire [XLEN-1:0] ex_wb_data_i,
 
     // Back-pressure to fetch (so the pipe can stall on DIV/REM or a RAW
     // hazard).
@@ -503,10 +506,27 @@ module decode_stage (
     // covered by ex_stall) don't falsely trigger — only the div-done
     // cycle does.
     // =================================================================
-    logic raw_haz;
-    assign raw_haz = decoded_valid & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
-        ((rs1_addr_dec != 5'd0 & rs1_addr_dec == ex_wb_addr_i) |
-         (rs2_addr_dec != 5'd0 & rs2_addr_dec == ex_wb_addr_i));
+    //logic raw_haz;
+    //assign raw_haz = decoded_valid & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
+    //    ((rs1_addr_dec != 5'd0 & rs1_addr_dec == ex_wb_addr_i) |
+    //     (rs2_addr_dec != 5'd0 & rs2_addr_dec == ex_wb_addr_i));
+    
+    // =================================================================
+    // RAW forwarding (execute -> decode)
+    //
+    // Bypasses the regfile write-then-read: when execute retires a
+    // writeback this cycle to a register the instruction being decoded
+    // reads, inject ex_wb_data_i directly instead of the stale async
+    // read. Covers DIV/REM and load results too — wb_en_o/wb_data_o
+    // are qualified by result_ready in execute, so they're valid
+    // exactly the cycle the result is ready, and decode is already
+    // parked (stall_i) through the whole busy/wait window. No bubble.
+    // =================================================================
+    wire fwd_rs1 = ex_wb_en_i & (ex_wb_addr_i != 5'd0) & (rs1_addr_dec == ex_wb_addr_i);
+    wire fwd_rs2 = ex_wb_en_i & (ex_wb_addr_i != 5'd0) & (rs2_addr_dec == ex_wb_addr_i);
+
+    wire [XLEN-1:0] rs1_fwd = fwd_rs1 ? ex_wb_data_i : rs1_data_i;
+    wire [XLEN-1:0] rs2_fwd = fwd_rs2 ? ex_wb_data_i : rs2_data_i;
 
     // =================================================================
     // Source selection + uniform 32-bit decode (one always_comb).
@@ -1088,8 +1108,10 @@ module decode_stage (
         de_d.is_compressed = src_is_compressed;
         de_d.rs1_addr      = rs1_addr_dec;
         de_d.rs2_addr      = rs2_addr_dec;
-        de_d.rs1_data      = rs1_data_i;
-        de_d.rs2_data      = rs2_data_i;
+//        de_d.rs1_data      = rs1_data_i;
+//        de_d.rs2_data      = rs2_data_i;
+        de_d.rs1_data      = rs1_fwd;
+        de_d.rs2_data      = rs2_fwd;
         de_d.imm           = imm;
         de_d.rd            = rd_field;
         de_d.alu_op        = alu_op;
@@ -1132,10 +1154,12 @@ module decode_stage (
 
         if (flush_i) begin
             hold_d = 1'b0;  // redirect: drop any stashed half
-        end else if (raw_haz || stall_i) begin
-            // RAW interlock / DIV-REM stall: preserve the stash (the
-            // consumer re-runs next cycle). raw_haz cannot fire during
-            // span_wait/target_span (decoded_valid=0), but is harmless.
+//        end else if (raw_haz || stall_i) begin
+//            // RAW interlock / DIV-REM stall: preserve the stash (the
+//            // consumer re-runs next cycle). raw_haz cannot fire during
+//            // span_wait/target_span (decoded_valid=0), but is harmless.
+            end else if (stall_i) begin
+            // DIV-REM / mem-wait stall: preserve the stash.
         end else if (span_wait) begin
             // Spanning low half held, upper-half word not here yet:
             // keep waiting (preserve). Do NOT stall fetch -- it must
@@ -1177,10 +1201,11 @@ module decode_stage (
     always_comb begin
         if (flush_i) begin
             de_next = '0;
-        end else if (raw_haz) begin
-            de_next = '0;  // RAW interlock: bubble D/E (execute gets an invalid slot)
+//      end else if (raw_haz) begin
+//          de_next = '0;  // RAW interlock: bubble D/E (execute gets an invalid slot)
         end else if (stall_i) begin
-            de_next = de_q;  // DIV/REM stall: hold
+//            de_next = de_q;  // DIV/REM stall: hold
+            de_next = de_q;  // DIV/REM / mem-wait stall: hold
         end else begin
             de_next = de_d;
         end
@@ -1198,8 +1223,9 @@ module decode_stage (
     // =================================================================
     wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
     wire backpressure_stall = stall_i;
-    wire raw_stall = raw_haz;
-    assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
+//  wire raw_stall = raw_haz;
+//  assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
+    assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
 
     // Register-read addresses drive the reg file.
     assign rs1_addr_o = rs1_addr_dec;

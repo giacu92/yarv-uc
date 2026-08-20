@@ -231,6 +231,7 @@ module rv32imac_zicsr_zifencei (
         .flush_i     (ex_flush),
         .ex_wb_en_i  (wb_en),
         .ex_wb_addr_i(wb_addr),
+        .ex_wb_data_i(wb_data),
         .stall_o     (dec_stall),
         .de_o        (de_bus),
         .de_pc_o     (de_pc),
