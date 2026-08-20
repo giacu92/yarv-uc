@@ -1,0 +1,11 @@
+@00000000
+// Harvard oracle — data image (D-mem, byte-strobed RW, 0-based 64 KiB).
+//
+// Empty placeholder: the oracle program (imem.hex) writes all its own
+// data at runtime via stores (sw/sb/sh at 0x100+), then reads it back.
+// Nothing is preloaded — D-mem power-up contents are whatever BSRAM
+// gives (don't-care; the program overwrites before reading). The sim
+// wrapper's PROBE window watches u_dmem.mem[63..78] (0xfc..0x138) where
+// the quicksort .data / oracle data lands.
+//
+// C builds preload this file from sw/build/dmem.hex (.rodata/.data/.bss).

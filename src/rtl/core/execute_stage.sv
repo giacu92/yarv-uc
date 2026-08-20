@@ -102,6 +102,11 @@ module execute_stage (
     // Native memory interface (LSU): loads/stores/Zilx launch here.
     output mem_req_t mem_req_o,
     input  mem_rsp_t mem_rsp_i,
+`ifndef VON_NEUMANN
+    // Native memory interface for peripherals
+    output mem_req_t peri_req_o,
+    input  mem_rsp_t peri_rsp_i,
+`endif
 
     // ex_* per-stage taps (E/M register): pc / instr / valid of the retired
     // op. Named like fetch's fe_*_o (no _dbg suffix) so every pipeline stage
@@ -202,7 +207,28 @@ module execute_stage (
     logic            mem_launch;
     assign
         mem_launch = de_i.valid & is_mem_op & ~mem_misaligned & (ex_state_q == EX_IDLE) & ~stall_i;
-    wire  mem_launch_hs = mem_launch & mem_rsp_i.wready;
+
+    // Effective address selects the LSU target: D-mem (addr[PERI_ADDR_BIT]=0)
+    // or the peri bridge (=1). alu_result (the EA) is held stable through
+    // EX_MEM_WAIT (decode stalls de_i), so this one combinational bit drives
+    // both the request target and the response source — no tracking flops
+    // needed (the LSU is single-outstanding).
+`ifndef VON_NEUMANN
+    wire is_peri = alu_result[PERI_ADDR_BIT];
+`endif
+
+    // Effective LSU response: the selected target's rsp (Harvard dmem/peri),
+    // or the single bus rsp (AXI-memory build). All launch/done/load logic
+    // reads this so a peri op does not falsely retire on the D-mem's
+    // wready/rvalid (the bug from splitting only the request side).
+    mem_rsp_t lsu_rsp;
+`ifndef VON_NEUMANN
+    assign lsu_rsp = is_peri ? peri_rsp_i : mem_rsp_i;
+`else
+    assign lsu_rsp = mem_rsp_i;
+`endif
+
+    wire  mem_launch_hs = mem_launch & lsu_rsp.wready;
 
     // Posted store: once the bridge accepts AW+W (mem_launch_hs on a
     // write), it owns the write->B round trip on its own; the LSU
@@ -214,7 +240,7 @@ module execute_stage (
     // waiting here. Loads still need EX_MEM_WAIT: data isn't available
     // until rvalid.
     logic mem_done;
-    assign mem_done = (ex_state_q == EX_MEM_WAIT) & mem_rsp_i.rvalid;
+    assign mem_done = (ex_state_q == EX_MEM_WAIT) & lsu_rsp.rvalid;
 
     logic store_done;
     assign store_done = mem_launch_hs & de_i.mem_write;
@@ -230,7 +256,7 @@ module execute_stage (
     // so decode advances (mem_running falls away the cycle mem_done=1).
     logic mem_running;
     assign mem_running = (ex_state_q == EX_MEM_WAIT) & ~mem_done;
-    assign stall_o     = alu_start | div_running | (mem_launch & ~store_done) | mem_running | stall_i;
+    assign stall_o = alu_start | div_running | (mem_launch & ~store_done) | mem_running | stall_i;
 
     always_comb begin
         ex_state_d = ex_state_q;
@@ -271,7 +297,7 @@ module execute_stage (
     // pulses, when rdata is valid.
     logic [XLEN-1:0] load_shifted;
     logic [XLEN-1:0] load_data;
-    assign load_shifted = mem_rsp_i.rdata >> {alu_result[1:0], 3'b000};
+    assign load_shifted = lsu_rsp.rdata >> {alu_result[1:0], 3'b000};
     always_comb begin
         unique case (de_i.mem_size)
             MS_B:
@@ -280,8 +306,8 @@ module execute_stage (
             MS_H:
             load_data = de_i.mem_unsigned ?
                 {16'b0, load_shifted[15:0]} : {{16{load_shifted[15]}}, load_shifted[15:0]};
-            MS_W: load_data = mem_rsp_i.rdata;
-            default: load_data = mem_rsp_i.rdata;
+            MS_W: load_data = lsu_rsp.rdata;
+            default: load_data = lsu_rsp.rdata;
         endcase
     end
 
@@ -378,6 +404,40 @@ module execute_stage (
     logic [XLEN-1:0] store_wdata;
     assign store_wdata = de_i.rs2_data << {alu_result[1:0], 3'b000};
 
+`ifndef VON_NEUMANN
+    // Harvard: steer the launch to D-mem (is_peri=0) or the peri bridge
+    // (is_peri=1). Both ports get full defaults so the non-selected port is
+    // cleanly idle (no latch / no stray wvalid).
+    always_comb begin
+        mem_req_o.wvalid  = 1'b0;
+        mem_req_o.we      = 1'b0;
+        mem_req_o.addr    = '0;
+        mem_req_o.wdata   = '0;
+        mem_req_o.wstrb   = '0;
+        mem_req_o.rready  = 1'b0;
+        peri_req_o.wvalid = 1'b0;
+        peri_req_o.we     = 1'b0;
+        peri_req_o.addr   = '0;
+        peri_req_o.wdata  = '0;
+        peri_req_o.wstrb  = '0;
+        peri_req_o.rready = 1'b0;
+        if (is_peri) begin
+            peri_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
+            peri_req_o.we     = de_i.mem_write;
+            peri_req_o.addr   = alu_result;  // EA
+            peri_req_o.wdata  = store_wdata;
+            peri_req_o.wstrb  = store_wstrb;
+            peri_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
+        end else begin
+            mem_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
+            mem_req_o.we     = de_i.mem_write;
+            mem_req_o.addr   = alu_result;  // EA
+            mem_req_o.wdata  = store_wdata;
+            mem_req_o.wstrb  = store_wstrb;
+            mem_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
+        end
+    end
+`else
     always_comb begin
         mem_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
         mem_req_o.we     = de_i.mem_write;
@@ -386,6 +446,7 @@ module execute_stage (
         mem_req_o.wstrb  = store_wstrb;
         mem_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
     end
+`endif
 
     // =================================================================
     // Branch resolve + redirect

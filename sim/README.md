@@ -1,10 +1,14 @@
 # Simulation (Verilator)
 
 Functional simulation of the implemented pipeline (fetch + decode +
-execute + LSU + Zicsr CSR file) plus the on-die AXI4-Lite bridge,
-`mem_arbiter`, `axi4_lite_xbar`, and an AXI4-Lite RAM slave. The board
-top's wiring is replicated in `sim_top.sv` so the RAM can be preloaded
-with a program and the CPU's per-stage debug taps can be logged.
+execute + LSU + Zicsr CSR file). The default **Harvard** build wires the
+CPU to a native read-only I-mem (`native_ram`, `+IINIT`) and a native
+byte-strobed D-mem (`native_ram`, `+DINIT`); AXI survives only for the
+tied-off peripheral bus. The legacy **von-Neumann** build
+(`VON_NEUMANN=1`) keeps the `mem_arbiter` + `axi4_lite_xbar` + single
+AXI4-Lite RAM (`+INIT`) topology. The board top's wiring is replicated
+in `sim_top.sv` so the memories can be preloaded and the CPU's
+per-stage debug taps can be logged.
 
 This harness is **not** part of the synthesis file list.
 
@@ -20,11 +24,15 @@ sudo apt-get install -y verilator
 
 ```
 cd sim
-make run                                  # hand-crafted program.hex oracle
-make run RUN_ARGS="+INIT=sw/build/program.hex"   # load the C program
+make run                                          # Harvard: imem.hex/dmem.hex oracle
+make run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"  # C program
+make run VON_NEUMANN=1 RUN_ARGS="+INIT=program.hex"  # legacy von-Neumann build
 # or, from the repo root:
-make sw-run       # build the C program (sim/sw) + run the sim loading it
+make sw-run       # build the C program (sim/sw) + run the Harvard sim loading it
 ```
+
+`VON_NEUMANN=1` selects the legacy single-AXI-master topology; the
+default (unset) is Harvard.
 
 `make run` compiles `obj_dir/Vsim_top` and runs it. The harness drives
 clk/rst (async active-low reset for a few cycles) and prints **three**
@@ -75,40 +83,91 @@ auto-reapply).
 
 ## Program image
 
-`sim/program.hex` is a `$readmemh` preload (one 32-bit hex word per
-line; the word value IS the instruction encoding). The image is
-**plusarg-selected**: `+INIT=<path>` overrides the default
-`program.hex`, so a C-compiled program can be loaded without clobbering
-the hand-crafted oracle. To compile C → `program.hex`, use the
+The Harvard build loads two `$readmemh` preloads (one 32-bit hex word per
+line; the word value IS the instruction/data word):
+
+- `sim/imem.hex` — instruction image (I-mem, read-only).
+- `sim/dmem.hex` — data image (D-mem, byte-strobed). Empty placeholder
+  for the oracle, which writes its own data at runtime via stores.
+
+The images are **plusarg-selected**: `+IINIT=<path>` / `+DINIT=<path>`
+override the defaults, so a C-compiled image pair can be loaded without
+clobbering the oracle. The legacy von-Neumann build uses a single
+`+INIT=<path>` (default `program.hex`). To compile C → images, use the
 `sim/sw/` flow (see `sim/sw/README.md`).
+
+## Native RAM compliance test (`native_mem_tb/`)
+
+A second, independent harness that does **not** use the CPU — it
+instantiates `native_ram` alone (a read/write D-mem and a read-only
+I-mem) and drives it as a native `mem_req_t`/`mem_rsp_t` master from C++
+(`native_mem_tb.cpp` is a small cycle-accurate BFM). It verifies the
+native slave's protocol compliance in isolation: RVALID registered and
+**held until RREADY** (not a one-cycle pulse — the key fix vs a naive
+read), byte-strobed partial writes, back-to-back writes, single
+outstanding (WREADY low while an unread read response is held), posted
+store commits at the launch handshake, and read-only ignoring writes.
+
+```
+cd sim/native_mem_tb && make run   # prints "N checks, 0 failures" on success
+```
 
 ## AXI4-Lite RAM compliance test (`ram_tb/`)
 
-A second, independent harness that does **not** use the CPU — it
-instantiates `axi4_lite_ram` alone and drives it as an AXI4-Lite master
-from C++ (`ram_tb.cpp` is a small cycle-accurate BFM). It verifies the
-RAM's protocol compliance in isolation (registered/held BVALID + RVALID,
-AW-first / W-first orderings, byte-strobed partial writes, back-to-back
-writes, single outstanding, RVALID held while RREADY delayed), which
-the integrated sim — where the CPU drives the RAM through the bridge +
-arbiter + crossbar — does not isolate.
+A third, independent harness (no CPU) that instantiates `axi4_lite_ram`
+alone and drives it as an AXI4-Lite master from C++ (`ram_tb.cpp`). It
+verifies the AXI RAM's protocol compliance in isolation
+(registered/held BVALID + RVALID, AW-first / W-first orderings,
+byte-strobed partial writes, back-to-back writes, single outstanding).
+`axi4_lite_ram` is now peri-side only in the Harvard build; `ram_tb`
+still covers it.
 
 ```
 cd sim/ram_tb && make run     # prints "N checks, 0 failures" on success
 ```
 
+## Co-sim vs Spike (`cosim/`)
+
+Runs the same C-built ELF on Spike (upstream `riscv-isa-sim`, built locally
+once via `build_spike.sh`, run with `--log-commits`) and on the Verilator
+RTL sim, then `cosim_diff.py` diffs per-retire architectural effects (pc +
+register write). Spike is the golden ISA reference; Zilx is already
+implemented upstream (no patch). The RTL sim writes a per-retire trace to
+`RTL_TRACE` (`sim_main.cpp`); the diff driver skips Spike's boot-ROM stub
+retires and parks both sides at the halt self-loop.
+
+Harvard co-sim needs `.data` at a non-zero VMA: Spike is a single
+unified address space, so `.text`@0 and `.data`@0 would clobber each
+other (the second LOAD segment overwrites the first at vaddr 0). The
+linker places `.data` at DMEM 0x2000 (`sim/sw/link.ld`), and the cosim
+`SPIKE_MEM` (`0x0:0x1000` for code, `0x2000:0xE000` for data+stack)
+matches that split — so Spike's unified space and the RTL's split
+I-mem/D-mem spaces both see the same absolute addresses.
+
+```
+make cosim     # build sw + Spike, run both, diff -> "PASS -- matched N retires"
+```
+
+The Spike source tree, build, install, and per-run logs are gitignored;
+only the harness (`Makefile`, `build_spike.sh`, `cosim_diff.py`) is
+committed.
+
 ## Files
 
-- `sim_top.sv`    — sim wrapper (CPU + RAM + peri tie-off + `mem_probe`
-  generate block exposing a window of `u_ram.mem` to the VCD). Ports only
-  `clk_i`/`rstn_i`/`led_o`; CPU taps stay internal, probed via the
-  Verilator hierarchy.
+- `sim_top.sv`    — sim wrapper (CPU + native I/D-mem or AXI RAM +
+  peri tie-off + `mem_probe` generate block exposing a window of the
+  data RAM to the VCD). Ports only `clk_i`/`rstn_i`/`led_o`; CPU taps
+  stay internal, probed via the Verilator hierarchy.
 - `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs
   incl. writeback values, stall breakdown, park/`MAX_CYC` stop).
-- `program.hex`   — `$readmemh` program preload (RV32I/RVC/M/CSR oracle).
-- `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs).
+- `imem.hex`/`dmem.hex` — Harvard oracle preload (code / data).
+- `program.hex`   — von-Neumann oracle preload (RV32I/RVC/M/CSR).
+- `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs;
+  `VON_NEUMANN=1` selects the legacy build).
+- `native_mem_tb/` — native RAM compliance test.
 - `ram_tb/`       — AXI4-Lite RAM compliance test.
-- `sw/`           — C → program.hex flow (see `sw/README.md`).
+- `cosim/`        — RTL vs Spike golden ISA ref co-sim (see "Co-sim vs Spike").
+- `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
 
 Build artefacts (`obj_dir/`, `sw/build/`, `*.vcd`, `*.log`) are
 gitignored.

@@ -1,5 +1,8 @@
 package rv32_pkg;
 
+    //`define VON_NEUMANN;
+
+
     localparam int unsigned XLEN          = 32;
     localparam int unsigned STRB_WIDTH    = XLEN / 8;
     localparam int unsigned AXI4_LEN      = 32;

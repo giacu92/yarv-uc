@@ -7,30 +7,35 @@ import rv32_pkg::*;
 /**
  * Board-level top for the Tang Nano 20k (Gowin GW2AR-18C).
  *
- * Instantiates the RV32IMAC + Zicsr + Zifencei CPU (which exposes one
- * AXI4-Lite master on its boundary) and routes it through a 1->2
- * AXI4-Lite crossbar to a memory BRAM and an open peripheral bus.
+ * Instantiates the RV32IMAC + Zicsr + Zifencei CPU and wires its memory
+ * ports to on-die BSRAM. Two build topologies, selected by VON_NEUMANN:
  *
- * Topology:
+ * Harvard (default, VON_NEUMANN undefined):
+ *
+ *   rv32imac_zicsr_zifencei
+ *      |  imem (native, read-only)   dmem (native, byte-strobed)   axi_peri
+ *      v                             v                              v
+ *   native_ram (u_imem, RO)      native_ram (u_dmem, RW)        axi_bus_peri
+ *   (instr)                       (data + .rodata + stack)       (open, future UART/GPIO)
+ *
+ *   Fetch and the LSU no longer contend: each has a dedicated native
+ *   BSRAM port. AXI survives only for peripherals (the peri bridge is
+ *   inside the CPU). The board top is pure point-to-point wires — no
+ *   crossbar, no mem/peri decode here (the LSU steers addr[PERI_ADDR_BIT]
+ *   internally).
+ *
+ * Von-Neumann legacy (VON_NEUMANN defined):
  *
  *   rv32imac_zicsr_zifencei
  *      |  bus_axi (master: instr + data + MMIO, von Neumann)
  *      v
- *   axi_bus_cpu (trunk)
- *      |
- *      v
  *   axi4_lite_xbar (1 slave -> 2 masters, addr[PERI_ADDR_BIT] decode)
  *      |  m_mem_axi                       m_peri_axi
  *      v                                  v
- *   axi_bus_mem (trunk)                 axi_bus_peri (trunk, no slave yet)
- *      |                                  |
- *      v                                  v
- *   axi4_lite_ram (instr+data)          (open, future UART/GPIO)
+ *   axi4_lite_ram (instr+data)          axi_bus_peri (open, future UART/GPIO)
  *
- * The native->AXI conversion is owned by the CPU itself (one
- * axi4_lite_master_bridge inside rv32imac_zicsr_zifencei); the board
- * top owns the address-decode topology (the crossbar). The CPU is
- * agnostic to whether an address hits RAM or a peripheral.
+ *   Fetch + LSU share one AXI master through a mem_arbiter inside the
+ *   CPU; the board top owns the mem/peri address-decode (the crossbar).
  *
  * Pin assignments are in impl/pnr/rv32imac_Zicsr_Zifencei.cst.
  *
@@ -57,19 +62,20 @@ module top_module (
     //   PIN10, single-ended LVCMOS33)
     //
     // Internal CPU clock (rPLL CLKOUT):
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 10 / 5 = 50 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=9 -> FBDIV=10; ODIV_SEL=16
-    //   only sets the VCO = 25*10*16/5 = 800 MHz, it does NOT divide
-    //   CLKOUT). Period = 20 ns. Constrained in the SDC.
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 8 / 5 = 40 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=7 -> FBDIV=8; ODIV_SEL=16
+    //   only sets the VCO = 25*8*16/5 = 640 MHz, it does NOT divide
+    //   CLKOUT). Period = 25 ns. Constrained in the SDC.
     //
-    // Target lowered 100 -> 50 MHz: the execute stage + regfile (BSRAM)
-    // combinational depth does not meet 100 MHz, and Fmax is not the
-    // current goal. 50 MHz gives margin below the ~54 MHz BSRAM cap.
+    // Target lowered 50 -> 40 MHz: the route-dominated execute/ALU/decode
+    // critical path does not leave comfortable margin at 50 MHz (~0.06ns
+    // slack, run-to-run noise), so the target is backed off to 40 MHz for
+    // a safer, repeatable closure.
     //
     // VCO must stay in 500-1250 MHz (GowinSynthesis EX0311 range for this
-    // rPLL). CLKOUT=FCLKIN*FBDIV/IDIV is independent of ODIV, so to halve
-    // CLKOUT 100->50 while keeping VCO at the proven 800 MHz, FBDIV halves
-    // (20->10) AND ODIV doubles (8->16): VCO = 25*10*16/5 = 800 MHz.
+    // rPLL). CLKOUT=FCLKIN*FBDIV/IDIV is independent of ODIV. Keeping IDIV=5
+    // and ODIV=16, FBDIV=8 gives CLKOUT=40 MHz with VCO=25*8*16/5=640 MHz
+    // (comfortably inside the 500-1250 band).
     // -----------------------------------------------------------------
 
     wire clk_core;
@@ -78,8 +84,8 @@ module top_module (
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("25"),
         .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
-        .FBDIV_SEL(9),     // -> CLKOUT = 50 MHz (range: 3.125-600 MHz)
-        .ODIV_SEL (16)     // -> VCO = 800 MHz (range: 500-1250 MHz)
+        .FBDIV_SEL(7),     // -> CLKOUT = 40 MHz (range: 3.125-600 MHz)
+        .ODIV_SEL (16)     // -> VCO = 640 MHz (range: 500-1250 MHz)
     ) pll (
         .CLKOUTP (),
         .CLKOUTD (),
@@ -94,7 +100,7 @@ module top_module (
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
         .CLKIN   (clk_i),     // 25 MHz
-        .CLKOUT  (clk_core),  // 50 MHz
+        .CLKOUT  (clk_core),  // 40 MHz
         .LOCK    (pll_lock)
     );
 
@@ -125,43 +131,111 @@ module top_module (
     // -----------------------------------------------------------------
     // AXI4-Lite buses (trunk modport)
     //
-    //   axi_bus_cpu  : CPU master -> crossbar slave
-    //   axi_bus_mem  : crossbar mem master -> RAM slave
-    //   axi_bus_peri : crossbar peri master -> (future UART/GPIO slave)
+    //   Harvard     : axi_bus_peri only (CPU peri master -> open slave).
+    //   Von-Neumann : axi_bus_cpu (CPU master -> crossbar), axi_bus_mem
+    //                 (crossbar mem master -> RAM), axi_bus_peri (open).
     // -----------------------------------------------------------------
+`ifdef VON_NEUMANN
     axi4_lite_if axi_bus_cpu ();
     axi4_lite_if axi_bus_mem ();
+`endif
     axi4_lite_if axi_bus_peri ();
 
-    // Single clock domain: the whole fabric (CPU bridge, crossbar, the
-    // buses, and the RAM slave) runs on clk_core / rstn_core. There
-    // is NO clock-domain crossing — clk_i (25 MHz) only feeds the rPLL,
-    // and rstn_i is the async board reset that feeds the synchronizer.
-    assign axi_bus_cpu.aclk     = clk_core;
-    assign axi_bus_cpu.aresetn  = rstn_core;
-    assign axi_bus_mem.aclk     = clk_core;
-    assign axi_bus_mem.aresetn  = rstn_core;
+    // Single clock domain: the whole fabric (CPU bridge, memories, the
+    // buses) runs on clk_core / rstn_core. There is NO clock-domain
+    // crossing — clk_i (25 MHz) only feeds the rPLL, and rstn_i is the
+    // async board reset that feeds the synchronizer.
+`ifdef VON_NEUMANN
+    assign axi_bus_cpu.aclk    = clk_core;
+    assign axi_bus_cpu.aresetn = rstn_core;
+    assign axi_bus_mem.aclk    = clk_core;
+    assign axi_bus_mem.aresetn = rstn_core;
+`endif
     assign axi_bus_peri.aclk    = clk_core;
     assign axi_bus_peri.aresetn = rstn_core;
 
-    // Debug taps: decode or execute stage stall.
+    // Debug tap: decode or execute stage stall.
     wire dbg_stall;
 
     // -----------------------------------------------------------------
+    // Native memory ports (Harvard). Fetch and the LSU each get a
+    // dedicated BSRAM; the LSU steers RAM vs peri on addr[PERI_ADDR_BIT]
+    // itself, so the board top needs no crossbar for memory.
+    // -----------------------------------------------------------------
+`ifndef VON_NEUMANN
+    mem_req_t imem_req;
+    mem_rsp_t imem_rsp;
+    mem_req_t dmem_req;
+    mem_rsp_t dmem_rsp;
+`endif
+
+    // -----------------------------------------------------------------
     // CPU. Functional ports only — no debug crosses the CPU boundary
-    // (the per-stage taps are internal; the sim probes them via the
-    // Verilator hierarchy). The fetch stage stays observable to
-    // synthesis through its real output: the bus to the crossbar / RAM
-    // below.
+    // (the per-stage taps are internal; the simulation probes them via
+    // the Verilator hierarchy).
     // -----------------------------------------------------------------
     rv32imac_zicsr_zifencei u_cpu (
         .clk_i      (clk_core),
         .rstn_i     (rstn_core),
         .boot_addr_i(32'h0000_0000),
-        .bus_axi    (axi_bus_cpu.master),
-        .dbg_stall_o(dbg_stall)
+        .dbg_stall_o(dbg_stall),
+`ifdef VON_NEUMANN
+        .bus_axi    (axi_bus_cpu.master)
+`else
+        .axi_peri   (axi_bus_peri.master),
+        .imem_req_o (imem_req),
+        .imem_rsp_i (imem_rsp),
+        .dmem_req_o (dmem_req),
+        .dmem_rsp_i (dmem_rsp)
+`endif
     );
 
+`ifndef VON_NEUMANN
+    // -----------------------------------------------------------------
+    // Instruction memory (read-only). Fetch's dedicated port — no
+    // contention with the LSU. Preloaded with firmware via INIT_FILE
+    // (see the parameter comment below); simulation preloads via
+    // $readmemh in sim_top.
+    // -----------------------------------------------------------------
+    native_ram #(
+        .ADDR_W    (16),             // 64 KiB
+        .DATA_WIDTH(32),
+        .READ_ONLY (1),
+        // A read-only I-mem with no init and no write port is a zero-ROM:
+        // Gowin folds every read to constant 0, the fetch stream becomes
+        // all-illegal, and the whole pipeline (regfile/csr/alu/execute)
+        // gets swept as dead code -- only fetch+decode survive because
+        // they feed dbg_stall_o. So the I-mem MUST carry firmware for any
+        // meaningful (or even timing-representative) synthesis. This is
+        // the timing-closure / bring-up firmware (the sim oracle, a
+        // self-contained program that stores its own .data at runtime, so
+        // no D-mem preload is needed). A real product bitstream re-points
+        // this at the application firmware. Path is relative to the Gowin
+        // project dir (repo root).
+        .INIT_FILE ("sim/imem.hex")
+    ) u_imem (
+        .clk_i    (clk_core),
+        .rstn_i   (rstn_core),
+        .mem_req_i(imem_req),
+        .mem_rsp_o(imem_rsp)
+    );
+
+    // -----------------------------------------------------------------
+    // Data memory (byte-strobed read/write). Holds .rodata/.data/.bss
+    // and the stack. LSU's dedicated port.
+    // -----------------------------------------------------------------
+    native_ram #(
+        .ADDR_W    (16),  // 64 KiB
+        .DATA_WIDTH(32),
+        .READ_ONLY (0),
+        .INIT_FILE ("")
+    ) u_dmem (
+        .clk_i    (clk_core),
+        .rstn_i   (rstn_core),
+        .mem_req_i(dmem_req),
+        .mem_rsp_o(dmem_rsp)
+    );
+`else
     // -----------------------------------------------------------------
     // 1->2 AXI4-Lite crossbar: splits the CPU bus into a memory region
     // and a peripheral region by address (addr[PERI_ADDR_BIT]=1 -> peri,
@@ -189,6 +263,7 @@ module top_module (
         .rstn_i(rstn_core),
         .axi   (axi_bus_mem.slave)
     );
+`endif
 
     // -----------------------------------------------------------------
     // Peripheral bus: reserved for memory-mapped peripherals (UART, GPIO,

@@ -108,8 +108,8 @@ module decode_stage (
     // (ex_wb_addr_i) that the instruction being decoded reads, decode
     // bubbles the D/E register and holds F/D one cycle so the reg-file
     // async read repeats after the writeback commits (see raw_haz below).
-    input wire       ex_wb_en_i,
-    input wire [4:0] ex_wb_addr_i,
+    input wire            ex_wb_en_i,
+    input wire [     4:0] ex_wb_addr_i,
     // Execute writeback data: same cycle as ex_wb_en_i/ex_wb_addr_i,
     // qualified by result_ready (valid on ALU, DIV-done, or load-done).
     input wire [XLEN-1:0] ex_wb_data_i,
@@ -510,7 +510,7 @@ module decode_stage (
     //assign raw_haz = decoded_valid & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
     //    ((rs1_addr_dec != 5'd0 & rs1_addr_dec == ex_wb_addr_i) |
     //     (rs2_addr_dec != 5'd0 & rs2_addr_dec == ex_wb_addr_i));
-    
+
     // =================================================================
     // RAW forwarding (execute -> decode)
     //
@@ -533,13 +533,13 @@ module decode_stage (
     // =================================================================
     // is-compressed of the fetched word, derived from the instruction
     // word itself (fetch no longer exports it as a separate port).
-    wire         fe_is_compressed = (fe_instr_i[1:0] != 2'b11);
+    wire fe_is_compressed = (fe_instr_i[1:0] != 2'b11);
 
     logic [31:0] src_instr32;
     logic [31:0] src_pc;
-    logic        src_is_compressed;
-    logic        buffer_upper;
-    logic        decoded_valid;
+    logic src_is_compressed;
+    logic buffer_upper;
+    logic decoded_valid;
 
     // -----------------------------------------------------------------
     // Spanning-stitch predicates.
@@ -553,25 +553,25 @@ module decode_stage (
     // low half). So the stitch needs NO new flop: these are all wires
     // over flops + inputs.
     // -----------------------------------------------------------------
-    wire         hold_is_span = (hold_word_q[1:0] == 2'b11);  // stashed low half of a 32-bit instr
-    wire         is_hold = hold_q;
-    wire         is_hold_plain = hold_q && !hold_is_span;  // compressed upper half ready
-    wire         span_pending = hold_q && hold_is_span;  // spanning low half held
-    wire         span_complete = span_pending && fe_valid_i;  // upper-half word arrived -> stitch
-    wire         span_wait = span_pending && !fe_valid_i;  // waiting for the upper-half word
-    wire         target_upper = !hold_q && fe_valid_i && fe_pc_i[1];  // redirect to odd half
-    wire         target_span = target_upper && (fe_instr_i[17:16] == 2'b11);  // 32-bit at target
+    wire hold_is_span = (hold_word_q[1:0] == 2'b11);  // stashed low half of a 32-bit instr
+    wire is_hold = hold_q;
+    wire is_hold_plain = hold_q && !hold_is_span;  // compressed upper half ready
+    wire span_pending = hold_q && hold_is_span;  // spanning low half held
+    wire span_complete = span_pending && fe_valid_i;  // upper-half word arrived -> stitch
+    wire span_wait = span_pending && !fe_valid_i;  // waiting for the upper-half word
+    wire target_upper = !hold_q && fe_valid_i && fe_pc_i[1];  // redirect to odd half
+    wire target_span = target_upper && (fe_instr_i[17:16] == 2'b11);  // 32-bit at target
 
-    logic [ 4:0] rs1_addr_dec;
-    logic [ 4:0] rs2_addr_dec;
+    logic [4:0] rs1_addr_dec;
+    logic [4:0] rs2_addr_dec;
     logic [11:0] csr_addr_dec;
 
     // ---- Field extraction ----
-    logic [ 6:0] opcode;
-    logic [ 2:0] funct3;
-    logic [ 6:0] funct7;
-    logic        funct7b5;  // funct7[5] — SUB/SRA, M-ext
-    logic [ 4:0] funct5;  // AMO/Zilx mode (instr[31:27])
+    logic [6:0] opcode;
+    logic [2:0] funct3;
+    logic [6:0] funct7;
+    logic funct7b5;  // funct7[5] — SUB/SRA, M-ext
+    logic [4:0] funct5;  // AMO/Zilx mode (instr[31:27])
     logic aq, rl;  // AMO ordering bits (instr[26:25]) — must be 0 for Zilx
     logic [4:0] rd_field, rs1_field, rs2_field;
     logic is_m_ext;
@@ -1108,8 +1108,8 @@ module decode_stage (
         de_d.is_compressed = src_is_compressed;
         de_d.rs1_addr      = rs1_addr_dec;
         de_d.rs2_addr      = rs2_addr_dec;
-//        de_d.rs1_data      = rs1_data_i;
-//        de_d.rs2_data      = rs2_data_i;
+        //        de_d.rs1_data      = rs1_data_i;
+        //        de_d.rs2_data      = rs2_data_i;
         de_d.rs1_data      = rs1_fwd;
         de_d.rs2_data      = rs2_fwd;
         de_d.imm           = imm;
@@ -1154,11 +1154,11 @@ module decode_stage (
 
         if (flush_i) begin
             hold_d = 1'b0;  // redirect: drop any stashed half
-//        end else if (raw_haz || stall_i) begin
-//            // RAW interlock / DIV-REM stall: preserve the stash (the
-//            // consumer re-runs next cycle). raw_haz cannot fire during
-//            // span_wait/target_span (decoded_valid=0), but is harmless.
-            end else if (stall_i) begin
+            //        end else if (raw_haz || stall_i) begin
+            //            // RAW interlock / DIV-REM stall: preserve the stash (the
+            //            // consumer re-runs next cycle). raw_haz cannot fire during
+            //            // span_wait/target_span (decoded_valid=0), but is harmless.
+        end else if (stall_i) begin
             // DIV-REM / mem-wait stall: preserve the stash.
         end else if (span_wait) begin
             // Spanning low half held, upper-half word not here yet:
@@ -1201,10 +1201,10 @@ module decode_stage (
     always_comb begin
         if (flush_i) begin
             de_next = '0;
-//      end else if (raw_haz) begin
-//          de_next = '0;  // RAW interlock: bubble D/E (execute gets an invalid slot)
+            //      end else if (raw_haz) begin
+            //          de_next = '0;  // RAW interlock: bubble D/E (execute gets an invalid slot)
         end else if (stall_i) begin
-//            de_next = de_q;  // DIV/REM stall: hold
+            //            de_next = de_q;  // DIV/REM stall: hold
             de_next = de_q;  // DIV/REM / mem-wait stall: hold
         end else begin
             de_next = de_d;
@@ -1223,8 +1223,8 @@ module decode_stage (
     // =================================================================
     wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
     wire backpressure_stall = stall_i;
-//  wire raw_stall = raw_haz;
-//  assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
+    //  wire raw_stall = raw_haz;
+    //  assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
     assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
 
     // Register-read addresses drive the reg file.
