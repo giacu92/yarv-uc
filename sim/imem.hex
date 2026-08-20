@@ -19,36 +19,36 @@
 // One bubble (no wb, no ex) precedes each hazard consumer (a0, t4, the
 // bne-resolve path, a4).
 
-0x00f00293  // 0x00: addi   t0,     zero, 15          t0 = 15
-0x34129073  // 0x04: csrrw  zero,   mepc, t0          mepc = t0 (CSR warm-up)
+00f00293  // 0x00: addi   t0,     zero, 15          t0 = 15
+34129073  // 0x04: csrrw  zero,   mepc, t0          mepc = t0 (CSR warm-up)
 
-0x00000013  // nop
-0x00000013  // nop
-0x00000013  // nop
-0x00000013  // nop
-0x00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
+00000013  // nop
 
-0x00f00293  // 0x00: addi   t0, zero, 15          t0 = 15
-0x04d00313  // 0x04: addi   t1, zero, 77          t1 = 77
-0x00628533  // 0x08: add    a0, t0, t1            RAW on t1 -> a0 = 92
-0x00300393  // 0x0c: addi   t2, zero, 3           t2 = 3
-0x0272ce33  // 0x10: div    t3, t0, t2            RAW on t2 -> t3 = 15/3 = 5
-0x001e0e93  // 0x14: addi   t4, t3, 1             RAW on div t3 -> t4 = 6
-0x00100f13  // 0x18: addi   t5, zero, 1           t5 = 1
-0x000f1463  // 0x1c: bne    t5, zero, +8          RAW on t5 -> taken, skip 0x20
-0x04200593  // 0x20: addi   a1, zero, 0x42        not-taken marker (skipped)
-0x00900f93  // 0x24: addi   t6, zero, 9           taken-path marker -> t6 = 9
+00f00293  // 0x00: addi   t0, zero, 15          t0 = 15
+04d00313  // 0x04: addi   t1, zero, 77          t1 = 77
+00628533  // 0x08: add    a0, t0, t1            RAW on t1 -> a0 = 92
+00300393  // 0x0c: addi   t2, zero, 3           t2 = 3
+0272ce33  // 0x10: div    t3, t0, t2            RAW on t2 -> t3 = 15/3 = 5
+001e0e93  // 0x14: addi   t4, t3, 1             RAW on div t3 -> t4 = 6
+00100f13  // 0x18: addi   t5, zero, 1           t5 = 1
+000f1463  // 0x1c: bne    t5, zero, +8          RAW on t5 -> taken, skip 0x20
+04200593  // 0x20: addi   a1, zero, 0x42        not-taken marker (skipped)
+00900f93  // 0x24: addi   t6, zero, 9           taken-path marker -> t6 = 9
 // ---- LSU (data @ 0x100 in D-mem, written then read back) ----
-0x05500613  // 0x28: addi   a2, zero, 0x55        a2 = 0x55
-0x10c02023  // 0x2c: sw     a2, 0x100(zero)       dmem[0x100] = 0x00000055
-0x10002683  // 0x30: lw     a3, 0x100(zero)       a3 = 0x55 (load-use next)
-0x00168713  // 0x34: addi   a4, a3, 1             RAW on load a3 -> a4 = 0x56
-0x0ab00793  // 0x38: addi   a5, zero, 0xAB        a5 = 0xAB
-0x10f00023  // 0x3c: sb     a5, 0x100(zero)       dmem[0x100] byte0 = 0xAB
-0x10000803  // 0x40: lb     a6, 0x100(zero)       a6 = 0xFFFFFFAB (sign-ext)
-0x10004883  // 0x44: lbu    a7, 0x100(zero)       a7 = 0x000000AB (zero-ext)
-0x00008437  // 0x48: lui    s0, 0x8               s0 = 0x00008000
-0x10801123  // 0x4c: sh     s0, 0x102(zero)       dmem[0x102] halfword = 0x8000
-0x10201483  // 0x50: lh     s1, 0x102(zero)       s1 = 0xFFFF8000 (sign-ext)
-0x10205403  // 0x54: lhu    s0, 0x102(zero)       s0 = 0x00008000 (zero-ext)
-0x0000006f  // 0x58: jal    x0, 0                 self-loop halt
+05500613  // 0x28: addi   a2, zero, 0x55        a2 = 0x55
+10c02023  // 0x2c: sw     a2, 0x100(zero)       dmem[0x100] = 0x00000055
+10002683  // 0x30: lw     a3, 0x100(zero)       a3 = 0x55 (load-use next)
+00168713  // 0x34: addi   a4, a3, 1             RAW on load a3 -> a4 = 0x56
+0ab00793  // 0x38: addi   a5, zero, 0xAB        a5 = 0xAB
+10f00023  // 0x3c: sb     a5, 0x100(zero)       dmem[0x100] byte0 = 0xAB
+10000803  // 0x40: lb     a6, 0x100(zero)       a6 = 0xFFFFFFAB (sign-ext)
+10004883  // 0x44: lbu    a7, 0x100(zero)       a7 = 0x000000AB (zero-ext)
+00008437  // 0x48: lui    s0, 0x8               s0 = 0x00008000
+10801123  // 0x4c: sh     s0, 0x102(zero)       dmem[0x102] halfword = 0x8000
+10201483  // 0x50: lh     s1, 0x102(zero)       s1 = 0xFFFF8000 (sign-ext)
+10205403  // 0x54: lhu    s0, 0x102(zero)       s0 = 0x00008000 (zero-ext)
+0000006f  // 0x58: jal    x0, 0                 self-loop halt

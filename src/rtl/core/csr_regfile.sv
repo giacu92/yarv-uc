@@ -42,10 +42,12 @@ module csr_regfile (
     input wire            csr_wren_i,
     input wire [XLEN-1:0] csr_data_i,
 
-    // Instruction stats
-    input wire instr_retire_i,  // instruction retired (commit)
-    input wire instr_branch_i,  // instruction retired was a branch
-    input wire instr_pc_i       // instruction retired was a jump
+    // Instruction stats (retired-instruction inputs; reserved for future
+    // mhpmcounter / branch-prediction counters — only instr_retire_i is
+    // consumed so far, by minstret).
+    input wire            instr_retire_i,  // instruction retired (commit)
+    input wire            instr_branch_i,  // retired instruction was a branch
+    input wire [XLEN-1:0] instr_pc_i       // retired instruction's PC
 );
     // Index map: implemented CSRs packed into a 9-entry array. The case
     // statements below translate the 12-bit CSR address to/from this index.
