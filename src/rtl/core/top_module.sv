@@ -180,13 +180,17 @@ module top_module (
         .boot_addr_i(32'h0000_0000),
         .dbg_stall_o(dbg_stall),
 `ifdef VON_NEUMANN
-        .bus_axi    (axi_bus_cpu.master)
+        .bus_axi    (axi_bus_cpu.master),
+        // No MSIP slave on the von-Neumann board top (the peri trunk is
+        // open); tie the machine software interrupt low.
+        .msip_i     (1'b0)
 `else
         .axi_peri   (axi_bus_peri.master),
         .imem_req_o (imem_req),
         .imem_rsp_i (imem_rsp),
         .dmem_req_o (dmem_req),
-        .dmem_rsp_i (dmem_rsp)
+        .dmem_rsp_i (dmem_rsp),
+        .msip_i     (msip)
 `endif
     );
 
@@ -266,21 +270,22 @@ module top_module (
 `endif
 
     // -----------------------------------------------------------------
-    // Peripheral bus: reserved for memory-mapped peripherals (UART, GPIO,
-    // ...). No slave instantiated yet — the trunk is left open on the
-    // slave side (tied off) so a peripheral drops in without rewiring.
-    // NOTE: with no slave, awready/arready are 0, so a peripheral
-    // access would stall the LSU until a real slave is added. No code
-    // should target the peri region until then.
+    // Peripheral bus: the MSIP MMIO slave (machine software interrupt).
+    // A write of bit[0] to MSIP_PERI_ADDR (peri base 0x1000_0000) sets /
+    // clears the machine software interrupt pending bit; the msip_o
+    // output feeds the CPU's msip_i (mip.MSIP). It is the only peri slave
+    // on axi_bus_peri for now (the trunk was previously tied off; a UART /
+    // GPIO drops in alongside by adding an address-decoded slave mux
+    // later). No tieoff remains — the slave drives every handshake line.
     // -----------------------------------------------------------------
-    assign axi_bus_peri.awready = 1'b0;
-    assign axi_bus_peri.wready  = 1'b0;
-    assign axi_bus_peri.bvalid  = 1'b0;
-    assign axi_bus_peri.bresp   = 2'b00;
-    assign axi_bus_peri.arready = 1'b0;
-    assign axi_bus_peri.rvalid  = 1'b0;
-    assign axi_bus_peri.rdata   = '0;
-    assign axi_bus_peri.rresp   = 2'b00;
+    wire msip;
+
+    msip_peri u_msip (
+        .clk_i (clk_core),
+        .rstn_i(rstn_core),
+        .axi   (axi_bus_peri.slave),
+        .msip_o(msip)
+    );
 
     // -----------------------------------------------------------------
     // Debug LEDs: 

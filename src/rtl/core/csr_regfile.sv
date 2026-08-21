@@ -42,12 +42,39 @@ module csr_regfile (
     input wire            csr_wren_i,
     input wire [XLEN-1:0] csr_data_i,
 
-    // Instruction stats (retired-instruction inputs; reserved for future
-    // mhpmcounter / branch-prediction counters — only instr_retire_i is
-    // consumed so far, by minstret).
-    input wire            instr_retire_i,  // instruction retired (commit)
-    input wire            instr_branch_i,  // retired instruction was a branch
-    input wire [XLEN-1:0] instr_pc_i       // retired instruction's PC
+    // Trap-write bundle (from the trap unit, one cycle, each a distinct
+    // CSR). Separate from the RMW port so a trap entry can write mepc /
+    // mcause / mtval / mstatus in the same cycle a csrrw would have used
+    // the single RMW port (trap suppresses the RMW, so they are mutually
+    // exclusive — but the trap port wins on conflict).
+    input wire            we_mepc_i,
+    input wire [XLEN-1:0] d_mepc_i,
+    input wire            we_mcause_i,
+    input wire [XLEN-1:0] d_mcause_i,
+    input wire            we_mtval_i,
+    input wire [XLEN-1:0] d_mtval_i,
+    input wire            we_mstatus_i,
+    input wire [XLEN-1:0] d_mstatus_i,
+
+    // Machine software interrupt pending bit, driven by the MSIP MMIO
+    // slave (a write of bit[0] to MSIP_PERI_ADDR sets/clears mip.MSIP).
+    // mip.MSIP is read-only from CSR writes (SW cannot clear it by
+    // writing mip); the slave is the only source.
+    input wire msip_i,
+
+    // Combinational CSR taps for the trap unit (mtvec / mepc redirect,
+    // mstatus MIE/MPIE, mip / mie for interrupt pending). Separate
+    // outputs so the trap path does not steal the async RMW read.
+    output wire [XLEN-1:0] mtvec_o,
+    output wire [XLEN-1:0] mepc_o,
+    output wire [XLEN-1:0] mstatus_o,
+    output wire [XLEN-1:0] mip_o,
+    output wire [XLEN-1:0] mie_o,
+
+    // Instruction retire stat (consumed by minstret). Future
+    // mhpmcounter / branch-prediction counters would add their own
+    // retire-side inputs here when implemented.
+    input wire            instr_retire_i  // instruction retired (commit)
 );
     // Index map: implemented CSRs packed into a 9-entry array. The case
     // statements below translate the 12-bit CSR address to/from this index.
@@ -88,46 +115,91 @@ module csr_regfile (
             end
         end else begin
 
-            // Update MCYCLE and MINSTRET on every cycle (increment by 1). These are
-            // architected to be incremented every cycle, so they are not gated by
-            // csr_wren_i. The other CSRs are only updated on a CSR write (csr_wren_i).
+            // Free-running counters: incremented every cycle (architected),
+            // not gated by csr_wren_i. A CSR write (below) overrides the
+            // increment the same cycle (last nonblocking assignment wins).
             regs[9]  <= regs[9] + 1;  // MCYCLE
             regs[10] <= instr_retire_i ? regs[10] + 1 : regs[10];  // MINSTRET
 
-            if (csr_wren_i) begin
-                case (csr_addr_i)
-                    CSR_ADDR_MSTATUS:  regs[0] <= csr_data_i;
-                    CSR_ADDR_MISA:     ;  // misa is read-only here (ignore writes)
-                    CSR_ADDR_MIE:      regs[2] <= csr_data_i;
-                    CSR_ADDR_MTVEC:    regs[3] <= csr_data_i;
-                    CSR_ADDR_MSCRATCH: regs[4] <= csr_data_i;
-                    CSR_ADDR_MEPC:     regs[5] <= csr_data_i;
-                    CSR_ADDR_MCAUSE:   regs[6] <= csr_data_i;
-                    CSR_ADDR_MTVAL:    regs[7] <= csr_data_i;
-                    CSR_ADDR_MIP:      regs[8] <= csr_data_i;
-                    CSR_ADDR_MCYCLE:   regs[9] <= csr_data_i;
-                    CSR_ADDR_MINSTRET: regs[10] <= csr_data_i;
-                    default:           ;  // Unimplemented CSRs ignore writes
-                endcase
+            // --- Trap-write bundle (one cycle, each a distinct CSR).
+            // Priority over the RMW port: a trap suppresses the RMW this
+            // cycle, so they never collide, but the trap port wins anyway. ---
+            if (we_mstatus_i) regs[0] <= d_mstatus_i;
+            if (we_mepc_i) regs[5] <= d_mepc_i;
+            if (we_mcause_i) regs[6] <= d_mcause_i;
+            if (we_mtval_i) regs[7] <= d_mtval_i;
+
+            // --- mstatus RMW (only if no trap write). Only M-mode is
+            // implemented, so MPP is forced to 00 on any write; the other
+            // bits are taken raw (M-mode code is trusted). ---
+            if (!we_mstatus_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MSTATUS))
+                regs[0] <= {csr_data_i[31:13], 2'b00, csr_data_i[10:0]};
+
+            // --- mtvec RMW: BASE in [31:2] raw; MODE masked to direct /
+            // vectored only ({1'b0, bit[0]} — bit[1] cleared, other modes
+            // collapse to direct). ---
+            if (csr_wren_i && (csr_addr_i == CSR_ADDR_MTVEC))
+                regs[3] <= {csr_data_i[31:2], 1'b0, csr_data_i[0]};
+
+            // --- mie RMW: raw (MSIE/MTIE/MEIE are writable storage; no
+            // interrupt source for MTIE/MEIE yet). ---
+            if (csr_wren_i && (csr_addr_i == CSR_ADDR_MIE)) regs[2] <= csr_data_i;
+
+            // --- mscratch RMW: raw. ---
+            if (csr_wren_i && (csr_addr_i == CSR_ADDR_MSCRATCH)) regs[4] <= csr_data_i;
+
+            // --- mepc / mcause / mtval RMW: raw (trap write above wins). ---
+            if (!we_mepc_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MEPC)) regs[5] <= csr_data_i;
+            if (!we_mcause_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MCAUSE))
+                regs[6] <= csr_data_i;
+            if (!we_mtval_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MTVAL)) regs[7] <= csr_data_i;
+
+            // --- mip: MSIP (bit3) tracks msip_i every cycle (read-only
+            // from CSR write — SW clears it via the MMIO slave, not by
+            // writing mip); MTIP(7)/MEIP(11) hardwired 0 (no timer / ext
+            // source yet). The other bits are RMW-writable. ---
+            regs[8][3]  <= msip_i;
+            regs[8][7]  <= 1'b0;
+            regs[8][11] <= 1'b0;
+            if (csr_wren_i && (csr_addr_i == CSR_ADDR_MIP)) begin
+                regs[8][2:0]   <= csr_data_i[2:0];
+                regs[8][6:4]   <= csr_data_i[6:4];
+                regs[8][10:8]  <= csr_data_i[10:8];
+                regs[8][31:12] <= csr_data_i[31:12];
             end
+
+            // --- mcycle / minstret RMW (overrides the increment above). ---
+            if (csr_wren_i && (csr_addr_i == CSR_ADDR_MCYCLE)) regs[9] <= csr_data_i;
+            if (csr_wren_i && (csr_addr_i == CSR_ADDR_MINSTRET)) regs[10] <= csr_data_i;
+            // misa is read-only here: ignore writes.
         end
     end
 
     assign csr_data_o = csr_rdata;
 
+    // Trap-unit taps (combinational). mip_o reflects the live msip_i /
+    // hardwired-zero bits via regs[8] (updated every cycle above).
+    assign mtvec_o    = regs[3];
+    assign mepc_o     = regs[5];
+    assign mstatus_o  = regs[0];
+    assign mip_o      = regs[8];
+    assign mie_o      = regs[2];
+
 `ifdef VERILATOR
     // Sim-only: mirror the reset values at time 0 so waveforms/logs do not
     // show X before the first reset edge. Matches the sync reset above.
     initial begin
-        regs[0] = '0;
-        regs[1] = MISA_RESET;
-        regs[2] = '0;
-        regs[3] = '0;
-        regs[4] = '0;
-        regs[5] = '0;
-        regs[6] = '0;
-        regs[7] = '0;
-        regs[8] = '0;
+        regs[0]  = '0;
+        regs[1]  = MISA_RESET;
+        regs[2]  = '0;
+        regs[3]  = '0;
+        regs[4]  = '0;
+        regs[5]  = '0;
+        regs[6]  = '0;
+        regs[7]  = '0;
+        regs[8]  = '0;
+        regs[9]  = '0;
+        regs[10] = '0;
     end
 `endif
 

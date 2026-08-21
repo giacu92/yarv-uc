@@ -76,6 +76,27 @@ module execute_stage (
     output wire [XLEN-1:0] csr_wdata_o,  // write CSR value (new, RMW result)
     output wire            csr_wren_o,   // CSR write enable (execute-qualified)
 
+    // Trap unit interface (trap unit lives at the CPU top, a peer of the
+    // execute stage). Execute = "exception logic": it detects the triggers
+    // and resolves cause/tval/pc from de_i + the EA, and exports them; the
+    // trap unit consumes them, drives the CSR trap-write bundle + the fetch
+    // redirect, and reports the pending+enabled interrupt back here.
+    //
+    // A pending+enabled machine software interrupt (from the trap unit's
+    // read of mstatus.MIE / mip.MSIP / mie.MSIE).
+    input wire            int_pending_i,
+    // The trap unit's resolved fetch target (mtvec vector for traps /
+    // interrupts, mepc for mret). Merged with the normal branch redirect.
+    input wire [XLEN-1:0] trap_redirect_addr_i,
+
+    // Triggers + payload to the trap unit.
+    output wire            sync_trap_req_o,   // sync exception entry
+    output wire            mret_req_o,        // mret return
+    output wire            take_interrupt_o,  // async interrupt entry
+    output wire [XLEN-1:0] trap_cause_o,      // mcause value
+    output wire [XLEN-1:0] trap_tval_o,       // mtval value
+    output wire [XLEN-1:0] trap_pc_o,         // mepc value
+
     // Back-pressure from a future downstream stage (tied 0 now).
     input wire stall_i,
 
@@ -195,7 +216,8 @@ module execute_stage (
     ex_state_e ex_state_q, ex_state_d;
 
     logic alu_start;
-    assign alu_start = de_i.valid & is_div_op & (ex_state_q == EX_IDLE) & ~stall_i;
+    assign
+        alu_start = de_i.valid & is_div_op & (ex_state_q == EX_IDLE) & ~freeze & ~trap_redirect_req;
 
     logic            alu_result_valid;
     logic [XLEN-1:0] alu_result;
@@ -205,8 +227,8 @@ module execute_stage (
     // idle (single-outstanding), so the launch handshakes the same cycle
     // and the FSM moves to EX_MEM_WAIT.
     logic            mem_launch;
-    assign
-        mem_launch = de_i.valid & is_mem_op & ~mem_misaligned & (ex_state_q == EX_IDLE) & ~stall_i;
+    assign mem_launch = de_i.valid & is_mem_op & ~mem_misaligned &
+        (ex_state_q == EX_IDLE) & ~freeze & ~trap_redirect_req;
 
     // Effective address selects the LSU target: D-mem (addr[PERI_ADDR_BIT]=0)
     // or the peri bridge (=1). alu_result (the EA) is held stable through
@@ -256,7 +278,8 @@ module execute_stage (
     // so decode advances (mem_running falls away the cycle mem_done=1).
     logic mem_running;
     assign mem_running = (ex_state_q == EX_MEM_WAIT) & ~mem_done;
-    assign stall_o = alu_start | div_running | (mem_launch & ~store_done) | mem_running | stall_i;
+    assign stall_o = alu_start | div_running | (mem_launch & ~store_done) | mem_running | stall_i |
+        wfi_stall;
 
     always_comb begin
         ex_state_d = ex_state_q;
@@ -286,6 +309,98 @@ module execute_stage (
         .result_valid_o(alu_result_valid),
         .result_o      (alu_result)
     );
+
+    // =================================================================
+    // Trap / interrupt / mret (precise, at the commit point).
+    //
+    // Sync traps (illegal / ecall / ebreak / misaligned) fire in EX_IDLE the
+    // cycle the faulting op would retire; the op commits as a trap (ex_valid
+    // pulses, counts to minstret). mret commits and redirects to mepc. A
+    // pending machine software interrupt is taken instead of retiring the
+    // next normal instruction (suppressed, re-runs after mret) OR on a WFI
+    // wake; it does NOT count as a retire. All three flush decode (kill
+    // younger in-flight) and redirect fetch via branch_valid_o / branch_addr_o
+    // (the trap unit's redirect merges with the normal branch redirect).
+    //
+    // Priority: sync trap > interrupt > mret > normal branch. Traps/mret/
+    // interrupt never coincide with a normal branch (a branch is squashed by
+    // take_interrupt; an illegal branch already trapped at decode).
+    //
+    // `freeze` extends the downstream stall with the WFI-halt freeze so a
+    // held instruction does not retire/launch while waiting for a pending
+    // interrupt. take_interrupt clears wfi_stall the cycle it fires, so
+    // freeze drops out and the interrupt proceeds.
+    // =================================================================
+    wire is_wfi_op = (de_i.sys_op == SYS_WFI);
+    wire is_mret_op = (de_i.sys_op == SYS_MRET);
+
+    // WFI halt state. Declared early: wfi_stall / freeze gate the trap
+    // predicates below, and freeze extends the downstream stall.
+    // int_pending_i comes from the trap unit at the CPU top (combinational
+    // from the CSR taps); trap_redirect_addr_i is the trap unit's resolved
+    // fetch target (mtvec vector / mepc), merged with the normal branch
+    // redirect in branch_valid_o / branch_addr_o below.
+    logic wfi_halt_q;
+    logic [XLEN-1:0] wfi_next_pc_q;
+    wire wfi_stall = wfi_halt_q & ~int_pending_i;
+    wire freeze = stall_i | wfi_stall;
+
+    // Sync trap request: illegal/ecall/ebreak (decode exception) OR a
+    // misaligned load/store detected here (needs the EA). Fires only in
+    // EX_IDLE (misaligned never launches; system traps are single-cycle).
+    wire sync_trap_req = de_i.valid & ~freeze & (ex_state_q == EX_IDLE) &
+        (de_i.exception | mem_misaligned);
+
+    wire mret_req = de_i.valid & ~freeze & (ex_state_q == EX_IDLE) & is_mret_op;
+
+    // A normal instruction eligible to be squashed by an interrupt (any
+    // non-trap, non-mret, non-wfi valid op in EX_IDLE). WFI is excluded: it
+    // retires (commit) then halts; the interrupt is taken on the WFI wake
+    // path (wfi_halt_q) with mepc = wfi.pc + size.
+    wire normal_int_eligible = de_i.valid & ~is_wfi_op & ~de_i.exception &
+        (ex_state_q == EX_IDLE) & ~freeze;
+
+    wire take_interrupt = int_pending_i & ~sync_trap_req & ~mret_req &
+        (normal_int_eligible | wfi_halt_q);
+
+    wire trap_redirect_req = sync_trap_req | mret_req | take_interrupt;
+
+    // Payload resolved for the trap unit (at the CPU top). A misaligned
+    // access overrides the decode cause/tval (bad EA); an interrupt forces
+    // the MSI cause / tval=0. The trap unit consumes these as cause_i /
+    // tval_i / pc_i and produces the redirect + CSR trap-write bundle.
+    wire [XLEN-1:0] sync_cause = mem_misaligned ?
+        (de_i.mem_write ? MCAUSE_SAD_MIS : MCAUSE_LAD_MIS) : de_i.exception_cause;
+    wire [XLEN-1:0] sync_tval = mem_misaligned ? alu_result : de_i.exception_tval;
+    wire [XLEN-1:0] trap_cause = take_interrupt ? MCAUSE_MSI : sync_cause;
+    wire [XLEN-1:0] trap_tval = take_interrupt ? 32'd0 : sync_tval;
+    // mepc: faulting instr pc (sync trap), or the suppressed instr pc
+    // (interrupt), or the WFI-wake pc (interrupt taken after WFI).
+    wire [XLEN-1:0] wfi_next_pc = de_i.pc + (de_i.is_compressed ? 32'd2 : 32'd4);
+    wire [XLEN-1:0] trap_mepc = wfi_halt_q ? wfi_next_pc_q : de_i.pc;
+
+    // Export the triggers + payload to the trap unit (CPU top).
+    assign sync_trap_req_o  = sync_trap_req;
+    assign mret_req_o       = mret_req;
+    assign take_interrupt_o = take_interrupt;
+    assign trap_cause_o     = trap_cause;
+    assign trap_tval_o      = trap_tval;
+    assign trap_pc_o        = trap_mepc;
+
+    // -----------------------------------------------------------------
+    // WFI halt. WFI retires (commit) once, then freezes the pipe until a
+    // pending+enabled interrupt wakes it. The interrupt is taken on the
+    // wake via the wfi_halt_q branch of take_interrupt, with mepc =
+    // wfi.pc + size (the instruction that will execute after the handler).
+    // freeze = the downstream stall OR the WFI wait; take_interrupt clears
+    // wfi_stall the cycle it fires (int_pending high -> wfi_stall low), so
+    // freeze drops out and the interrupt proceeds.
+    // -----------------------------------------------------------------
+    wire wfi_retire = de_i.valid & (ex_state_q == EX_IDLE) &
+        is_wfi_op & ~trap_redirect_req & ~stall_i;
+
+    logic wfi_halt_d;
+    logic [XLEN-1:0] wfi_next_pc_d;
 
     // =================================================================
     // Writeback (ALU / PC4 / MEM). A load retires via WB_MEM with sub-word
@@ -329,8 +444,8 @@ module execute_stage (
     logic result_ready;
     assign result_ready = is_mem_op ? mem_op_done : alu_result_valid;
 
-    assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~stall_i &
-        result_ready & ~mem_misaligned;
+    assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~freeze &
+        result_ready & ~mem_misaligned & ~trap_redirect_req;
 
     // =================================================================
     // CSR read-modify-write (Zicsr). The old CSR value is csr_rdata_i
@@ -356,8 +471,8 @@ module execute_stage (
     // Same retire predicate as the regfile writeback (result_ready=1 for
     // a CSR op). de_i.csr_wren is decode's "CSR op present" flag, already
     // squashed by illegal in decode.
-    assign csr_op_valid = de_i.valid & de_i.csr_wren & ~de_i.illegal & ~stall_i &
-        result_ready & ~mem_misaligned;
+    assign csr_op_valid = de_i.valid & de_i.csr_wren & ~de_i.illegal & ~freeze &
+        result_ready & ~mem_misaligned & ~trap_redirect_req;
 
     always_comb begin
         unique case (de_i.csr_op)
@@ -466,14 +581,21 @@ module execute_stage (
         endcase
     end
 
-    assign branch_addr_o = (de_i.branch_type == BR_JALR) ?
+    // Normal branch target / request (a taken JAL/JALR/branch). Gated by
+    // ~trap_redirect_req: a branch squashed by an interrupt re-runs after
+    // mret instead of redirecting now.
+    wire [XLEN-1:0] branch_target = (de_i.branch_type == BR_JALR) ?
         (de_i.rs1_data + de_i.imm) & 32'hFFFF_FFFE : (de_i.pc + de_i.imm);
 
-    // Branches are single-cycle (ALU placeholder op, result_valid=1), so
-    // alu_result_valid is always 1 for them; gate on it anyway for safety.
-    assign branch_valid_o = de_i.valid & ~de_i.illegal & (de_i.branch_type != BR_NONE) &
-        branch_taken & ~stall_i & alu_result_valid;
-    assign flush_o = branch_valid_o;
+    wire branch_redirect_req = de_i.valid & ~de_i.illegal & (de_i.branch_type != BR_NONE) &
+        branch_taken & ~freeze & alu_result_valid & ~trap_redirect_req;
+
+    // Combined fetch redirect: a normal branch OR a trap / mret / interrupt.
+    // The trap unit's redirect_addr (from the CPU top) wins when a
+    // trap/mret/interrupt fires.
+    assign branch_valid_o = branch_redirect_req | trap_redirect_req;
+    assign branch_addr_o  = trap_redirect_req ? trap_redirect_addr_i : branch_target;
+    assign flush_o        = branch_valid_o;
 
     // =================================================================
     // E/M debug taps (retired instruction)
@@ -482,37 +604,53 @@ module execute_stage (
     logic [XLEN-1:0] ex_instr_q, ex_instr_d;
     logic ex_valid_q, ex_valid_d;
 
-    // An op retires when it is valid, not illegal, and its result is ready
-    // (alu_result_valid for ALU/DIV, mem_done for a load/store). A
-    // misaligned mem op is suppressed — it never reaches EX_MEM_WAIT, so
-    // its result_ready stays 0 and it does not retire. Single-cycle ops
-    // retire the cycle they are valid; DIV/REM on alu_result_valid; mem
-    // ops on mem_done.
-    logic op_retires;
-    assign op_retires = de_i.valid & ~de_i.illegal & ~stall_i & result_ready & ~mem_misaligned;
+    // An op commits (retires -> ex_valid pulses, counts to minstret, logged
+    // by the sim retire trace) when it retires normally, OR when an mret
+    // retires. A sync trap does NOT commit: the faulting instruction is not
+    // retired (it raised an exception before committing -- per the RISC-V
+    // spec and Spike's --log-commits, which does not emit a commit line for
+    // a trapping instruction). An interrupt does NOT commit either: the
+    // squashed instruction re-runs after mret. WFI retires once (normal
+    // path, result_ready=1 for the ALU-hint op) then halts. A misaligned
+    // mem op is NOT in the normal path -- it raises a sync trap and does
+    // not commit. The trap machinery itself (CSR trap-write bundle, fetch
+    // redirect) is independent of ex_valid, so traps still fire correctly;
+    // only the retire count is suppressed.
+    logic op_commits;
+    assign op_commits = take_interrupt ? 1'b0 : sync_trap_req ? 1'b0 :
+        mret_req ? 1'b1 : (de_i.valid & ~de_i.illegal & ~freeze & result_ready & ~mem_misaligned);
 
-    assign ex_pc_d    = op_retires ? de_i.pc : ex_pc_q;
-    assign ex_instr_d = op_retires ? de_i.instr : ex_instr_q;
-    assign ex_valid_d = op_retires;
+    assign ex_pc_d = op_commits ? de_i.pc : ex_pc_q;
+    assign ex_instr_d = op_commits ? de_i.instr : ex_instr_q;
+    assign ex_valid_d = op_commits;
 
-    assign ex_pc_o    = ex_pc_q;
+    assign ex_pc_o = ex_pc_q;
     assign ex_instr_o = ex_instr_q;
     assign ex_valid_o = ex_valid_q;
+
+    // WFI halt next-state: set when WFI retires, cleared on the interrupt
+    // wake (take_interrupt). wfi_next_pc holds the return PC for the wake.
+    assign wfi_halt_d = wfi_retire | (wfi_halt_q & ~take_interrupt);
+    assign wfi_next_pc_d = wfi_retire ? wfi_next_pc : wfi_next_pc_q;
 
     // =================================================================
     // Sequential
     // =================================================================
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            ex_state_q <= EX_IDLE;
-            ex_pc_q    <= '0;
-            ex_instr_q <= '0;
-            ex_valid_q <= 1'b0;
+            ex_state_q    <= EX_IDLE;
+            ex_pc_q       <= '0;
+            ex_instr_q    <= '0;
+            ex_valid_q    <= 1'b0;
+            wfi_halt_q    <= 1'b0;
+            wfi_next_pc_q <= '0;
         end else begin
-            ex_state_q <= ex_state_d;
-            ex_pc_q    <= ex_pc_d;
-            ex_instr_q <= ex_instr_d;
-            ex_valid_q <= ex_valid_d;
+            ex_state_q    <= ex_state_d;
+            ex_pc_q       <= ex_pc_d;
+            ex_instr_q    <= ex_instr_d;
+            ex_valid_q    <= ex_valid_d;
+            wfi_halt_q    <= wfi_halt_d;
+            wfi_next_pc_q <= wfi_next_pc_d;
         end
     end
 

@@ -79,19 +79,28 @@ module sim_top (
     // it carries no per-stage debug, just a "pipe stalled" status bit.
     // -----------------------------------------------------------------
     wire unused_dbg_stall;
+    // Machine software interrupt pending bit (mip.MSIP source). Harvard:
+    // driven by the MSIP MMIO slave on axi_bus_peri (same as the board
+    // top — SW self-writes the MSIP register, then WFI / a pending
+    // interrupt is taken). Von-Neumann: no MSIP slave in sim, tie low.
+`ifndef VON_NEUMANN
+    wire msip;
+`endif
     rv32imac_zicsr_zifencei u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
         .boot_addr_i(32'h0000_0000),
         .dbg_stall_o(unused_dbg_stall),
 `ifdef VON_NEUMANN
-        .bus_axi    (axi_bus_cpu.master)
+        .bus_axi    (axi_bus_cpu.master),
+        .msip_i     (1'b0)
 `else
         .axi_peri   (axi_bus_peri.master),
         .imem_req_o (imem_req),
         .imem_rsp_i (imem_rsp),
         .dmem_req_o (dmem_req),
-        .dmem_rsp_i (dmem_rsp)
+        .dmem_rsp_i (dmem_rsp),
+        .msip_i     (msip)
 `endif
     );
 
@@ -208,10 +217,20 @@ module sim_top (
     endgenerate
 
     // -----------------------------------------------------------------
-    // Peripheral bus: tie off the slave side (reserved for future MMIO
-    // peripherals; data RAM is on the native dmem port / mem master, not
-    // here).
+    // Peripheral bus: the MSIP MMIO slave (machine software interrupt),
+    // mirroring the board top. A write of bit[0] to MSIP_PERI_ADDR sets /
+    // clears mip.MSIP; the msip output feeds u_cpu.msip_i. Von-Neumann
+    // sim has no MSIP slave (peri trunk tied off) — msip is tied low at
+    // the CPU above.
     // -----------------------------------------------------------------
+`ifndef VON_NEUMANN
+    msip_peri u_msip (
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .axi   (axi_bus_peri.slave),
+        .msip_o(msip)
+    );
+`else
     assign axi_bus_peri.awready = 1'b0;
     assign axi_bus_peri.wready  = 1'b0;
     assign axi_bus_peri.bvalid  = 1'b0;
@@ -220,6 +239,7 @@ module sim_top (
     assign axi_bus_peri.rvalid  = 1'b0;
     assign axi_bus_peri.rdata   = '0;
     assign axi_bus_peri.rresp   = 2'b00;
+`endif
 
     // -----------------------------------------------------------------
     // LED: free-running counter, parity with the board top.

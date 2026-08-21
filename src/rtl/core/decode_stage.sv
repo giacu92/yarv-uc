@@ -569,9 +569,10 @@ module decode_stage (
     // ---- Field extraction ----
     logic [6:0] opcode;
     logic [2:0] funct3;
+    logic [4:0] funct5;  // AMO/Zilx mode (instr[31:27])
     logic [6:0] funct7;
     logic funct7b5;  // funct7[5] — SUB/SRA, M-ext
-    logic [4:0] funct5;  // AMO/Zilx mode (instr[31:27])
+    logic [11:0] funct12;
     logic aq, rl;  // AMO ordering bits (instr[26:25]) — must be 0 for Zilx
     logic [4:0] rd_field, rs1_field, rs2_field;
     logic is_m_ext;
@@ -588,14 +589,18 @@ module decode_stage (
     alu_src_a_t alu_src_a;
     alu_src_b_t alu_src_b;
     logic mem_read, mem_write;
-    mem_size_t       mem_size;
-    logic            mem_unsigned;
-    logic      [1:0] mem_shamt;  // Zilx index scale (0 unscaled, log2 size scaled)
-    wb_src_t         wb_src;
-    branch_t         branch_type;
-    logic            dec_illegal;
-    logic            is_csr;
-    csr_op_t         csr_op;
+    mem_size_t            mem_size;
+    logic                 mem_unsigned;
+    logic      [     1:0] mem_shamt;  // Zilx index scale (0 unscaled, log2 size scaled)
+    wb_src_t              wb_src;
+    branch_t              branch_type;
+    logic                 dec_illegal;
+    logic                 is_csr;
+    csr_op_t              csr_op;
+    sys_op_t              sys_op;
+    logic                 exc_req;  // decode requests a sync trap
+    logic      [XLEN-1:0] exc_cause;
+    logic      [XLEN-1:0] exc_tval;
 
     // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
     // and driven with a default every cycle in the decode always_comb below:
@@ -689,6 +694,7 @@ module decode_stage (
         funct7 = src_instr32[31:25];
         funct7b5 = src_instr32[30];
         funct5 = src_instr32[31:27];  // AMO/Zilx mode
+        funct12 = src_instr32[31:20];
         aq = src_instr32[26];  // AMO aq (must be 0 for Zilx)
         rl = src_instr32[25];  // AMO rl (must be 0 for Zilx)
         rd_field = src_instr32[11:7];
@@ -736,6 +742,10 @@ module decode_stage (
         wb_src = WB_ALU;
         branch_type = BR_NONE;
         dec_illegal = 1'b1;  // default: anything not matched is illegal
+        sys_op = SYS_NONE;
+        exc_req = 1'b0;
+        exc_cause = '0;
+        exc_tval = '0;
         // Zilx helpers: assigned here so every opcode path drives them (no
         // latch). Only OPC_AMO below reads/overrides zilx_ok.
         is_unscaled = (funct5 == 5'b10010);  // lx  (unscaled)
@@ -1025,6 +1035,7 @@ module decode_stage (
             end
 
             OPC_SYSTEM: begin
+                uses_rs2 = 1'b0;  // CSR ops never read rs2
                 // Zicsr CSR ops (funct3 != 0) + ecall/ebreak/mret/wfi
                 // (funct3 == 0). Only the CSR ops execute this phase; the
                 // trap-entry ops stay illegal (no trap machinery yet).
@@ -1051,7 +1062,6 @@ module decode_stage (
                 if (is_csr) begin
                     reg_write   = 1'b1;  // rd <- old CSR value
                     wb_src      = WB_CSR;
-                    uses_rs2    = 1'b0;  // CSR ops never read rs2
                     csr_wren    = 1'b1;  // execute qualifies the actual write
                     dec_illegal = 1'b0;
                     unique case (funct3)
@@ -1082,48 +1092,113 @@ module decode_stage (
                         default: dec_illegal = 1'b1;  // unreachable (is_csr => funct3!=0)
                     endcase
                 end else begin
-                    // ecall / ebreak / mret / wfi / fence.i — no trap yet.
-                    dec_illegal = 1'b1;
+                    // Trap-entry / return / halt ops (funct3 == 0). Retire
+                    // with side effects handled in execute (redirect + CSR
+                    // writes via the trap unit); NOT marked illegal. ecall/
+                    // ebreak raise a sync trap (exc_req=1) the cycle they
+                    // retire; mret/wfi are legal no-side-eff at decode.
+                    // SFENCE.VMA (no VM) stays illegal -> traps as illegal.
+                    if (funct12 == 12'h000) begin  // ECALL -> env call from M-mode
+                        sys_op      = SYS_ECALL;
+                        dec_illegal = 1'b0;
+                        exc_req     = 1'b1;
+                        exc_cause   = MCAUSE_ECALL_M;
+                        exc_tval    = '0;
+                    end else if (funct12 == 12'h001) begin  // EBREAK -> breakpoint
+                        sys_op      = SYS_EBREAK;
+                        dec_illegal = 1'b0;
+                        exc_req     = 1'b1;
+                        exc_cause   = MCAUSE_BREAKPOINT;
+                        exc_tval    = '0;
+                    end else if (funct7 == 7'b0001000 && rs2_field == 5'b00101 &&
+                                 rs1_field == 5'b00000) begin  // WFI
+                        sys_op      = SYS_WFI;
+                        dec_illegal = 1'b0;
+                    end else if (funct7 == 7'b0011000 && rs2_field == 5'b00010 &&
+                                 rs1_field == 5'b00000) begin  // MRET
+                        sys_op      = SYS_MRET;
+                        dec_illegal = 1'b0;
+                    end else if (funct7 == 7'b0001001) begin  // SFENCE.VMA -> illegal (no VM)
+                        dec_illegal = 1'b1;
+                    end else begin
+                        dec_illegal = 1'b1;
+                    end
                 end
             end
 
+            OPC_MISC_MEM: begin
+                // Zifencei: fence (funct3=0) / fence.i (funct3=1). Harvard
+                // in-order single-core with no D->I path -> both are legal
+                // nops here (no ordering side effect needed). Retire as
+                // single-cycle nops (no reg/mem/csr/branch). Other funct3
+                // reserved -> illegal.
+                unique case (funct3)
+                    3'b000: begin  // fence
+                        sys_op      = SYS_FENCE;
+                        dec_illegal = 1'b0;
+                    end
+                    3'b001: begin  // fence.i
+                        sys_op      = SYS_FENCE_I;
+                        dec_illegal = 1'b0;
+                    end
+                    default: dec_illegal = 1'b1;
+                endcase
+            end
+
             default: begin
-                // OPC_MISC_MEM (fence), OPC_SYSTEM (csr/ecall/ebreak),
-                // atomics, anything else -> illegal this phase.
+                // Atomics, unknown opcodes -> illegal (traps as illegal
+                // instruction in execute). OPC_SYSTEM / OPC_MISC_MEM are
+                // handled above.
                 dec_illegal = 1'b1;
             end
         endcase
 
         // Register-read addresses: force x0 for instrs that don't use
         // rs1/rs2 (avoids reading a bogus field, e.g. LUI's rs1 is imm).
-        rs1_addr_dec       = uses_rs1 ? rs1_field : 5'd0;
-        rs2_addr_dec       = uses_rs2 ? rs2_field : 5'd0;
-        csr_addr_dec       = is_csr ? src_instr32[31:20] : 12'd0;  // CSR index is 12 bits
+        rs1_addr_dec = uses_rs1 ? rs1_field : 5'd0;
+        rs2_addr_dec = uses_rs2 ? rs2_field : 5'd0;
+        csr_addr_dec = is_csr ? src_instr32[31:20] : 12'd0;  // CSR index is 12 bits
+
+        // Any illegal (and present) instruction requests an illegal-instr
+        // sync trap in execute. ecall/ebreak set exc_req explicitly above
+        // (dec_illegal=0); misaligned-access traps are detected in execute
+        // (need the EA) and override cause/tval there. Gate on
+        // decoded_valid so a span_wait / target_span bubble (no real
+        // instruction) does not raise a spurious trap.
+        if (dec_illegal && decoded_valid) begin
+            exc_req   = 1'b1;
+            exc_cause = MCAUSE_ILLEGAL;
+            exc_tval  = src_instr32;
+        end
 
         // ---- Assemble the D/E word for this cycle ----
-        de_d               = '0;
-        de_d.valid         = decoded_valid;
-        de_d.pc            = src_pc;
-        de_d.instr         = src_instr32;  // 32-bit word decode treated
-        de_d.is_compressed = src_is_compressed;
-        de_d.rs1_addr      = rs1_addr_dec;
-        de_d.rs2_addr      = rs2_addr_dec;
+        de_d                 = '0;
+        de_d.valid           = decoded_valid;
+        de_d.pc              = src_pc;
+        de_d.instr           = src_instr32;  // 32-bit word decode treated
+        de_d.is_compressed   = src_is_compressed;
+        de_d.rs1_addr        = rs1_addr_dec;
+        de_d.rs2_addr        = rs2_addr_dec;
         //        de_d.rs1_data      = rs1_data_i;
         //        de_d.rs2_data      = rs2_data_i;
-        de_d.rs1_data      = rs1_fwd;
-        de_d.rs2_data      = rs2_fwd;
-        de_d.imm           = imm;
-        de_d.rd            = rd_field;
-        de_d.alu_op        = alu_op;
-        de_d.alu_src_a     = alu_src_a;
-        de_d.alu_src_b     = alu_src_b;
-        de_d.mem_size      = mem_size;
-        de_d.mem_unsigned  = mem_unsigned;
-        de_d.mem_shamt     = mem_shamt;
-        de_d.wb_src        = wb_src;
-        de_d.branch_type   = branch_type;
-        de_d.csr_op        = csr_op;
-        de_d.csr_addr      = csr_addr_dec;
+        de_d.rs1_data        = rs1_fwd;
+        de_d.rs2_data        = rs2_fwd;
+        de_d.imm             = imm;
+        de_d.rd              = rd_field;
+        de_d.alu_op          = alu_op;
+        de_d.alu_src_a       = alu_src_a;
+        de_d.alu_src_b       = alu_src_b;
+        de_d.mem_size        = mem_size;
+        de_d.mem_unsigned    = mem_unsigned;
+        de_d.mem_shamt       = mem_shamt;
+        de_d.wb_src          = wb_src;
+        de_d.branch_type     = branch_type;
+        de_d.sys_op          = sys_op;
+        de_d.exception       = exc_req;
+        de_d.exception_cause = exc_cause;
+        de_d.exception_tval  = exc_tval;
+        de_d.csr_op          = csr_op;
+        de_d.csr_addr        = csr_addr_dec;
         // reg_write / mem_read / mem_write / csr_wren are squashed by
         // illegal. A spanning stitch decodes a real 32-bit instr through
         // the uniform decoder, so spanning no longer forces illegal.

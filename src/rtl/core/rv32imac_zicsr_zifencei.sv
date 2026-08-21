@@ -71,6 +71,12 @@ module rv32imac_zicsr_zifencei (
     output mem_req_t dmem_req_o,
     input  mem_rsp_t dmem_rsp_i
 `endif
+    ,
+
+    // Machine software-interrupt pending bit from the MSIP MMIO slave
+    // (on axi_peri at the board top). Drives mip.MSIP. Common to both
+    // builds; the von-Neumann board top ties it low (no MSIP slave there).
+    input wire msip_i
 );
 
     // ===================================================================
@@ -145,6 +151,19 @@ module rv32imac_zicsr_zifencei (
     wire [XLEN-1:0] csr_wdata;
     wire            csr_we;
     wire [XLEN-1:0] csr_rdata;
+
+    // CSR taps (trap unit reads mtvec / mepc / mstatus / mip / mie).
+    wire [XLEN-1:0] csr_mtvec, csr_mepc, csr_mstatus, csr_mip, csr_mie;
+
+    // Trap-write bundle (trap unit -> CSR file) + triggers/payload
+    // (execute "exception logic" -> trap unit) + the pending interrupt and
+    // resolved redirect fed back to execute.
+    wire we_mepc, we_mcause, we_mtval, we_mstatus;
+    wire [XLEN-1:0] d_mepc, d_mcause, d_mtval, d_mstatus;
+    wire sync_trap_req, mret_req, take_interrupt;
+    wire [XLEN-1:0] trap_cause, trap_tval, trap_pc;
+    wire            int_pending;
+    wire [XLEN-1:0] trap_redirect_addr;
 
     // ex_* E/M taps (retired op pc / instr / valid). Debug only — left
     // unconnected here; the sim probes them via the Verilator hierarchy.
@@ -246,9 +265,52 @@ module rv32imac_zicsr_zifencei (
         .csr_data_o    (csr_rdata),
         .csr_wren_i    (csr_we),
         .csr_data_i    (csr_wdata),
-        .instr_retire_i(ex_valid),
-        .instr_branch_i(ex_branch_valid),
-        .instr_pc_i    (ex_pc)
+        .we_mepc_i     (we_mepc),
+        .d_mepc_i      (d_mepc),
+        .we_mcause_i   (we_mcause),
+        .d_mcause_i    (d_mcause),
+        .we_mtval_i    (we_mtval),
+        .d_mtval_i     (d_mtval),
+        .we_mstatus_i  (we_mstatus),
+        .d_mstatus_i   (d_mstatus),
+        .msip_i        (msip_i),
+        .mtvec_o       (csr_mtvec),
+        .mepc_o        (csr_mepc),
+        .mstatus_o     (csr_mstatus),
+        .mip_o         (csr_mip),
+        .mie_o         (csr_mie),
+        .instr_retire_i(ex_valid)
+    );
+
+    // Trap unit (combinational peer of the execute stage): consumes the
+    // triggers + cause/tval/pc the execute "exception logic" produces,
+    // drives the CSR trap-write bundle (mepc / mcause / mtval / mstatus) and
+    // the fetch redirect, and reports the pending+enabled MS interrupt back
+    // to execute. int_pending depends only on the CSR taps (no loop through
+    // the triggers).
+    trap_unit u_trap (
+        .mtvec_i         (csr_mtvec),
+        .mepc_i          (csr_mepc),
+        .mstatus_i       (csr_mstatus),
+        .mip_i           (csr_mip),
+        .mie_i           (csr_mie),
+        .take_trap_i     (sync_trap_req),
+        .take_interrupt_i(take_interrupt),
+        .mret_i          (mret_req),
+        .cause_i         (trap_cause),
+        .tval_i          (trap_tval),
+        .pc_i            (trap_pc),
+        .redirect_valid_o(),
+        .redirect_addr_o (trap_redirect_addr),
+        .csr_we_mepc_o   (we_mepc),
+        .csr_d_mepc_o    (d_mepc),
+        .csr_we_mcause_o (we_mcause),
+        .csr_d_mcause_o  (d_mcause),
+        .csr_we_mtval_o  (we_mtval),
+        .csr_d_mtval_o   (d_mtval),
+        .csr_we_mstatus_o(we_mstatus),
+        .csr_d_mstatus_o (d_mstatus),
+        .int_pending_o   (int_pending)
     );
 
     decode_stage u_decode (
@@ -274,32 +336,45 @@ module rv32imac_zicsr_zifencei (
     );
 
     execute_stage u_execute (
-        .clk_i         (clk_i),
-        .rstn_i        (rstn_i),
-        .de_i          (de_bus),
-        .csr_rdata_i   (csr_rdata),        // CSR read value
-        .csr_wdata_o   (csr_wdata),        // CSR write value (RMW result)
-        .csr_wren_o    (csr_we),           // CSR write enable (execute-qualified)
-        .stall_i       (1'b0),             // no downstream stage yet
-        .stall_o       (ex_stall),
-        .flush_o       (ex_flush),
-        .wb_addr_o     (wb_addr),
-        .wb_data_o     (wb_data),
-        .wb_en_o       (wb_en),
-        .branch_valid_o(ex_branch_valid),
-        .branch_addr_o (ex_branch_addr),
+        .clk_i               (clk_i),
+        .rstn_i              (rstn_i),
+        .de_i                (de_bus),
+        .csr_rdata_i         (csr_rdata),           // CSR read value
+        .csr_wdata_o         (csr_wdata),           // CSR write value (RMW result)
+        .csr_wren_o          (csr_we),              // CSR write enable (execute-qualified)
+        .stall_i             (1'b0),                // no downstream stage yet
+        .stall_o             (ex_stall),
+        .flush_o             (ex_flush),
+        .wb_addr_o           (wb_addr),
+        .wb_data_o           (wb_data),
+        .wb_en_o             (wb_en),
+        .branch_valid_o      (ex_branch_valid),
+        .branch_addr_o       (ex_branch_addr),
 `ifdef VON_NEUMANN
-        .mem_req_o     (lsu_req),
-        .mem_rsp_i     (lsu_rsp),
+        .mem_req_o           (lsu_req),
+        .mem_rsp_i           (lsu_rsp),
 `else
-        .mem_req_o     (dmem_req_o),
-        .mem_rsp_i     (dmem_rsp_i),
-        .peri_req_o    (peri_req),
-        .peri_rsp_i    (peri_rsp),
+        .mem_req_o           (dmem_req_o),
+        .mem_rsp_i           (dmem_rsp_i),
+        .peri_req_o          (peri_req),
+        .peri_rsp_i          (peri_rsp),
 `endif
-        .ex_pc_o       (ex_pc),
-        .ex_instr_o    (ex_instr),
-        .ex_valid_o    (ex_valid)
+        // Trap machinery: execute "exception logic" emits the triggers +
+        // cause/tval/pc, imports the pending interrupt + resolved redirect
+        // (from the trap unit). int_pending is combinational off the CSR
+        // taps (no loop through the triggers); redirect_addr selects trap /
+        // mret / interrupt target over the normal branch.
+        .int_pending_i       (int_pending),
+        .trap_redirect_addr_i(trap_redirect_addr),
+        .sync_trap_req_o     (sync_trap_req),
+        .mret_req_o          (mret_req),
+        .take_interrupt_o    (take_interrupt),
+        .trap_cause_o        (trap_cause),
+        .trap_tval_o         (trap_tval),
+        .trap_pc_o           (trap_pc),
+        .ex_pc_o             (ex_pc),
+        .ex_instr_o          (ex_instr),
+        .ex_valid_o          (ex_valid)
     );
 
     // ===================================================================

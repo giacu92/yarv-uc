@@ -22,11 +22,13 @@ RTL := \
 	../src/rtl/core/reg_file.sv \
 	../src/rtl/core/csr_regfile.sv \
 	../src/rtl/core/decode_stage.sv \
+	../src/rtl/core/trap_unit.sv \
 	../src/rtl/core/alu.sv \
 	../src/rtl/core/execute_stage.sv \
 	../src/rtl/core/rv32imac_zicsr_zifencei.sv \
 	../src/rtl/utils/axi4_lite_ram.sv \
 	../src/rtl/utils/native_ram.sv \
+	../src/rtl/utils/msip_peri.sv \
 	sim_top.sv
 
 # Build topology: VON_NEUMANN=1 selects the legacy von-Neumann/AXI build
