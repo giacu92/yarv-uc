@@ -1,10 +1,11 @@
 # Simulation (Verilator)
 
 Functional simulation of the implemented pipeline (fetch + decode +
-execute + LSU + Zicsr CSR file). The default **Harvard** build wires the
-CPU to a native read-only I-mem (`native_ram`, `+IINIT`) and a native
-byte-strobed D-mem (`native_ram`, `+DINIT`); AXI survives only for the
-tied-off peripheral bus. The legacy **von-Neumann** build
+execute + LSU + Zicsr CSR file + trap/exception/interrupt unit). The
+default **Harvard** build wires the CPU to a native read-only I-mem
+(`native_ram`, `+IINIT`) and a native byte-strobed D-mem (`native_ram`,
+`+DINIT`); the AXI4-Lite peripheral bus carries the `msip_peri` MMIO
+slave (machine software interrupt). The legacy **von-Neumann** build
 (`VON_NEUMANN=1`) keeps the `mem_arbiter` + `axi4_lite_xbar` + single
 AXI4-Lite RAM (`+INIT`) topology. The board top's wiring is replicated
 in `sim_top.sv` so the memories can be preloaded and the CPU's
@@ -152,12 +153,43 @@ The Spike source tree, build, install, and per-run logs are gitignored;
 only the harness (`Makefile`, `build_spike.sh`, `cosim_diff.py`) is
 committed.
 
+## Trap oracle (`sw_trap/`)
+
+A standalone M-mode trap-exercise program (`trap_test.S`, built
+`-march=rv32imac_zicsr_zifencei` so the toolchain emits csr/mret/wfi):
+sets `mtvec` (direct), enables `mie.MSIE` + `mstatus.MIE`, and runs four
+tests — ecall, load-misaligned, illegal instruction, and MSIP+WFI. The
+handler (keyed on `mcause`) advances `mepc`+4 for sync traps / clears
+MSIP + sets `mepc`=wfi+4 for the interrupt, leaving distinct D-mem
+markers; `main` self-checks them and writes `0x600D` at D-mem 0x2000
+(pass) or `0xBAD` (probe word 0x800). Run from `sim/`:
+
+```
+cd sw_trap && make                                      # -> build/imem.hex + build/dmem.hex
+cd .. && make run RUN_ARGS="+IINIT=sw_trap/build/imem.hex +DINIT=sw_trap/build/dmem.hex"
+```
+
+## Illegal-trap co-sim (`cosim_ecall/`)
+
+The Spike co-sim of a synchronous trap: a minimal illegal-instruction
+program (`ecall_test.S`, `.word 0x0000007f`) run on Spike + RTL and
+diffed with the shared `cosim_diff.py`. The faulting instruction is not
+retired in either model. `ecall` itself is **not** Spike-comparable
+(Spike hijacks an M-mode ecall as the htif host-call exit; MSIP has no
+Spike slave at 0x1000_0000), so the ecall / MSIP+WFI paths are covered
+only by the standalone oracle above.
+
+```
+cd cosim_ecall && make cosim   # -> "PASS -- matched 17 retires"
+```
+
 ## Files
 
 - `sim_top.sv`    — sim wrapper (CPU + native I/D-mem or AXI RAM +
-  peri tie-off + `mem_probe` generate block exposing a window of the
-  data RAM to the VCD). Ports only `clk_i`/`rstn_i`/`led_o`; CPU taps
-  stay internal, probed via the Verilator hierarchy.
+  `msip_peri` MMIO slave on the peri bus + `mem_probe` generate block
+  exposing a window of the data RAM to the VCD). Ports only
+  `clk_i`/`rstn_i`/`led_o`; CPU taps stay internal, probed via the
+  Verilator hierarchy.
 - `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs
   incl. writeback values, stall breakdown, park/`MAX_CYC` stop).
 - `imem.hex`/`dmem.hex` — Harvard oracle preload (code / data).
@@ -167,7 +199,11 @@ committed.
 - `native_mem_tb/` — native RAM compliance test.
 - `ram_tb/`       — AXI4-Lite RAM compliance test.
 - `cosim/`        — RTL vs Spike golden ISA ref co-sim (see "Co-sim vs Spike").
+- `cosim_ecall/`  — Spike co-sim of an illegal-instruction sync trap
+  (see "Illegal-trap co-sim").
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
+- `sw_trap/`      — standalone M-mode trap-exercise program
+  (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
 
 Build artefacts (`obj_dir/`, `sw/build/`, `*.vcd`, `*.log`) are
 gitignored.

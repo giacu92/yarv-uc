@@ -84,7 +84,9 @@ uninitialized `.bss` globals.
 `-march=rv32imac` does not emit Zilx indexed loads, so `partition()`
 hand-encodes `lxs.w` via `.insn`; the hand-crafted `sim/imem.hex` /
 `sim/dmem.hex` oracle covers the other Zilx sizes/signs (b/h/w,
-signed/unsigned) and the unscaled variant. The peri (MMIO) bus slave
-is still tied off, so keep data accesses in the D-mem region (low
-addresses) — a peri access (`addr[28]` set) stalls the LSU until a
-real UART/GPIO slave is dropped in.
+signed/unsigned) and the unscaled variant. The peripheral bus now
+carries the `msip_peri` MMIO slave at peri base `0x1000_0000` (a write
+of bit[0] sets/clears mip.MSIP); keep quicksort's data accesses in the
+D-mem region (low addresses) — a peri access (`addr[28]` set) hits the
+MSIP register at `0x1000_0000` and has no slave elsewhere, so it would
+stall the LSU.
