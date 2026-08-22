@@ -171,10 +171,10 @@ fetch/LSU bus contention. The legacy build is selected with
 `make VON_NEUMANN=1 run` (+ `+INIT=` for the single-image oracle).
 
 See `sim/README.md` for the logs, VCD/GTKWave, the native-RAM
-(`sim/native_mem_tb/`) and AXI4-Lite RAM (`sim/ram_tb/`) compliance tests,
-the RTL-vs-Spike co-sim (`make cosim` — retire-for-retire match against
-the golden ISA reference), and the trap oracle + illegal-trap cosim
-(`sim/sw_trap/`, `sim/cosim_ecall/`).
+(`sim/hw/native_mem_tb/`) and AXI4-Lite RAM (`sim/hw/ram_tb/`) compliance
+tests, the RTL-vs-Spike co-sim (`make cosim` — retire-for-retire match
+against the golden ISA reference), and the trap oracle + illegal-trap
+cosim (`sim/sw_trap/`, `sim/cosim/ecall/`).
 
 ### Synthesize / place & route (Gowin EDA, remote host)
 

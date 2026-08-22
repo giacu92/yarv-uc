@@ -7,13 +7,13 @@
 # Requires: verilator, g++.
 
 RTL := \
-	../../src/rtl/pkg/rv32_pkg.sv \
-	../../src/rtl/utils/native_ram.sv \
+	../../../src/rtl/pkg/rv32_pkg.sv \
+	../../../src/rtl/utils/native_ram.sv \
 	native_mem_tb.sv
 
 VFLAGS := --cc --exe --build --top-module native_mem_tb \
 	-Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT -Wno-LATCH -Wno-INITIALDLY -Wno-TIMESCALEMOD \
-	-I../../src/rtl/pkg -I../../src/rtl/utils
+	-I../../../src/rtl/pkg -I../../../src/rtl/utils
 
 TOP := obj_dir/Vnative_mem_tb
 

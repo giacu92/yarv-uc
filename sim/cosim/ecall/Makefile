@@ -1,12 +1,12 @@
 # ecall co-sim: build a minimal ecall+mret program, run it on Spike
 # (golden) and on the Verilator RTL, diff per-retire (pc, rd, val).
-# Mirrors cosim/Makefile but builds its own ecall_test.S (not quicksort).
+# Mirrors cosim/quicksort/Makefile but builds its own ecall_test.S (not quicksort).
 #
 #   make cosim     build + run both + diff
 #   make clean     remove logs + build
 
 SCRIPT_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
-COSIM_DIR  := $(SCRIPT_DIR)../cosim/
+COSIM_DIR  := $(SCRIPT_DIR)../
 SPIKE      := $(COSIM_DIR)riscv-isa-sim-install/bin/spike
 
 ESP_TC      ?= $(HOME)/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin
@@ -62,8 +62,8 @@ rtl-run: $(IMEM_HEX) $(DMEM_HEX)
 	@echo "== running RTL sim (RTL_TRACE=$(RTL_LOG)) =="
 	@rm -f $(RTL_LOG)
 	@RTL_TRACE=$(RTL_LOG) MAX_CYC=20000 \
-	  $(MAKE) -C $(SCRIPT_DIR).. run \
-	    RUN_ARGS="+IINIT=cosim_ecall/build/imem.hex +DINIT=cosim_ecall/build/dmem.hex" \
+	  $(MAKE) -C $(SCRIPT_DIR)../.. run \
+	    RUN_ARGS="+IINIT=cosim/ecall/build/imem.hex +DINIT=cosim/ecall/build/dmem.hex" \
 	  >/dev/null
 	@test -s $(RTL_LOG) || { echo "rtl: no trace produced"; exit 1; }
 	@echo "rtl: $$(wc -l < $(RTL_LOG)) retires -> $(RTL_LOG)"

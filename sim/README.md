@@ -99,7 +99,7 @@ clobbering the oracle. The legacy von-Neumann build uses a single
 `+INIT=<path>` (default `program.hex`). To compile C → images, use the
 `sim/sw/` flow (see `sim/sw/README.md`).
 
-## Native RAM compliance test (`native_mem_tb/`)
+## Native RAM compliance test (`hw/native_mem_tb/`)
 
 A second, independent harness that does **not** use the CPU — it
 instantiates `native_ram` alone (a read/write D-mem and a read-only
@@ -112,10 +112,10 @@ outstanding (WREADY low while an unread read response is held), posted
 store commits at the launch handshake, and read-only ignoring writes.
 
 ```
-cd sim/native_mem_tb && make run   # prints "N checks, 0 failures" on success
+cd sim/hw/native_mem_tb && make run   # prints "N checks, 0 failures" on success
 ```
 
-## AXI4-Lite RAM compliance test (`ram_tb/`)
+## AXI4-Lite RAM compliance test (`hw/ram_tb/`)
 
 A third, independent harness (no CPU) that instantiates `axi4_lite_ram`
 alone and drives it as an AXI4-Lite master from C++ (`ram_tb.cpp`). It
@@ -126,10 +126,10 @@ byte-strobed partial writes, back-to-back writes, single outstanding).
 still covers it.
 
 ```
-cd sim/ram_tb && make run     # prints "N checks, 0 failures" on success
+cd sim/hw/ram_tb && make run     # prints "N checks, 0 failures" on success
 ```
 
-## Co-sim vs Spike (`cosim/`)
+## Co-sim vs Spike (`cosim/quicksort/`)
 
 Runs the same C-built ELF on Spike (upstream `riscv-isa-sim`, built locally
 once via `build_spike.sh`, run with `--log-commits`) and on the Verilator
@@ -152,8 +152,9 @@ make cosim     # build sw + Spike, run both, diff -> "PASS -- matched N retires"
 ```
 
 The Spike source tree, build, install, and per-run logs are gitignored;
-only the harness (`Makefile`, `build_spike.sh`, `cosim_diff.py`) is
-committed.
+only the harness is committed: `cosim_diff.py` + `build_spike.sh` at
+`cosim/` (shared with the illegal-trap co-sim), and the `Makefile` at
+`cosim/quicksort/`.
 
 ## Trap oracle (`sw_trap/`)
 
@@ -171,7 +172,7 @@ cd sw_trap && make                                      # -> build/imem.hex + bu
 cd .. && make run RUN_ARGS="+IINIT=sw_trap/build/imem.hex +DINIT=sw_trap/build/dmem.hex"
 ```
 
-## Illegal-trap co-sim (`cosim_ecall/`)
+## Illegal-trap co-sim (`cosim/ecall/`)
 
 The Spike co-sim of a synchronous trap: a minimal illegal-instruction
 program (`ecall_test.S`, `.word 0x0000007f`) run on Spike + RTL and
@@ -182,7 +183,7 @@ Spike slave at 0x1000_0000), so the ecall / MSIP+WFI paths are covered
 only by the standalone oracle above.
 
 ```
-cd cosim_ecall && make cosim   # -> "PASS -- matched 17 retires"
+cd cosim/ecall && make cosim   # -> "PASS -- matched 17 retires" (run from sim/)
 ```
 
 ## Files
@@ -198,14 +199,17 @@ cd cosim_ecall && make cosim   # -> "PASS -- matched 17 retires"
 - `program.hex`   — von-Neumann oracle preload (RV32I/RVC/M/CSR).
 - `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs;
   `VON_NEUMANN=1` selects the legacy build).
-- `native_mem_tb/` — native RAM compliance test.
-- `ram_tb/`       — AXI4-Lite RAM compliance test.
-- `cosim/`        — RTL vs Spike golden ISA ref co-sim (see "Co-sim vs Spike").
-- `cosim_ecall/`  — Spike co-sim of an illegal-instruction sync trap
+- `hw/native_mem_tb/` — native RAM compliance test.
+- `hw/ram_tb/`       — AXI4-Lite RAM compliance test.
+- `cosim/`           — shared co-sim assets: `cosim_diff.py` +
+  `build_spike.sh` + the local Spike build/install.
+- `cosim/quicksort/` — RTL vs Spike golden ISA ref co-sim (see
+  "Co-sim vs Spike").
+- `cosim/ecall/`     — Spike co-sim of an illegal-instruction sync trap
   (see "Illegal-trap co-sim").
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
 - `sw_trap/`      — standalone M-mode trap-exercise program
   (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
 
-Build artefacts (`obj_dir/`, `sw/build/`, `*.vcd`, `*.log`) are
-gitignored.
+Build artefacts (`obj_dir/`, `sw/build/`, `cosim/ecall/build/`,
+`cosim/quicksort/*.log`, `*.vcd`, `*.log`) are gitignored.

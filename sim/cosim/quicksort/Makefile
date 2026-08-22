@@ -16,12 +16,12 @@
 # breaks the build, fix it first -- cosim cannot run without a building sim.
 
 SCRIPT_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
-SPIKE      := $(SCRIPT_DIR)riscv-isa-sim-install/bin/spike
-ELF        := $(SCRIPT_DIR)../sw/build/program.elf
+SPIKE      := $(SCRIPT_DIR)../riscv-isa-sim-install/bin/spike
+ELF        := $(SCRIPT_DIR)../../sw/build/program.elf
 # Harvard: the C build emits a code image (-> I-mem) and a data image
 # (-> D-mem), not a single program.hex. The RTL sim loads both.
-IMEM_HEX   := $(SCRIPT_DIR)../sw/build/imem.hex
-DMEM_HEX   := $(SCRIPT_DIR)../sw/build/dmem.hex
+IMEM_HEX   := $(SCRIPT_DIR)../../sw/build/imem.hex
+DMEM_HEX   := $(SCRIPT_DIR)../../sw/build/dmem.hex
 SPIKE_LOG  := $(SCRIPT_DIR)spike.log
 RTL_LOG    := $(SCRIPT_DIR)rtl.trace
 
@@ -49,11 +49,11 @@ SPIKE_MEM := 0x0:0x1000,0x2000:0xE000
 cosim: diff
 
 spike-build:
-	@bash $(SCRIPT_DIR)build_spike.sh
+	@bash $(SCRIPT_DIR)../build_spike.sh
 
 # Build the C program (ELF for Spike, imem/dmem hex for the RTL) if missing.
 $(ELF) $(IMEM_HEX) $(DMEM_HEX):
-	@$(MAKE) -C $(SCRIPT_DIR)../.. sw
+	@$(MAKE) -C $(SCRIPT_DIR)../../.. sw
 
 spike-run: $(ELF) spike-build
 	@echo "== running Spike (golden) =="
@@ -67,14 +67,14 @@ rtl-run: $(IMEM_HEX) $(DMEM_HEX)
 	@echo "== running RTL sim (RTL_TRACE=$(RTL_LOG)) =="
 	@rm -f $(RTL_LOG)
 	@RTL_TRACE=$(RTL_LOG) MAX_CYC=20000 \
-	  $(MAKE) -C $(SCRIPT_DIR).. run \
+	  $(MAKE) -C $(SCRIPT_DIR)../.. run \
 	    RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex" \
 	  >/dev/null
 	@test -s $(RTL_LOG) || { echo "rtl: no trace produced (RTL_TRACE unset? sim_main.cpp edit missing?)"; exit 1; }
 	@echo "rtl: $$(wc -l < $(RTL_LOG)) retires -> $(RTL_LOG)"
 
 diff: spike-run rtl-run
-	@python3 $(SCRIPT_DIR)cosim_diff.py --rtl $(RTL_LOG) --spike $(SPIKE_LOG)
+	@python3 $(SCRIPT_DIR)../cosim_diff.py --rtl $(RTL_LOG) --spike $(SPIKE_LOG)
 
 clean:
 	rm -f $(SPIKE_LOG) $(RTL_LOG)

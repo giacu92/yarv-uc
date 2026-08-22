@@ -28,7 +28,7 @@ sim/*.log
 # C-program build artefacts (sim/sw: C -> program.hex, regenerable)
 sim/sw/build/
 sim/sw_trap/build/
-sim/cosim_ecall/build/
+sim/cosim/ecall/build/
 
 # Local sim artifacts (backups, GTKWave session layouts — not shared)
 sim/program.hex.org
@@ -39,10 +39,10 @@ sim/waves.gtkw
 sim/cosim/riscv-isa-sim/
 sim/cosim/riscv-isa-sim-build/
 sim/cosim/riscv-isa-sim-install/
-sim/cosim/spike.log
-sim/cosim/rtl.trace
-sim/cosim_ecall/spike.log
-sim/cosim_ecall/rtl.trace
+sim/cosim/quicksort/spike.log
+sim/cosim/quicksort/rtl.trace
+sim/cosim/ecall/spike.log
+sim/cosim/ecall/rtl.trace
 
 # Editor / OS
 *.swp
@@ -50,4 +50,4 @@ sim/cosim_ecall/rtl.trace
 .DS_Store
 # Python bytecode (cosim_diff.py runs)
 sim/cosim/__pycache__/
-sim/cosim_ecall/__pycache__/
+sim/cosim/ecall/__pycache__/

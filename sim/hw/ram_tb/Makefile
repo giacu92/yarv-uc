@@ -7,13 +7,13 @@
 # Requires: verilator, g++.
 
 RTL := \
-	../../src/rtl/bus/axi4_lite_if.sv \
-	../../src/rtl/utils/axi4_lite_ram.sv \
+	../../../src/rtl/bus/axi4_lite_if.sv \
+	../../../src/rtl/utils/axi4_lite_ram.sv \
 	ram_tb.sv
 
 VFLAGS := --cc --exe --build --top-module ram_tb \
 	-Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT -Wno-LATCH -Wno-INITIALDLY -Wno-TIMESCALEMOD \
-	-I../../src/rtl/bus -I../../src/rtl/utils
+	-I../../../src/rtl/bus -I../../../src/rtl/utils
 
 TOP := obj_dir/Vram_tb
 

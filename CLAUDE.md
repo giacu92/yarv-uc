@@ -43,7 +43,7 @@ Gotcha: `gw_sh -pnr -do ...` silently no-ops (not a valid flag in V1.9.11.03) �
 `.cst`: `clk_i`→PIN10 (25MHz LVCMOS33), `rstn_i`→PIN88 (async active-low), `led_o[0]`=stall indicator, `led_o[3:1]`=counter alive.
 `.sdc`: `clk25`@25MHz on `clk_i`; generated `clk_core`@40MHz (sole timing-critical clock). At the 40MHz target PnR closes 40.058MHz Actual Fmax, worst setup slack +0.037ns, TNS 0 (0 failing endpoints) — verified on the remote build host 2026-08-21. (Previously at the 50MHz target it closed ~50.15MHz with ~0.06ns slack; the target was backed off to 40MHz for a safer, repeatable closure. Note Gowin's "Actual Fmax" tracks the constraint effort — a lower target yields a realized Fmax just above it, not the design's true headroom.) A/B test proved regfile primitive is NOT the limiter (BSRAM vs `syn_ramstyle="registers"` — identical Fmax); real critical path is route-dominated (~65% route) in execute/ALU/decode. `rstn_i`/`led_o` false-path.
 
-No lint config. Verilator sim in `sim/` (functional), `sim/native_mem_tb/` (native RAM protocol compliance), `sim/ram_tb/` (AXI4-Lite protocol compliance), and `sim/cosim/` (RTL vs Spike golden ISA ref).
+No lint config. Verilator sim in `sim/` (functional), `sim/hw/native_mem_tb/` (native RAM protocol compliance), `sim/hw/ram_tb/` (AXI4-Lite protocol compliance), and `sim/cosim/quicksort/` (RTL vs Spike golden ISA ref).
 
 ## Simulation (Verilator)
 
@@ -63,33 +63,33 @@ make VON_NEUMANN=1 run                # legacy single-AXI-master build
 ```
 Build artefacts gitignored.
 
-### Native RAM compliance test (`sim/native_mem_tb/`)
+### Native RAM compliance test (`sim/hw/native_mem_tb/`)
 Independent BFM master driving `native_ram` directly (a RW D-mem + a read-only I-mem). Checks RVALID registered & held until RREADY (the key fix vs a naive 1-cycle pulse), byte-strobed partial writes, back-to-back writes, single-outstanding (WREADY low while an unread read is held), posted store commits at launch-accept, and read-only ignoring writes.
 ```bash
-cd sim/native_mem_tb && make run     # "N checks, 0 failures"
+cd sim/hw/native_mem_tb && make run     # "N checks, 0 failures"
 ```
 
-### AXI4-Lite RAM compliance test (`sim/ram_tb/`)
+### AXI4-Lite RAM compliance test (`sim/hw/ram_tb/`)
 Independent BFM master driving `axi4_lite_ram` directly. `axi4_lite_ram` is now peri-side only in the Harvard build; `ram_tb` still covers it. Checks registered BVALID held under delayed BREADY (the key compliance fix), AW/W ordering, byte strobes, back-to-back writes, single-outstanding, RVALID held under delayed RREADY.
 ```bash
-cd sim/ram_tb && make run     # "N checks, 0 failures"
+cd sim/hw/ram_tb && make run     # "N checks, 0 failures"
 ```
 
-### Co-sim vs Spike (`sim/cosim/`)
+### Co-sim vs Spike (`sim/cosim/quicksort/`)
 Runs the same C-built ELF on Spike (upstream `riscv-isa-sim`, `--log-commits`, built locally once via `build_spike.sh`) and on the Verilator RTL, then `cosim_diff.py` diffs per-retire architectural effects (pc + register write). Spike is the golden ISA ref; Zilx is already upstream (no patch). The RTL sim writes a per-retire trace to `RTL_TRACE` (`sim_main.cpp`), the diff driver skips Spike's boot-ROM stub and parks both sides at the halt self-loop. Harvard co-sim requires `.data` at a non-zero VMA (link.ld `DMEM ORIGIN=0x2000`) so Spike's unified address space holds `.text`@0 and `.data`@0x2000 disjoint — at VMA 0 the LOAD segments clobber each other. The cosim `SPIKE_MEM` (`0x0:0x1000` code, `0x2000:0xE000` data+stack) matches that split.
 ```bash
 make cosim     # build sw + Spike, run both, diff -> "PASS -- matched N retires"
 ```
 
-### Trap oracle + illegal-trap cosim (`sim/sw_trap/`, `sim/cosim_ecall/`)
+### Trap oracle + illegal-trap cosim (`sim/sw_trap/`, `sim/cosim/ecall/`)
 `sim/sw_trap/trap_test.S` (built `-march=rv32imac_zicsr_zifencei` so the toolchain emits csr/mret/wfi) is a standalone M-mode program exercising ecall / load-misaligned / illegal / MSIP+WFI: it sets `mtvec` (direct), enables `mie.MSIE`+`mstatus.MIE`, runs the four tests, and the handler (keyed on `mcause`) advances `mepc`+4 for sync traps / clears MSIP + `mepc`=wfi+4 for the interrupt, leaving distinct D-mem markers; `main` self-checks them and writes `0x600D` at D-mem 0x2000 (pass) or `0xBAD` (probe word 0x800). Run from `sim/`:
 ```bash
 cd sw_trap && make       # build build/imem.hex + build/dmem.hex
 cd .. && make run RUN_ARGS="+IINIT=sw_trap/build/imem.hex +DINIT=sw_trap/build/dmem.hex"
 ```
-`sim/cosim_ecall/` is the Spike cosim of a sync trap: a minimal illegal-instruction program (`ecall_test.S`, `.word 0x0000007f`), run on Spike + RTL, diffed with the shared `cosim_diff.py`. `make cosim` -> "PASS -- matched N retires" (the faulting instr is not retired in either model). ecall itself is **not** Spike-comparable (Spike hijacks an M-mode ecall as the htif host-call exit; MSIP has no Spike slave at 0x1000_0000), so those paths are covered only by the standalone oracle above.
+`sim/cosim/ecall/` is the Spike cosim of a sync trap: a minimal illegal-instruction program (`ecall_test.S`, `.word 0x0000007f`), run on Spike + RTL, diffed with the shared `cosim_diff.py` (at `sim/cosim/cosim_diff.py`, symlinked into `sim/cosim/ecall/`). `make cosim` -> "PASS -- matched N retires" (the faulting instr is not retired in either model). ecall itself is **not** Spike-comparable (Spike hijacks an M-mode ecall as the htif host-call exit; MSIP has no Spike slave at 0x1000_0000), so those paths are covered only by the standalone oracle above.
 ```bash
-cd cosim_ecall && make cosim   # -> "PASS -- matched 17 retires"
+cd cosim/ecall && make cosim   # -> "PASS -- matched 17 retires" (run from sim/)
 ```
 
 ## Code formatting (Verible)
@@ -147,7 +147,7 @@ Source priority: spanning stitch > compressed hold > odd-half target > fresh low
 - I-mem `INIT_FILE` must point at firmware for any meaningful synthesis (a read-only RAM with empty init folds to constant 0 → the whole pipeline sweeps as dead code). `top_module.sv` `u_imem` currently loads `sim/imem.hex` (the oracle) as the timing-closure / bring-up firmware; a real product bitstream re-points it at the application firmware.
 - LSU done (loads/stores/Zilx retire via native D-mem + peri bridge; load-use covered by RAW interlock; posted store for both D-mem and peri).
 - **Peripherals + interrupt sources — current active front (see root `README.md` Roadmap).** Only MSIP is wired today (`msip_peri`, `mip.MSIP`); `mip.MTIP`/`MEIP` hardwired 0, `axi_bus_peri` has one slave. Planned, in order: (1) CLINT-style timer — 64-bit `mtime`/`mtimecmp` as two 32-bit MMIO register pairs, `mtime >= mtimecmp` compare inside the peripheral → a single level bit into `csr_regfile` like `msip_o`→`mip[3]`; reuse `msip_peri.sv`'s AXI4-Lite skeleton. (2) Multi-slave 1→N AXI4-Lite address-decode mux on `axi_bus_peri` (same pattern as the 1→2 `axi4_lite_xbar`, one level down) — the actual blocker for any second slave. (3) Wire the existing `src/rtl/utils/axi4_lite_uart.sv` (8N1, single-buffer TX/RX, 5-reg map TXDATA/RXDATA/STATUS/CTRL/BAUDDIV, level IRQ) into `top_module.sv` + sim + `.gprj` — not yet wired/simmed/synth'd. (4) GPIO (dir/out/in, per-pin or global IRQ, same MMIO template). (5) Simple PLIC-style interrupt controller — deprioritized until 3+ IRQ sources (UART+GPIO+timer).
-- **Trap/exception/interrupt machinery done** (machine mode): precise sync traps (illegal/ecall/ebreak/load|store-addr-misaligned), `mret`, `wfi`=halt, `fence`/`fence.i`=nop, mstatus MIE/MPIE/MPP entry/return semantics, mtvec direct+vectored, mepc/mcause/mtval writes, machine software interrupt via `msip_peri` (MMIO bit[0] → mip.MSIP), taken at a retire boundary or on a WFI wake. Sim-verified: standalone trap oracle (`sim/sw_trap`, `+IINIT=sw_trap/build/imem.hex` — ecall/misaligned/illegal/MSIP+WFI, self-checks markers → 0x600D) + Spike cosim of an illegal-trap (`sim/cosim_ecall`, `make cosim` — PASS, 17 matched; ecall itself is not Spike-comparable: Spike hijacks M-mode ecall as the htif exit). Quicksort cosim unchanged (2165 matched). Remaining trap work: timer/external interrupts (`mtime`/MTIP, MEIP), S/U-mode + delegation, instruction-access-fault, a vectored-mode interrupt cosim (direct mode covered).
+- **Trap/exception/interrupt machinery done** (machine mode): precise sync traps (illegal/ecall/ebreak/load|store-addr-misaligned), `mret`, `wfi`=halt, `fence`/`fence.i`=nop, mstatus MIE/MPIE/MPP entry/return semantics, mtvec direct+vectored, mepc/mcause/mtval writes, machine software interrupt via `msip_peri` (MMIO bit[0] → mip.MSIP), taken at a retire boundary or on a WFI wake. Sim-verified: standalone trap oracle (`sim/sw_trap`, `+IINIT=sw_trap/build/imem.hex` — ecall/misaligned/illegal/MSIP+WFI, self-checks markers → 0x600D) + Spike cosim of an illegal-trap (`sim/cosim/ecall`, `make cosim` — PASS, 17 matched; ecall itself is not Spike-comparable: Spike hijacks M-mode ecall as the htif exit). Quicksort cosim unchanged (2165 matched). Remaining trap work: timer/external interrupts (`mtime`/MTIP, MEIP), S/U-mode + delegation, instruction-access-fault, a vectored-mode interrupt cosim (direct mode covered).
 - **Synth + PnR of the trap path: NOT yet re-confirmed.** The remote build host `192.168.10.36` was offline 2026-08-22; the last confirmed closure (2026-08-21, pre-trap) was Harvard clean + PnR 40MHz (40.058MHz Fmax, +0.037ns slack, TNS 0). The trap path adds mepc/mcause/mtval/mstatus trap-write ports (cheap FF) + a small redirect mux into the fetch redirect path — re-run `gw_sh impl/synth_check.tcl` then `impl/pnr_check.tcl` on the remote host once it's back to confirm 40 MHz still closes (check worst slack, especially the redirect-mux fan-in).
 - RVC spanning is handled (see Decode behaviour); remaining cost is the 1-cycle `span_wait` bubble per spanning instr (would need a wider F/D to avoid).
 - I-mem is single-outstanding (~2 cyc/instr); a pipelined 1-cyc/instr I-mem (BSRAM supports pipelined reads; needs backpressure skid) is a later fetch-throughput optimization, out of scope.

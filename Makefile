@@ -94,7 +94,8 @@ wave: sim
 #
 clean:
 	$(MAKE) -C sim clean
-	$(MAKE) -C sim/cosim clean
+	$(MAKE) -C sim/cosim/quicksort clean
+	$(MAKE) -C sim/cosim/ecall clean
 
 run:
 	$(MAKE) -C sim run
@@ -124,7 +125,7 @@ sw-run: sw
 # Build (once) a local Spike with commit logging, build the C program,
 # run it on both Spike and the Verilator sim, and diff per-retire pc +
 # register writes. First run needs Spike build deps (see
-# sim/cosim/build_spike.sh). Delegated to sim/cosim/Makefile.
+# sim/cosim/build_spike.sh). Delegated to sim/cosim/quicksort/Makefile.
 #
 cosim:
-	$(MAKE) -C sim/cosim cosim
+	$(MAKE) -C sim/cosim/quicksort cosim
