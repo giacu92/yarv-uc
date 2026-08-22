@@ -2,17 +2,25 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/giacu92/yarv-uc)
 
-Disclaimer: This project is created by me with the assistance of Claude Code (Anthropic).
-I used mostly AI for help me coding and verification of the core.
+Disclaimer: This project is created by me with the assistance of Claude Code
+(Anthropic). I used AI mostly to help me code and verify the core.
 
-A RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
+> **Status: work in progress.** This is a hobby/learning core, not a
+> production soft-IP. The pipeline, memory system, Zicsr + Zifencei, and
+> machine-mode trap/exception/interrupt machinery are implemented and
+> sim-verified (Verilator + Spike co-sim), but several peripherals and
+> interrupt sources are still missing — see **Roadmap** below. Synthesis
+> + PnR of the most recent (trap) changes have not been re-confirmed on
+> the build host yet.
+
+An RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based
 board. The board is clocked by a 25 MHz single-ended reference from an
 MS5351M clock generator (CLK0 on PIN10, LVCMOS33); an on-chip rPLL
 multiplies it up to a 40 MHz `clk_core` that drives the whole fabric.
 
-The core is a work-in-progress **in-order, 3-stage pipeline — Fetch /
-Decode / Execute (F/D/E)** — with a **Harvard** memory system: a dedicated
+The core is an **in-order, 3-stage pipeline — Fetch / Decode / Execute
+(F/D/E)** — with a **Harvard** memory system: a dedicated
 read-only I-mem for fetch and a byte-strobed D-mem for the LSU, with AXI
 kept only for peripherals. A compile-time `VON_NEUMANN` switch retains the
 legacy single-AXI-master topology (fetch+LSU share one port through a
@@ -74,6 +82,45 @@ Synth + PnR of the trap path are **not yet re-confirmed** — the last
 confirmed closure (pre-trap) was Harvard clean + 40 MHz PnR; rerun
 `synth_check.tcl` + `pnr_check.tcl` on the build host once it is back.
 
+## Roadmap (what is next)
+
+The peripheral/interrupt story is the current active front. Only the
+**MSIP** software interrupt (`msip_peri`, MMIO bit[0] → `mip.MSIP`) is
+wired today; `mip.MTIP`/`MEIP` are hardwired 0 and the peri bus has a
+single slave. The planned work, in order:
+
+1. **CLINT-style timer (`mtime`/`mtimecmp` → MTIP).** A 64-bit `mtime`
+   + 64-bit `mtimecmp` exposed as two 32-bit MMIO register pairs.
+   Atomic 64-bit reads on RV32 use the standard software pattern (read
+   high, read low, re-read high, retry on rollover — no special hardware
+   needed). The `mtime >= mtimecmp` compare is done inside the peripheral,
+   which outputs a single level bit into `csr_regfile.sv` the same way
+   `msip_o` already drives `mip[3]`. Reuses `msip_peri.sv`'s AXI4-Lite
+   slave skeleton as a base.
+2. **Multi-slave address-decode mux on the peri bus.** `axi_bus_peri`
+   currently has only `msip_peri` as a slave and accepts any address
+   unconditionally. A small 1→N AXI4-Lite mux inside the peri domain
+   (same pattern as the existing 1→2 `axi4_lite_xbar` for the mem/peri
+   split, just one level down) is needed before a second slave can land.
+   This is the actual blocker for UART / timer / GPIO coexistence.
+3. **Wire the UART in.** An AXI4-Lite UART slave (`axi4_lite_uart.sv`)
+   already exists — 8N1, single-buffer TX/RX, a 5-register MMIO map
+   (TXDATA/RXDATA/STATUS/CTRL/BAUDDIV), level-sensitive interrupt. It is
+   not yet wired into `top_module.sv` (blocked on item 2) and not yet
+   simulated or synthesized.
+4. **GPIO.** Direction / output / input registers, per-pin or global
+   interrupt. Same MMIO/AXI4-Lite slave template as UART/MSIP.
+5. **Simple PLIC-style interrupt controller.** Deprioritized: with only
+   MSIP + (future) MTIP + UART, direct `mie`/`mip` routing is still
+   manageable without an arbiter. Revisit once 3+ independent IRQ
+   sources exist (UART + GPIO + timer).
+
+Also still open: timer/external interrupts (covered by item 1 + future
+MEIP source), a vectored-mode interrupt co-sim (direct mode is covered),
+and re-confirming 40 MHz synth + PnR closure with the trap path on the
+build host. S/U mode, delegation, PMP, and instruction-access-fault traps
+remain deferred.
+
 The CPU exposes **three** ports (Harvard): a native `imem` (fetch,
 read-only), a native `dmem` (LSU data, byte-strobed), and an AXI4-Lite
 master `axi_peri` for memory-mapped peripherals. The native
@@ -94,7 +141,8 @@ src/rtl/pkg/   rv32_pkg.sv          — types, opcodes, de_t D/E control struct
 src/rtl/core/  pipeline stages + CPU top + reg file + ALU + trap unit + board top
 src/rtl/bus/   AXI4-Lite interface + master bridge + arbiter + crossbar
 src/rtl/utils/ axi4_lite_ram.sv (AXI slave), native_ram.sv (Harvard I/D-mem),
-               msip_peri.sv (MSIP MMIO slave — machine software interrupt)
+               msip_peri.sv (MSIP MMIO slave — machine software interrupt),
+               axi4_lite_uart.sv (UART MMIO slave — exists, not yet wired in)
 src/phys/      pin assignment (.cst) + timing constraints (.sdc)
 impl/          Gowin EDA project + synthesis/PnR Tcl + reports
 sim/           Verilator functional sim + native & AXI RAM compliance tests

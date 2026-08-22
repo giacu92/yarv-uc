@@ -5,7 +5,9 @@ execute + LSU + Zicsr CSR file + trap/exception/interrupt unit). The
 default **Harvard** build wires the CPU to a native read-only I-mem
 (`native_ram`, `+IINIT`) and a native byte-strobed D-mem (`native_ram`,
 `+DINIT`); the AXI4-Lite peripheral bus carries the `msip_peri` MMIO
-slave (machine software interrupt). The legacy **von-Neumann** build
+slave (machine software interrupt) — the only peri slave for now; an
+`axi4_lite_uart.sv` slave exists on disk but is not yet wired in (see
+the root `README.md` Roadmap). The legacy **von-Neumann** build
 (`VON_NEUMANN=1`) keeps the `mem_arbiter` + `axi4_lite_xbar` + single
 AXI4-Lite RAM (`+INIT`) topology. The board top's wiring is replicated
 in `sim_top.sv` so the memories can be preloaded and the CPU's
