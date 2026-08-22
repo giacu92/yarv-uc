@@ -1,7 +1,5 @@
 package rv32_pkg;
 
-    //`define VON_NEUMANN;
-
 
     localparam int unsigned XLEN          = 32;
     localparam int unsigned STRB_WIDTH    = XLEN / 8;
@@ -186,6 +184,7 @@ package rv32_pkg;
     localparam logic [XLEN-1:0] MCAUSE_SAD_MIS = 32'h0000_0006;  // store/AMO addr misaligned
     localparam logic [XLEN-1:0] MCAUSE_ECALL_M = 32'h0000_000B;  // env call from M-mode (11)
     localparam logic [XLEN-1:0] MCAUSE_MSI = 32'h8000_0003;  // machine software interrupt
+    localparam logic [XLEN-1:0] MCAUSE_MTI = 32'h8000_0007;  // machine timer interrupt
 
     // mstatus machine-mode field bit positions (RV32).
     localparam int MSTATUS_MIE_BIT = 3;  // M-mode global interrupt enable
@@ -200,6 +199,14 @@ package rv32_pkg;
     // Machine software interrupt MMIO register (peri region, PERI_ADDR_BIT=28).
     // A write of bit[0] sets/clears mip.MSIP. Peri base = 0x1000_0000.
     localparam logic [XLEN-1:0] MSIP_PERI_ADDR = 32'h1000_0000;
+
+    // Machine timer MMIO registers (CLINT-style). The timer lives in the
+    // peri region at MTIMER_BASE (0x1000_1000), selected by the peri xbar on
+    // addr[12]=1 (msip is at addr[12]=0). mtime is a free-running 64-bit
+    // counter (RO); mtimecmp is the 64-bit compare (RW). mtip = mtime>=mtimecmp.
+    localparam logic [XLEN-1:0] MTIMER_BASE = 32'h1000_1000;
+    localparam int unsigned MTIME_OFF = 5'h0;  // mtime_lo @ +0, mtime_hi @ +4
+    localparam int unsigned MTIMECMP_OFF = 5'h8;  // mtimecmp_lo @ +8, mtimecmp_hi @ +C
 
     typedef enum logic [11:0] {
         CSR_ADDR_MSTATUS  = 12'h300,

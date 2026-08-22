@@ -68,7 +68,7 @@ import rv32_pkg::*;
 */
 
 module axi4_lite_uart #(
-    parameter int unsigned CLK_FREQ_HZ = 40e,
+    parameter int unsigned CLK_FREQ_HZ = 40e6,
     parameter int unsigned BAUD_RATE   = 115200
 ) (
     input wire clk_i,
@@ -122,14 +122,14 @@ module axi4_lite_uart #(
     } tx_state_e;
 
     tx_state_e       tx_state_q;
-    logic     [ 7:0] tx_shift_q;
-    logic     [ 2:0] tx_bit_cnt_q;
-    logic            tx_pending_q;   // a byte is latched, waiting to start
-    logic     [ 7:0] tx_pending_data_q;
+    logic      [7:0] tx_shift_q;
+    logic      [2:0] tx_bit_cnt_q;
+    logic            tx_pending_q;  // a byte is latched, waiting to start
+    logic      [7:0] tx_pending_data_q;
     logic            txd_q;
 
-    wire tx_idle  = (tx_state_q == TX_IDLE);
-    wire tx_ready = tx_idle & ~tx_pending_q;  // STATUS.TX_READY
+    wire             tx_idle = (tx_state_q == TX_IDLE);
+    wire             tx_ready = tx_idle & ~tx_pending_q;  // STATUS.TX_READY
 
     assign txd_o = txd_q;
 
@@ -143,15 +143,15 @@ module axi4_lite_uart #(
         RX_STOP
     } rx_state_e;
 
-    rx_state_e       rx_state_q;
-    logic     [ 7:0] rx_shift_q;
-    logic     [ 2:0] rx_bit_cnt_q;
-    logic     [15:0] rx_cnt_q;       // per-bit sample counter (this state)
-    logic     [ 7:0] rx_data_q;      // last completed byte (RXDATA)
-    logic            rx_ready_q;     // STATUS.RX_READY
-    logic            rx_overrun_q;   // STATUS.RX_OVERRUN (sticky)
+    rx_state_e        rx_state_q;
+    logic      [ 7:0] rx_shift_q;
+    logic      [ 2:0] rx_bit_cnt_q;
+    logic      [15:0] rx_cnt_q;  // per-bit sample counter (this state)
+    logic      [ 7:0] rx_data_q;  // last completed byte (RXDATA)
+    logic             rx_ready_q;  // STATUS.RX_READY
+    logic             rx_overrun_q;  // STATUS.RX_OVERRUN (sticky)
 
-    wire rx_idle = (rx_state_q == RX_IDLE);
+    wire              rx_idle = (rx_state_q == RX_IDLE);
 
     // =================================================================
     // CTRL
@@ -161,24 +161,24 @@ module axi4_lite_uart #(
     // =================================================================
     // AXI write path (register-mapped, same accept pattern as msip_peri).
     // =================================================================
-    logic               aw_seen_q;
-    logic               w_seen_q;
-    logic [DATA_W-1:0]  wdata_q;
-    logic [        2:0] awaddr_word_q;
-    logic               bvalid_q;
+    logic              aw_seen_q;
+    logic              w_seen_q;
+    logic [DATA_W-1:0] wdata_q;
+    logic [       2:0] awaddr_word_q;
+    logic              bvalid_q;
 
     assign axi.awready = !aw_seen_q && !bvalid_q;
     assign axi.wready  = !w_seen_q && !bvalid_q;
 
-    wire aw_hs = axi.awvalid && axi.awready;
-    wire w_hs  = axi.wvalid && axi.wready;
+    wire              aw_hs = axi.awvalid && axi.awready;
+    wire              w_hs = axi.wvalid && axi.wready;
 
-    wire aw_present = aw_seen_q || aw_hs;
-    wire w_present  = w_seen_q || w_hs;
-    wire do_write   = aw_present && w_present && !bvalid_q;
+    wire              aw_present = aw_seen_q || aw_hs;
+    wire              w_present = w_seen_q || w_hs;
+    wire              do_write = aw_present && w_present && !bvalid_q;
 
-    wire [2:0]        waddr_eff = aw_hs ? axi.awaddr[4:2] : awaddr_word_q;
-    wire [DATA_W-1:0]  wdata_eff = w_hs ? axi.wdata : wdata_q;
+    wire [       2:0] waddr_eff = aw_hs ? axi.awaddr[4:2] : awaddr_word_q;
+    wire [DATA_W-1:0] wdata_eff = w_hs ? axi.wdata : wdata_q;
 
     assign axi.bvalid = bvalid_q;
     assign axi.bresp  = 2'b00;  // OKAY
@@ -192,13 +192,13 @@ module axi4_lite_uart #(
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            aw_seen_q     <= 1'b0;
-            w_seen_q      <= 1'b0;
-            wdata_q       <= '0;
-            awaddr_word_q <= '0;
-            bvalid_q      <= 1'b0;
-            tx_ie_q       <= 1'b0;
-            rx_ie_q       <= 1'b0;
+            aw_seen_q           <= 1'b0;
+            w_seen_q            <= 1'b0;
+            wdata_q             <= '0;
+            awaddr_word_q       <= '0;
+            bvalid_q            <= 1'b0;
+            tx_ie_q             <= 1'b0;
+            rx_ie_q             <= 1'b0;
             div_pending_q       <= '0;
             div_pending_valid_q <= 1'b0;
         end else begin
@@ -335,9 +335,9 @@ module axi4_lite_uart #(
                 TX_START: begin
                     if (tx_baud_tick) begin
                         tx_baud_cnt_q <= '0;
-                        tx_state_q   <= TX_DATA;
-                        tx_bit_cnt_q <= '0;
-                        txd_q        <= tx_shift_q[0];
+                        tx_state_q    <= TX_DATA;
+                        tx_bit_cnt_q  <= '0;
+                        txd_q         <= tx_shift_q[0];
                     end else begin
                         tx_baud_cnt_q <= tx_baud_cnt_q + 16'd1;
                     end
@@ -362,7 +362,7 @@ module axi4_lite_uart #(
                 TX_STOP: begin
                     if (tx_baud_tick) begin
                         tx_baud_cnt_q <= '0;
-                        tx_state_q <= TX_IDLE;
+                        tx_state_q    <= TX_IDLE;
                     end else begin
                         tx_baud_cnt_q <= tx_baud_cnt_q + 16'd1;
                     end

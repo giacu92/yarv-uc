@@ -9,16 +9,16 @@ import rv32_pkg::*;
  * bridge that turns the native mem_req_t / mem_rsp_t into AR/AW/W +
  * R/B at the single master port.
  *
- * External view of the CPU (Harvard build, default — VON_NEUMANN
- * undefined):
+ * External view of the CPU (Harvard):
  *
  *   - `axi_peri` : AXI4-Lite master carrying PERIPHERAL traffic only
- *                 (UART, GPIO, ...). The LSU steers addr[PERI_ADDR_BIT]=1
- *                 accesses here through an internal peri bridge.
+ *                 (MSIP, CLINT timer, future UART/GPIO). The LSU steers
+ *                 addr[PERI_ADDR_BIT]=1 accesses here through an internal
+ *                 peri bridge.
  *   - `imem_req_o`/`imem_rsp_i` : native fetch port (read-only I-mem).
  *   - `dmem_req_o`/`dmem_rsp_i` : native LSU data port (byte-strobed D-mem).
  *
- * Internally (Harvard):
+ * Internally:
  *
  *   fetch_stage  ──► imem_req_o/imem_rsp_i        (dedicated I-mem, no
  *                                                   contention with the LSU)
@@ -30,11 +30,6 @@ import rv32_pkg::*;
  * board top is pure point-to-point wires — no crossbar. The bridge is a
  * single-outstanding FSM that turns a native req.wvalid/rsp.wready (launch)
  * + rsp.rvalid/req.rready (read) handshake into an AXI4-Lite transaction.
- *
- * The `VON_NEUMANN` build is the legacy von-Neumann fallback: one
- * unified `bus_axi` master, fetch+LSU share a mem_arbiter (LSU priority) →
- * the bridge, and a top-level crossbar splits mem/peri. The CPU is agnostic
- * to mem/peri only in that build.
  *
  * No debug signals cross the CPU boundary: the per-stage pc / instr /
  * valid / writeback taps live on the stage blocks and on internal nets
@@ -53,14 +48,8 @@ module rv32imac_zicsr_zifencei (
     input  wire [XLEN-1:0] boot_addr_i,  // Reset vector boot address
     output wire            dbg_stall_o,  // decode or execute stage stall
 
-`ifdef VON_NEUMANN
-    // AXI4-Lite master: unified memory + peripheral bus (von Neumann
-    // fetch+data, plus MMIO). A top-level crossbar splits mem/peri.
-    axi4_lite_if.master bus_axi
-
-`else
-    // Harvard: AXI4-Lite master for peripherals only. Fetch and LSU data
-    // RAM use the native imem_/dmem_ ports below (no AXI for memory).
+    // AXI4-Lite master for peripherals only. Fetch and LSU data RAM use
+    // the native imem_/dmem_ ports below (no AXI for memory).
     axi4_lite_if.master axi_peri,
 
     // Native I-mem (fetch, read-only).
@@ -69,14 +58,17 @@ module rv32imac_zicsr_zifencei (
 
     // Native D-mem (LSU data RAM, byte-strobed).
     output mem_req_t dmem_req_o,
-    input  mem_rsp_t dmem_rsp_i
-`endif
-    ,
+    input  mem_rsp_t dmem_rsp_i,
 
     // Machine software-interrupt pending bit from the MSIP MMIO slave
-    // (on axi_peri at the board top). Drives mip.MSIP. Common to both
-    // builds; the von-Neumann board top ties it low (no MSIP slave there).
-    input wire msip_i
+    // (on axi_peri at the board top). Drives mip.MSIP. Read-only from CSR
+    // write — SW clears it via the MMIO slave, not by writing mip.
+    input wire msip_i,
+
+    // Machine timer-interrupt pending bit from the CLINT timer MMIO slave
+    // (on axi_peri at the board top). Drives mip.MTIP. Read-only from CSR
+    // write — SW clears it by writing mtimecmp > mtime, not by writing mip.
+    input wire mtip_i
 );
 
     // ===================================================================
@@ -90,32 +82,25 @@ module rv32imac_zicsr_zifencei (
     // execute stage's div stall). branch_* come from the execute stage's
     // branch-resolve path (redirect + in-flight flush).
     // -----------------------------------------------------------------
-    // Von Neumann memory: fetch and the LSU share one imem port through
-    // a mem_arbiter (LSU priority). fe_* = fetch native side, lsu_* =
-    // LSU native side, imem_* = arbiter slave side -> the imem bridge.
+    // Fetch owns the I-mem port uncontended (Harvard). fe_* = fetch native
+    // side -> imem_req_o/imem_rsp_i.
     // -------------------------------------------------------------
-    mem_req_t fe_req;
-    mem_rsp_t fe_rsp;
-`ifdef VON_NEUMANN
-    mem_req_t lsu_req;
-    mem_rsp_t lsu_rsp;
-    mem_req_t imem_req;
-    mem_rsp_t imem_rsp;
-`else
-    mem_req_t peri_req;
-    mem_rsp_t peri_rsp;
-`endif
+    mem_req_t            fe_req;
+    mem_rsp_t            fe_rsp;
+    // LSU native peri side -> the peri bridge -> axi_peri.
+    mem_req_t            peri_req;
+    mem_rsp_t            peri_rsp;
 
     // F/D pipeline-register taps, consumed by the decode stage below.
-    wire [XLEN-1:0] fe_pc;
-    wire [XLEN-1:0] fe_instr;
-    wire            fe_valid;
+    wire      [XLEN-1:0] fe_pc;
+    wire      [XLEN-1:0] fe_instr;
+    wire                 fe_valid;
 
     // Decode -> fetch back-pressure (propagates execute's stall).
-    wire            dec_stall;
+    wire                 dec_stall;
     // Execute -> fetch redirect.
-    wire            ex_branch_valid;
-    wire [XLEN-1:0] ex_branch_addr;
+    wire                 ex_branch_valid;
+    wire      [XLEN-1:0] ex_branch_addr;
 
     // -------------------------------------------------------------
     // Register file + decode/execute
@@ -126,43 +111,44 @@ module rv32imac_zicsr_zifencei (
     // drives the reg-file write port (ALU / PC4 writeback), the fetch
     // redirect, and decode's stall (div) / flush (branch).
     // -------------------------------------------------------------
-    wire [     4:0] rs1_addr;
-    wire [     4:0] rs2_addr;
-    wire [XLEN-1:0] rs1_data;
-    wire [XLEN-1:0] rs2_data;
+    wire      [     4:0] rs1_addr;
+    wire      [     4:0] rs2_addr;
+    wire      [XLEN-1:0] rs1_data;
+    wire      [XLEN-1:0] rs2_data;
 
-    wire [     4:0] wb_addr;
-    wire [XLEN-1:0] wb_data;
-    wire            wb_en;
+    wire      [     4:0] wb_addr;
+    wire      [XLEN-1:0] wb_data;
+    wire                 wb_en;
 
-    de_t            de_bus;
+    de_t                 de_bus;
 
     // de_* D/E taps (decode stage outputs). Debug only — left
     // unconnected here; the sim probes them via the Verilator hierarchy.
-    wire [XLEN-1:0] de_pc;
-    wire [XLEN-1:0] de_instr;
-    wire            de_valid;
+    wire      [XLEN-1:0] de_pc;
+    wire      [XLEN-1:0] de_instr;
+    wire                 de_valid;
 
     // Execute -> decode back-pressure / flush.
-    wire            ex_stall;
-    wire            ex_flush;
+    wire                 ex_stall;
+    wire                 ex_flush;
 
     // CSR
-    wire [XLEN-1:0] csr_wdata;
-    wire            csr_we;
-    wire [XLEN-1:0] csr_rdata;
+    wire      [XLEN-1:0] csr_wdata;
+    wire                 csr_we;
+    wire      [XLEN-1:0] csr_rdata;
 
     // CSR taps (trap unit reads mtvec / mepc / mstatus / mip / mie).
     wire [XLEN-1:0] csr_mtvec, csr_mepc, csr_mstatus, csr_mip, csr_mie;
 
     // Trap-write bundle (trap unit -> CSR file) + triggers/payload
-    // (execute "exception logic" -> trap unit) + the pending interrupt and
-    // resolved redirect fed back to execute.
+    // (execute "exception logic" -> trap unit) + the pending interrupt, its
+    // resolved cause, and the resolved redirect fed back to execute.
     wire we_mepc, we_mcause, we_mtval, we_mstatus;
     wire [XLEN-1:0] d_mepc, d_mcause, d_mtval, d_mstatus;
     wire sync_trap_req, mret_req, take_interrupt;
     wire [XLEN-1:0] trap_cause, trap_tval, trap_pc;
     wire            int_pending;
+    wire [XLEN-1:0] int_cause;
     wire [XLEN-1:0] trap_redirect_addr;
 
     // ex_* E/M taps (retired op pc / instr / valid). Debug only — left
@@ -196,48 +182,20 @@ module rv32imac_zicsr_zifencei (
         .fe_valid_o    (fe_valid)
     );
 
-`ifdef VON_NEUMANN
-    // -------------------------------------------------------------
-    // Memory arbiter: fetch + LSU -> single imem bridge. LSU has fixed
-    // priority (a data access stalls fetch ~2 cycles); fetch and the LSU
-    // cannot both hold the bridge (single outstanding).
-    // -------------------------------------------------------------
-    mem_arbiter u_mem_arb (
-        .clk_i      (clk_i),
-        .rstn_i     (rstn_i),
-        .fetch_req_i(fe_req),
-        .fetch_rsp_o(fe_rsp),
-        .lsu_req_i  (lsu_req),
-        .lsu_rsp_o  (lsu_rsp),
-        .slv_req_o  (imem_req),
-        .slv_rsp_i  (imem_rsp)
-    );
-`endif
-
     // -------------------------------------------------------------
     // On-die AXI4-Lite bridge (single master port)
     //
     // Translates the native mem_req_t / mem_rsp_t into AXI4-Lite
     // AR/AW/W + R/B. The pipeline only ever deals with one-cycle
-    // request/response; the bridge owns the bus protocol. Both memory
-    // and peripheral addresses flow through this one bridge — the
-    // board top's crossbar splits them by address downstream.
+    // request/response; the bridge owns the bus protocol. Peripheral
+    // addresses flow through this bridge to the board top's peri bus.
     // -------------------------------------------------------------
     axi4_lite_master_bridge u_bus_bridge (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
-`ifdef VON_NEUMANN
-        .req_i (imem_req),
-        .rsp_o (imem_rsp),
-`else
         .req_i (peri_req),
         .rsp_o (peri_rsp),
-`endif
-`ifdef VON_NEUMANN
-        .axi   (bus_axi)
-`else
         .axi   (axi_peri)
-`endif
     );
 
     // GPR Regfile
@@ -274,6 +232,7 @@ module rv32imac_zicsr_zifencei (
         .we_mstatus_i  (we_mstatus),
         .d_mstatus_i   (d_mstatus),
         .msip_i        (msip_i),
+        .mtip_i        (mtip_i),
         .mtvec_o       (csr_mtvec),
         .mepc_o        (csr_mepc),
         .mstatus_o     (csr_mstatus),
@@ -285,9 +244,9 @@ module rv32imac_zicsr_zifencei (
     // Trap unit (combinational peer of the execute stage): consumes the
     // triggers + cause/tval/pc the execute "exception logic" produces,
     // drives the CSR trap-write bundle (mepc / mcause / mtval / mstatus) and
-    // the fetch redirect, and reports the pending+enabled MS interrupt back
-    // to execute. int_pending depends only on the CSR taps (no loop through
-    // the triggers).
+    // the fetch redirect, and reports the pending+enabled interrupt and its
+    // resolved cause back to execute. int_pending / int_cause depend only on
+    // the CSR taps (no loop through the triggers).
     trap_unit u_trap (
         .mtvec_i         (csr_mtvec),
         .mepc_i          (csr_mepc),
@@ -310,7 +269,8 @@ module rv32imac_zicsr_zifencei (
         .csr_d_mtval_o   (d_mtval),
         .csr_we_mstatus_o(we_mstatus),
         .csr_d_mstatus_o (d_mstatus),
-        .int_pending_o   (int_pending)
+        .int_pending_o   (int_pending),
+        .int_cause_o     (int_cause)
     );
 
     decode_stage u_decode (
@@ -350,21 +310,18 @@ module rv32imac_zicsr_zifencei (
         .wb_en_o             (wb_en),
         .branch_valid_o      (ex_branch_valid),
         .branch_addr_o       (ex_branch_addr),
-`ifdef VON_NEUMANN
-        .mem_req_o           (lsu_req),
-        .mem_rsp_i           (lsu_rsp),
-`else
         .mem_req_o           (dmem_req_o),
         .mem_rsp_i           (dmem_rsp_i),
         .peri_req_o          (peri_req),
         .peri_rsp_i          (peri_rsp),
-`endif
         // Trap machinery: execute "exception logic" emits the triggers +
-        // cause/tval/pc, imports the pending interrupt + resolved redirect
-        // (from the trap unit). int_pending is combinational off the CSR
-        // taps (no loop through the triggers); redirect_addr selects trap /
-        // mret / interrupt target over the normal branch.
+        // cause/tval/pc, imports the pending interrupt + its resolved cause
+        // + the resolved redirect (from the trap unit). int_pending /
+        // int_cause are combinational off the CSR taps (no loop through the
+        // triggers); redirect_addr selects trap / mret / interrupt target
+        // over the normal branch.
         .int_pending_i       (int_pending),
+        .int_cause_i         (int_cause),
         .trap_redirect_addr_i(trap_redirect_addr),
         .sync_trap_req_o     (sync_trap_req),
         .mret_req_o          (mret_req),
@@ -384,10 +341,8 @@ module rv32imac_zicsr_zifencei (
     // Aggregate stall tap for the board / sim (functional only).
     assign dbg_stall_o = dec_stall | ex_stall;
 
-`ifndef VON_NEUMANN
-    assign imem_req_o = fe_req;
-    assign fe_rsp     = imem_rsp_i;
-`endif
+    assign imem_req_o  = fe_req;
+    assign fe_rsp      = imem_rsp_i;
 
 endmodule
 

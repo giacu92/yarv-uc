@@ -14,19 +14,9 @@
 # =============================================================================
 
 # Primary clock: 25 MHz single-ended input on clk_i (PIN10). Period = 40 ns.
-# 50/50 duty cycle.
+# 50/50 duty cycle. clk_core is clk_i directly (no rPLL — see top_module),
+# so this single clock constrains the whole fabric.
 create_clock -name clk25 -period 40 [get_ports {clk_i}]
-
-# CPU core clock: rPLL CLKOUT drives the clk_core net.
-#   fCLKOUT = FCLKIN * FBDIV / IDIV = 25 * 8 / 5 = 40 MHz
-#   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=7 -> FBDIV=8; ODIV_SEL=16 sets the
-#   VCO = 25*8*16/5 = 640 MHz but does NOT divide CLKOUT).
-#   Period = 40 * 5 / 8 = 25 ns.  multiply_by 8 / divide_by 5 expresses the
-#   8/5 ratio in smallest integers.
-# Gowin auto-derives a clock on the rPLL output (named *.default_gen_clk);
-# this explicit constraint takes precedence (a PnR warning is expected and
-# harmless — it just names the clock clk_core for the timing reports).
-create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 8 -divide_by 5 [get_nets {clk_core}]
 
 # Async reset: treat rstn_i as asynchronous to the fabric clocks.
 # (We do not currently generate / assert rstn_i internally; this is
@@ -37,9 +27,8 @@ set_false_path -from [get_ports {rstn_i}]
 set_false_path -to [get_ports {led_o[*]}]
 
 # Single clock domain: the CPU, both AXI4-Lite bridges, the buses and
-# the axi4_lite_ram slave all run on clk_core (40 MHz, generated above).
-# clk_i (25 MHz, clk25) only feeds the rPLL — there are no user-logic
-# paths on clk25, so there is no clock-domain crossing to cut. Slave
-# outputs (rdata, rvalid, etc.) are registered in axi4_lite_ram and
-# captured on the same clk_core edge; no set_input_delay is needed for
-# this single-chip topology.
+# the axi4_lite_ram slave all run on clk_core (= clk_i, 25 MHz, clk25
+# above). There are no user-logic paths on a separate clock, so there is
+# no clock-domain crossing to cut. Slave outputs (rdata, rvalid, etc.)
+# are registered in axi4_lite_ram and captured on the same clk_core edge;
+# no set_input_delay is needed for this single-chip topology.

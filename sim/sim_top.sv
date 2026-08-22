@@ -6,17 +6,16 @@ import rv32_pkg::*;
 
 /**
  * Simulation top (Verilator). Mirrors the board-top wiring of
- * `top_module` for the selected build:
+ * `top_module`:
  *
- * Harvard (default, VON_NEUMANN undefined):
  *   CPU.imem -> native_ram u_imem (read-only, preloaded via +IINIT)
  *   CPU.dmem -> native_ram u_dmem (byte-strobed RW, preloaded via +DINIT)
- *   CPU.axi_peri -> axi_bus_peri (tied off)
- * Fetch and the LSU no longer contend; each has a dedicated BSRAM.
+ *   CPU.axi_peri -> axi_bus_peri -> axi4_lite_xbar (peri 1->2, addr[12])
+ *                    |-> u_msip  (0x1000_0000)
+ *                    |-> u_timer (0x1000_1000+)
  *
- * Von-Neumann legacy (VON_NEUMANN defined):
- *   CPU.bus_axi -> axi4_lite_xbar -> axi4_lite_ram u_ram (preloaded via
- *   +INIT). Fetch + LSU share one AXI master.
+ * Fetch and the LSU each have a dedicated BSRAM (Harvard). The peri bus
+ * carries the MSIP + CLINT timer MMIO slaves behind the peri xbar.
  *
  * No debug signals cross the CPU boundary (the CPU exports only its
  * functional ports). The C++ harness observes the per-stage taps
@@ -25,9 +24,6 @@ import rv32_pkg::*;
  * nets (fe_pc_w, de_pc_w, ex_pc_w, wb_en, wb_addr, wb_data, ...) are
  * reachable as flat C++ members of the sim_top model. sim_top itself
  * therefore needs no debug output ports.
- *
- * The peripheral bus is tied off exactly like `top_module` (reserved
- * for future MMIO peripherals — UART, GPIO — not data RAM).
  *
  * This module is simulation-only; it is not part of the synthesis
  * file list.
@@ -42,35 +38,31 @@ module sim_top (
 );
 
     // -----------------------------------------------------------------
-    // AXI4-Lite peripheral bus (trunk modport). Harvard keeps only this
-    // (CPU peri master -> tied-off slave); von-Neumann also has the CPU
-    // and mem trunks for the crossbar.
+    // AXI4-Lite peripheral bus (trunk modport) + peri 1->2 split.
     // -----------------------------------------------------------------
-`ifdef VON_NEUMANN
-    axi4_lite_if axi_bus_cpu ();
-    axi4_lite_if axi_bus_mem ();
-`endif
     axi4_lite_if axi_bus_peri ();
+    axi4_lite_if axi_bus_msip ();
+    axi4_lite_if axi_bus_timer ();
 
-`ifdef VON_NEUMANN
-    assign axi_bus_cpu.aclk    = clk_i;
-    assign axi_bus_cpu.aresetn = rstn_i;
-    assign axi_bus_mem.aclk    = clk_i;
-    assign axi_bus_mem.aresetn = rstn_i;
-`endif
-    assign axi_bus_peri.aclk    = clk_i;
-    assign axi_bus_peri.aresetn = rstn_i;
+    assign axi_bus_peri.aclk     = clk_i;
+    assign axi_bus_peri.aresetn  = rstn_i;
+    assign axi_bus_msip.aclk     = clk_i;
+    assign axi_bus_msip.aresetn  = rstn_i;
+    assign axi_bus_timer.aclk    = clk_i;
+    assign axi_bus_timer.aresetn = rstn_i;
 
     // -----------------------------------------------------------------
-    // Native memory ports (Harvard). Fetch and the LSU each get a
-    // dedicated native_ram.
+    // Native memory ports. Fetch and the LSU each get a dedicated
+    // native_ram.
     // -----------------------------------------------------------------
-`ifndef VON_NEUMANN
     mem_req_t imem_req;
     mem_rsp_t imem_rsp;
     mem_req_t dmem_req;
     mem_rsp_t dmem_rsp;
-`endif
+
+    // Interrupt pending bits (mip.MSIP / mip.MTIP sources).
+    wire msip;
+    wire mtip;
 
     // -----------------------------------------------------------------
     // CPU. Functional ports only; debug is observed via the Verilator
@@ -79,32 +71,20 @@ module sim_top (
     // it carries no per-stage debug, just a "pipe stalled" status bit.
     // -----------------------------------------------------------------
     wire unused_dbg_stall;
-    // Machine software interrupt pending bit (mip.MSIP source). Harvard:
-    // driven by the MSIP MMIO slave on axi_bus_peri (same as the board
-    // top — SW self-writes the MSIP register, then WFI / a pending
-    // interrupt is taken). Von-Neumann: no MSIP slave in sim, tie low.
-`ifndef VON_NEUMANN
-    wire msip;
-`endif
     rv32imac_zicsr_zifencei u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
         .boot_addr_i(32'h0000_0000),
         .dbg_stall_o(unused_dbg_stall),
-`ifdef VON_NEUMANN
-        .bus_axi    (axi_bus_cpu.master),
-        .msip_i     (1'b0)
-`else
         .axi_peri   (axi_bus_peri.master),
         .imem_req_o (imem_req),
         .imem_rsp_i (imem_rsp),
         .dmem_req_o (dmem_req),
         .dmem_rsp_i (dmem_rsp),
-        .msip_i     (msip)
-`endif
+        .msip_i     (msip),
+        .mtip_i     (mtip)
     );
 
-`ifndef VON_NEUMANN
     // -----------------------------------------------------------------
     // Instruction memory (read-only). Fetch's dedicated port. Preloaded
     // via $readmemh with the +IINIT=<path> plusarg (default "imem.hex").
@@ -148,98 +128,64 @@ module sim_top (
         $readmemh(iinit_file, u_imem.mem);
         $readmemh(dinit_file, u_dmem.mem);
     end
-`else
-    // -----------------------------------------------------------------
-    // 1->2 AXI4-Lite crossbar: mem vs peri by addr[PERI_ADDR_BIT].
-    // -----------------------------------------------------------------
-    axi4_lite_xbar #(
-        .SEL_BIT(PERI_ADDR_BIT)
-    ) u_xbar (
-        .clk_i     (clk_i),
-        .rstn_i    (rstn_i),
-        .s_axi     (axi_bus_cpu.slave),
-        .m_mem_axi (axi_bus_mem.master),
-        .m_peri_axi(axi_bus_peri.master)
-    );
-
-    // -----------------------------------------------------------------
-    // Memory RAM on the mem master (von Neumann: instructions + data),
-    // preloaded via $readmemh with +INIT=<path> (default "program.hex").
-    // -----------------------------------------------------------------
-    axi4_lite_ram #(
-        .ADDR_W   (16),  // 64 KiB
-        .INIT_FILE("")
-    ) u_ram (
-        .clk_i (clk_i),
-        .rstn_i(rstn_i),
-        .axi   (axi_bus_mem.slave)
-    );
-
-    string init_file;
-    initial begin
-        if (!$value$plusargs("INIT=%s", init_file))
-            init_file = "program.hex";  // default: hand-crafted oracle
-        $readmemh(init_file, u_ram.mem);
-    end
-`endif
 
     // -----------------------------------------------------------------
     // RAM probe: expose a window of the data RAM as scalar wires so they
     // land in the VCD and can be watched in GTKWave (Verilator does not
     // trace unpacked arrays past --trace-max-array, so the full mem[] is
     // not in the VCD). The window is pointed at the program's data array
-    // so you can watch it change as the program runs — e.g. quicksort's
-    // 16-int array before/after the sort.
+    // so you can watch it change as the program runs.
     //
-    // Harvard: data lives in u_dmem (D-mem, 0-based). Von-Neumann: data
-    // shares u_ram. PROBE_BASE_WORD is the word index of the data array
-    // in the data image — re-point it if the link layout changes.
-    //   word index = byte_addr / 4.
+    // Data lives in u_dmem (D-mem, 0-based). PROBE_BASE_WORD is the word
+    // index of the data array in the data image — re-point it if the
+    // link layout changes. word index = byte_addr / 4.
     // Default points at the C quicksort .data array (link.ld places .data
     // at DMEM 0x2000 = word 0x800, N=32 ints). The hand-crafted oracle
     // writes its data at 0x100 (word 64) at runtime — re-point there
-    // (PROBE_BASE_WORD=64) to watch the oracle.
+    // (PROBE_BASE_WORD=64) to watch the oracle. The trap/timer tests
+    // write their pass marker at 0x2000 (word 0x800) too.
     // In GTKWave the signals appear as:
     //   sim_top.g_mem_probe[<i>].mem_probe_w
     // -----------------------------------------------------------------
-    localparam int unsigned PROBE_BASE_WORD = 64'h800;  // DMEM 0x2000 (quicksort .data)
+    localparam int unsigned PROBE_BASE_WORD = 64'h800;  // DMEM 0x2000 (.data / pass marker)
     localparam int unsigned PROBE_LEN       = 64'd32;
 
     genvar gi;
     generate
         for (gi = 0; gi < PROBE_LEN; gi = gi + 1) begin : g_mem_probe
-`ifdef VON_NEUMANN
-            wire [31:0] mem_probe_w = u_ram.mem[PROBE_BASE_WORD+gi];
-`else
             wire [31:0] mem_probe_w = u_dmem.mem[PROBE_BASE_WORD+gi];
-`endif
         end
     endgenerate
 
     // -----------------------------------------------------------------
-    // Peripheral bus: the MSIP MMIO slave (machine software interrupt),
-    // mirroring the board top. A write of bit[0] to MSIP_PERI_ADDR sets /
-    // clears mip.MSIP; the msip output feeds u_cpu.msip_i. Von-Neumann
-    // sim has no MSIP slave (peri trunk tied off) — msip is tied low at
-    // the CPU above.
+    // Peripheral bus: peri 1->2 xbar (addr[12] decode) feeding the MSIP
+    // and CLINT timer MMIO slaves, mirroring the board top.
+    //   addr[12]=0 -> m_mem_axi  -> u_msip  (0x1000_0000)
+    //   addr[12]=1 -> m_peri_axi -> u_timer (0x1000_1000+)
     // -----------------------------------------------------------------
-`ifndef VON_NEUMANN
+    axi4_lite_xbar #(
+        .SEL_BIT(12)
+    ) u_peri_xbar (
+        .clk_i     (clk_i),
+        .rstn_i    (rstn_i),
+        .s_axi     (axi_bus_peri.slave),
+        .m_mem_axi (axi_bus_msip.master),
+        .m_peri_axi(axi_bus_timer.master)
+    );
+
     msip_peri u_msip (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
-        .axi   (axi_bus_peri.slave),
+        .axi   (axi_bus_msip.slave),
         .msip_o(msip)
     );
-`else
-    assign axi_bus_peri.awready = 1'b0;
-    assign axi_bus_peri.wready  = 1'b0;
-    assign axi_bus_peri.bvalid  = 1'b0;
-    assign axi_bus_peri.bresp   = 2'b00;
-    assign axi_bus_peri.arready = 1'b0;
-    assign axi_bus_peri.rvalid  = 1'b0;
-    assign axi_bus_peri.rdata   = '0;
-    assign axi_bus_peri.rresp   = 2'b00;
-`endif
+
+    clint_timer u_timer (
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .axi   (axi_bus_timer.slave),
+        .mtip_o(mtip)
+    );
 
     // -----------------------------------------------------------------
     // LED: free-running counter, parity with the board top.

@@ -8,34 +8,25 @@ import rv32_pkg::*;
  * Board-level top for the Tang Nano 20k (Gowin GW2AR-18C).
  *
  * Instantiates the RV32IMAC + Zicsr + Zifencei CPU and wires its memory
- * ports to on-die BSRAM. Two build topologies, selected by VON_NEUMANN:
- *
- * Harvard (default, VON_NEUMANN undefined):
+ * ports to on-die BSRAM. Harvard topology:
  *
  *   rv32imac_zicsr_zifencei
- *      |  imem (native, read-only)   dmem (native, byte-strobed)   axi_peri
- *      v                             v                              v
- *   native_ram (u_imem, RO)      native_ram (u_dmem, RW)        axi_bus_peri
- *   (instr)                       (data + .rodata + stack)       (open, future UART/GPIO)
+ *      |  imem (native, RO)   dmem (native, byte-strobed)   axi_peri
+ *      v                      v                              v
+ *   native_ram (u_imem)   native_ram (u_dmem)         axi_bus_peri
+ *   (instr)                (data + .rodata + stack)      |
+ *                                                        +-- axi4_lite_xbar
+ *                                                        |     (peri 1->2,
+ *                                                        |      addr[12])
+ *                                                        |
+ *                                       addr[12]=0 -----+--> u_msip  (0x1000_0000)
+ *                                       addr[12]=1 -----+--> u_timer (0x1000_1000+)
  *
  *   Fetch and the LSU no longer contend: each has a dedicated native
  *   BSRAM port. AXI survives only for peripherals (the peri bridge is
- *   inside the CPU). The board top is pure point-to-point wires — no
- *   crossbar, no mem/peri decode here (the LSU steers addr[PERI_ADDR_BIT]
- *   internally).
- *
- * Von-Neumann legacy (VON_NEUMANN defined):
- *
- *   rv32imac_zicsr_zifencei
- *      |  bus_axi (master: instr + data + MMIO, von Neumann)
- *      v
- *   axi4_lite_xbar (1 slave -> 2 masters, addr[PERI_ADDR_BIT] decode)
- *      |  m_mem_axi                       m_peri_axi
- *      v                                  v
- *   axi4_lite_ram (instr+data)          axi_bus_peri (open, future UART/GPIO)
- *
- *   Fetch + LSU share one AXI master through a mem_arbiter inside the
- *   CPU; the board top owns the mem/peri address-decode (the crossbar).
+ *   inside the CPU). The board top is pure point-to-point wires — the
+ *   LSU steers addr[PERI_ADDR_BIT] internally, and the peri xbar here
+ *   splits the peri bus into MSIP vs CLINT timer by addr[12].
  *
  * Pin assignments are in impl/pnr/rv32imac_Zicsr_Zifencei.cst.
  *
@@ -61,65 +52,37 @@ module top_module (
     //   clk_i = 25 MHz (MS5351M clock generator, crystal-fed; CLK0 on
     //   PIN10, single-ended LVCMOS33)
     //
-    // Internal CPU clock (rPLL CLKOUT):
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 8 / 5 = 40 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=7 -> FBDIV=8; ODIV_SEL=16
-    //   only sets the VCO = 25*8*16/5 = 640 MHz, it does NOT divide
-    //   CLKOUT). Period = 25 ns. Constrained in the SDC.
+    // Internal CPU clock:
+    //   clk_core = clk_i = 25 MHz (direct, no rPLL).
     //
-    // Target lowered 50 -> 40 MHz: the route-dominated execute/ALU/decode
-    // critical path does not leave comfortable margin at 50 MHz (~0.06ns
-    // slack, run-to-run noise), so the target is backed off to 40 MHz for
-    // a safer, repeatable closure.
-    //
-    // VCO must stay in 500-1250 MHz (GowinSynthesis EX0311 range for this
-    // rPLL). CLKOUT=FCLKIN*FBDIV/IDIV is independent of ODIV. Keeping IDIV=5
-    // and ODIV=16, FBDIV=8 gives CLKOUT=40 MHz with VCO=25*8*16/5=640 MHz
-    // (comfortably inside the 500-1250 band).
+    // The core was previously clocked at 40 MHz via an rPLL (25 * 8 / 5).
+    // Adding the machine timer (CLINT 64-bit mtime/mtimecmp) + the trap
+    // redirect path exposed the route-dominated CSR-address fan-out
+    // (async CSR read mux + write-decode -> fetch pc_q / regfile DI) at
+    // ~37 MHz actual Fmax, so 40 MHz no longer closes. Rather than pipeline
+    // the async CSR read (an invasive change to Zicsr read latency), the
+    // target is backed off to 25 MHz. Since clk_i is already a clean
+    // 25 MHz crystal clock, regenerating it through a 1:1 rPLL would only
+    // add jitter (and VCO-range risk) for no gain — so the PLL is dropped
+    // and clk_core is clk_i directly. Period = 40 ns. Constrained in the
+    // SDC as the single clk25 clock (no generated clock). A future higher-
+    // frequency target re-adds the rPLL (FBDIV/IDIV > 1, VCO 500-1250 MHz).
     // -----------------------------------------------------------------
 
-    wire clk_core;
-    wire pll_lock;
-
-    rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
-        .FCLKIN   ("25"),
-        .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
-        .FBDIV_SEL(7),     // -> CLKOUT = 40 MHz (range: 3.125-600 MHz)
-        .ODIV_SEL (16)     // -> VCO = 640 MHz (range: 500-1250 MHz)
-    ) pll (
-        .CLKOUTP (),
-        .CLKOUTD (),
-        .CLKOUTD3(),
-        .RESET   (1'b0),
-        .RESET_P (1'b0),
-        .CLKFB   (1'b0),
-        .FBDSEL  (6'b0),
-        .IDSEL   (6'b0),
-        .ODSEL   (6'b0),
-        .PSDA    (4'b0),
-        .DUTYDA  (4'b0),
-        .FDLY    (4'b0),
-        .CLKIN   (clk_i),     // 25 MHz
-        .CLKOUT  (clk_core),  // 40 MHz
-        .LOCK    (pll_lock)
-    );
+    wire clk_core = clk_i;
 
     // -----------------------------------------------------------------
     // Reset synchronization
     //
-    // Reset is asserted while:
-    //   - external reset is asserted, OR
-    //   - PLL has not locked yet.
-    //
-    // Deassertion is synchronized to clk_core.
+    // Reset is asserted while the external reset is asserted;
+    // deassertion is synchronized to clk_core (clk_i). With no PLL there
+    // is no lock signal to wait on.
     // -----------------------------------------------------------------
 
     logic [1:0] rst_sync;
 
     always_ff @(posedge clk_core) begin
         if (!rstn_i) begin
-            rst_sync <= 2'b00;
-        end else if (!pll_lock) begin
             rst_sync <= 2'b00;
         end else begin
             rst_sync <= {rst_sync[0], 1'b1};
@@ -129,45 +92,43 @@ module top_module (
     wire rstn_core = rst_sync[1];
 
     // -----------------------------------------------------------------
-    // AXI4-Lite buses (trunk modport)
+    // AXI4-Lite buses (trunk modport).
     //
-    //   Harvard     : axi_bus_peri only (CPU peri master -> open slave).
-    //   Von-Neumann : axi_bus_cpu (CPU master -> crossbar), axi_bus_mem
-    //                 (crossbar mem master -> RAM), axi_bus_peri (open).
+    //   axi_bus_peri  : CPU peri master -> peri xbar (1->2, addr[12] decode).
+    //   axi_bus_msip  : xbar mem master  -> MSIP slave  (0x1000_0000, [12]=0).
+    //   axi_bus_timer : xbar peri master -> timer slave (0x1000_1000+, [12]=1).
     // -----------------------------------------------------------------
-`ifdef VON_NEUMANN
-    axi4_lite_if axi_bus_cpu ();
-    axi4_lite_if axi_bus_mem ();
-`endif
     axi4_lite_if axi_bus_peri ();
+    axi4_lite_if axi_bus_msip ();
+    axi4_lite_if axi_bus_timer ();
 
     // Single clock domain: the whole fabric (CPU bridge, memories, the
-    // buses) runs on clk_core / rstn_core. There is NO clock-domain
-    // crossing — clk_i (25 MHz) only feeds the rPLL, and rstn_i is the
-    // async board reset that feeds the synchronizer.
-`ifdef VON_NEUMANN
-    assign axi_bus_cpu.aclk    = clk_core;
-    assign axi_bus_cpu.aresetn = rstn_core;
-    assign axi_bus_mem.aclk    = clk_core;
-    assign axi_bus_mem.aresetn = rstn_core;
-`endif
-    assign axi_bus_peri.aclk    = clk_core;
-    assign axi_bus_peri.aresetn = rstn_core;
+    // buses) runs on clk_core (= clk_i, 25 MHz) / rstn_core. There is NO
+    // clock-domain crossing — clk_i drives the fabric directly (no rPLL),
+    // and rstn_i is the async board reset that feeds the synchronizer.
+    assign axi_bus_peri.aclk     = clk_core;
+    assign axi_bus_peri.aresetn  = rstn_core;
+    assign axi_bus_msip.aclk     = clk_core;
+    assign axi_bus_msip.aresetn  = rstn_core;
+    assign axi_bus_timer.aclk    = clk_core;
+    assign axi_bus_timer.aresetn = rstn_core;
 
     // Debug tap: decode or execute stage stall.
     wire dbg_stall;
 
     // -----------------------------------------------------------------
-    // Native memory ports (Harvard). Fetch and the LSU each get a
-    // dedicated BSRAM; the LSU steers RAM vs peri on addr[PERI_ADDR_BIT]
-    // itself, so the board top needs no crossbar for memory.
+    // Native memory ports. Fetch and the LSU each get a dedicated BSRAM;
+    // the LSU steers RAM vs peri on addr[PERI_ADDR_BIT] itself, so the
+    // board top needs no crossbar for memory.
     // -----------------------------------------------------------------
-`ifndef VON_NEUMANN
     mem_req_t imem_req;
     mem_rsp_t imem_rsp;
     mem_req_t dmem_req;
     mem_rsp_t dmem_rsp;
-`endif
+
+    // Interrupt pending bits from the peri MMIO slaves.
+    wire msip;
+    wire mtip;
 
     // -----------------------------------------------------------------
     // CPU. Functional ports only — no debug crosses the CPU boundary
@@ -179,22 +140,15 @@ module top_module (
         .rstn_i     (rstn_core),
         .boot_addr_i(32'h0000_0000),
         .dbg_stall_o(dbg_stall),
-`ifdef VON_NEUMANN
-        .bus_axi    (axi_bus_cpu.master),
-        // No MSIP slave on the von-Neumann board top (the peri trunk is
-        // open); tie the machine software interrupt low.
-        .msip_i     (1'b0)
-`else
         .axi_peri   (axi_bus_peri.master),
         .imem_req_o (imem_req),
         .imem_rsp_i (imem_rsp),
         .dmem_req_o (dmem_req),
         .dmem_rsp_i (dmem_rsp),
-        .msip_i     (msip)
-`endif
+        .msip_i     (msip),
+        .mtip_i     (mtip)
     );
 
-`ifndef VON_NEUMANN
     // -----------------------------------------------------------------
     // Instruction memory (read-only). Fetch's dedicated port — no
     // contention with the LSU. Preloaded with firmware via INIT_FILE
@@ -239,56 +193,53 @@ module top_module (
         .mem_req_i(dmem_req),
         .mem_rsp_o(dmem_rsp)
     );
-`else
+
     // -----------------------------------------------------------------
-    // 1->2 AXI4-Lite crossbar: splits the CPU bus into a memory region
-    // and a peripheral region by address (addr[PERI_ADDR_BIT]=1 -> peri,
-    // else mem). Single-outstanding pass-through (the CPU bridge is
-    // single-outstanding overall). See axi4_lite_xbar for routing.
+    // Peripheral bus: 1->2 address-decode mux splitting the peri bus
+    // into the MSIP slave and the CLINT timer slave by addr[12]
+    // (roadmap item 2 — same xbar pattern as the mem/peri split, one
+    // level down). Single-outstanding pass-through (the CPU bridge is
+    // single-outstanding overall). A 3rd slave (UART/GPIO) later needs
+    // a generalized 1->N mux.
+    //   addr[12]=0 -> m_mem_axi  -> MSIP  (0x1000_0000)
+    //   addr[12]=1 -> m_peri_axi -> timer (0x1000_1000+)
     // -----------------------------------------------------------------
     axi4_lite_xbar #(
-        .SEL_BIT(PERI_ADDR_BIT)
-    ) u_xbar (
+        .SEL_BIT(12)
+    ) u_peri_xbar (
         .clk_i     (clk_core),
         .rstn_i    (rstn_core),
-        .s_axi     (axi_bus_cpu.slave),
-        .m_mem_axi (axi_bus_mem.master),
-        .m_peri_axi(axi_bus_peri.master)
+        .s_axi     (axi_bus_peri.slave),
+        .m_mem_axi (axi_bus_msip.master),
+        .m_peri_axi(axi_bus_timer.master)
     );
 
     // -----------------------------------------------------------------
-    // Memory RAM on the mem master (von Neumann: instructions + data).
+    // MSIP MMIO slave (machine software interrupt). A write of bit[0]
+    // to MSIP_PERI_ADDR (0x1000_0000) sets/clears mip.MSIP; msip_o feeds
+    // u_cpu.msip_i.
     // -----------------------------------------------------------------
-    axi4_lite_ram #(
-        .ADDR_W   (16),  // 64 KiB
-        .INIT_FILE("")
-    ) u_ram (
-        .clk_i (clk_core),
-        .rstn_i(rstn_core),
-        .axi   (axi_bus_mem.slave)
-    );
-`endif
-
-    // -----------------------------------------------------------------
-    // Peripheral bus: the MSIP MMIO slave (machine software interrupt).
-    // A write of bit[0] to MSIP_PERI_ADDR (peri base 0x1000_0000) sets /
-    // clears the machine software interrupt pending bit; the msip_o
-    // output feeds the CPU's msip_i (mip.MSIP). It is the only peri slave
-    // on axi_bus_peri for now (the trunk was previously tied off; a UART /
-    // GPIO drops in alongside by adding an address-decoded slave mux
-    // later). No tieoff remains — the slave drives every handshake line.
-    // -----------------------------------------------------------------
-    wire msip;
-
     msip_peri u_msip (
         .clk_i (clk_core),
         .rstn_i(rstn_core),
-        .axi   (axi_bus_peri.slave),
+        .axi   (axi_bus_msip.slave),
         .msip_o(msip)
     );
 
     // -----------------------------------------------------------------
-    // Debug LEDs: 
+    // CLINT timer MMIO slave (machine timer interrupt). mtip_o = (mtime
+    // >= mtimecmp); feeds u_cpu.mtip_i (mip.MTIP). SW clears it by
+    // writing mtimecmp > mtime.
+    // -----------------------------------------------------------------
+    clint_timer u_timer (
+        .clk_i (clk_core),
+        .rstn_i(rstn_core),
+        .axi   (axi_bus_timer.slave),
+        .mtip_o(mtip)
+    );
+
+    // -----------------------------------------------------------------
+    // Debug LEDs:
     // led_o[0]: stall indicator (high when the CPU is stalled, low when it is running)
     // led_o[3:1]: free-running counter on clk_core (alive indicator).
     // -----------------------------------------------------------------
@@ -306,3 +257,4 @@ module top_module (
     assign led_o[0]   = dbg_stall;
 
 endmodule
+`resetall

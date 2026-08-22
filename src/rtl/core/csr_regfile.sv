@@ -62,6 +62,12 @@ module csr_regfile (
     // writing mip); the slave is the only source.
     input wire msip_i,
 
+    // Machine timer interrupt pending bit, driven by the CLINT timer MMIO
+    // slave (mtime >= mtimecmp). Like MSIP, mip.MTIP is read-only from CSR
+    // writes (SW clears it by writing mtimecmp > mtime, not by writing mip);
+    // the slave is the only source.
+    input wire mtip_i,
+
     // Combinational CSR taps for the trap unit (mtvec / mepc redirect,
     // mstatus MIE/MPIE, mip / mie for interrupt pending). Separate
     // outputs so the trap path does not steal the async RMW read.
@@ -74,7 +80,7 @@ module csr_regfile (
     // Instruction retire stat (consumed by minstret). Future
     // mhpmcounter / branch-prediction counters would add their own
     // retire-side inputs here when implemented.
-    input wire            instr_retire_i  // instruction retired (commit)
+    input wire instr_retire_i  // instruction retired (commit)
 );
     // Index map: implemented CSRs packed into a 9-entry array. The case
     // statements below translate the 12-bit CSR address to/from this index.
@@ -154,12 +160,12 @@ module csr_regfile (
                 regs[6] <= csr_data_i;
             if (!we_mtval_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MTVAL)) regs[7] <= csr_data_i;
 
-            // --- mip: MSIP (bit3) tracks msip_i every cycle (read-only
-            // from CSR write — SW clears it via the MMIO slave, not by
-            // writing mip); MTIP(7)/MEIP(11) hardwired 0 (no timer / ext
-            // source yet). The other bits are RMW-writable. ---
+            // --- mip: MSIP (bit3) tracks msip_i and MTIP (bit7) tracks
+            // mtip_i every cycle (read-only from CSR write — SW clears them
+            // via the MMIO slaves, not by writing mip); MEIP(11) hardwired
+            // 0 (no external source yet). The other bits are RMW-writable. ---
             regs[8][3]  <= msip_i;
-            regs[8][7]  <= 1'b0;
+            regs[8][7]  <= mtip_i;
             regs[8][11] <= 1'b0;
             if (csr_wren_i && (csr_addr_i == CSR_ADDR_MIP)) begin
                 regs[8][2:0]   <= csr_data_i[2:0];

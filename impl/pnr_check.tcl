@@ -9,4 +9,9 @@
 # this Tcl wrapper is the working CLI path.
 open_project /home/giacomo/gowin_proj/rv32imac_Zicsr_Zifencei/rv32imac_Zicsr_Zifencei.gprj
 set_option -top_module top_module
+# Force the PnR target frequency to 25 MHz (clk_core = clk_i, no rPLL — see
+# SDC + top_module). The SDC (added to the .gprj as a file.sdc) constrains
+# clk_i at 40 ns, so this is belt-and-suspenders for any unconstrained
+# clock; it must match the SDC target so the two never disagree.
+set_option -global_freq 25.000
 run pnr

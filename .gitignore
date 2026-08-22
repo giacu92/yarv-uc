@@ -28,6 +28,7 @@ sim/*.log
 # C-program build artefacts (sim/sw: C -> program.hex, regenerable)
 sim/sw/build/
 sim/sw_trap/build/
+sim/sw_timer/build/
 sim/cosim/ecall/build/
 
 # Local sim artifacts (backups, GTKWave session layouts — not shared)

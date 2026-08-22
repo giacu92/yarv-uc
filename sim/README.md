@@ -2,16 +2,15 @@
 
 Functional simulation of the implemented pipeline (fetch + decode +
 execute + LSU + Zicsr CSR file + trap/exception/interrupt unit). The
-default **Harvard** build wires the CPU to a native read-only I-mem
+**Harvard** build wires the CPU to a native read-only I-mem
 (`native_ram`, `+IINIT`) and a native byte-strobed D-mem (`native_ram`,
-`+DINIT`); the AXI4-Lite peripheral bus carries the `msip_peri` MMIO
-slave (machine software interrupt) — the only peri slave for now; an
-`axi4_lite_uart.sv` slave exists on disk but is not yet wired in (see
-the root `README.md` Roadmap). The legacy **von-Neumann** build
-(`VON_NEUMANN=1`) keeps the `mem_arbiter` + `axi4_lite_xbar` + single
-AXI4-Lite RAM (`+INIT`) topology. The board top's wiring is replicated
-in `sim_top.sv` so the memories can be preloaded and the CPU's
-per-stage debug taps can be logged.
+`+DINIT`); the AXI4-Lite peripheral bus carries two MMIO slaves behind a
+1→2 address-decode xbar (`axi4_lite_xbar`, `addr[12]`): `msip_peri`
+(machine software interrupt, `0x1000_0000`) and `clint_timer` (machine
+timer interrupt, `0x1000_1000+`). An `axi4_lite_uart.sv` slave exists on
+disk but is not yet wired in (see the root `README.md` Roadmap). The
+board top's wiring is replicated in `sim_top.sv` so the memories can be
+preloaded and the CPU's per-stage debug taps can be logged.
 
 This harness is **not** part of the synthesis file list.
 
@@ -29,13 +28,9 @@ sudo apt-get install -y verilator
 cd sim
 make run                                          # Harvard: imem.hex/dmem.hex oracle
 make run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"  # C program
-make run VON_NEUMANN=1 RUN_ARGS="+INIT=program.hex"  # legacy von-Neumann build
 # or, from the repo root:
 make sw-run       # build the C program (sim/sw) + run the Harvard sim loading it
 ```
-
-`VON_NEUMANN=1` selects the legacy single-AXI-master topology; the
-default (unset) is Harvard.
 
 `make run` compiles `obj_dir/Vsim_top` and runs it. The harness drives
 clk/rst (async active-low reset for a few cycles) and prints **three**
@@ -95,9 +90,8 @@ line; the word value IS the instruction/data word):
 
 The images are **plusarg-selected**: `+IINIT=<path>` / `+DINIT=<path>`
 override the defaults, so a C-compiled image pair can be loaded without
-clobbering the oracle. The legacy von-Neumann build uses a single
-`+INIT=<path>` (default `program.hex`). To compile C → images, use the
-`sim/sw/` flow (see `sim/sw/README.md`).
+clobbering the oracle. To compile C → images, use the `sim/sw/` flow
+(see `sim/sw/README.md`).
 
 ## Native RAM compliance test (`hw/native_mem_tb/`)
 
@@ -122,8 +116,8 @@ alone and drives it as an AXI4-Lite master from C++ (`ram_tb.cpp`). It
 verifies the AXI RAM's protocol compliance in isolation
 (registered/held BVALID + RVALID, AW-first / W-first orderings,
 byte-strobed partial writes, back-to-back writes, single outstanding).
-`axi4_lite_ram` is now peri-side only in the Harvard build; `ram_tb`
-still covers it.
+`axi4_lite_ram` is not instantiated in the Harvard sim/synth (native
+`native_ram` serves I-mem/D-mem); `ram_tb` still exercises it standalone.
 
 ```
 cd sim/hw/ram_tb && make run     # prints "N checks, 0 failures" on success
@@ -186,19 +180,34 @@ only by the standalone oracle above.
 cd cosim/ecall && make cosim   # -> "PASS -- matched 17 retires" (run from sim/)
 ```
 
+## Timer oracle (`sw_timer/`)
+
+A standalone M-mode program (`timer_test.S`, built
+`-march=rv32imac_zicsr_zifencei`) exercising the machine timer interrupt:
+sets `sp`/`mtvec` (direct), enables `mie.MTIE` + `mstatus.MIE`, writes
+`mtimecmp=100` (mtime counts from 0, so `mtime>=100` fires ~cycle 100),
+then `wfi`. The timer interrupt wakes it (`mepc=wfi+4`); the handler
+checks `mcause[31:0]=0x8000_0007`, stores `0x07` as a marker at D-mem
+0x2040, clears MTIP by writing `mtimecmp=0xFFFFFFFF`, and `mret`s.
+`main` self-checks the marker and writes `0x600D` at D-mem 0x2000
+(pass, probe word 0x800) or `0xBAD`. Run from `sim/`:
+
+```
+cd sw_timer && make                                   # -> build/imem.hex + build/dmem.hex
+cd .. && make run RUN_ARGS="+IINIT=sw_timer/build/imem.hex +DINIT=sw_timer/build/dmem.hex"
+```
+
 ## Files
 
-- `sim_top.sv`    — sim wrapper (CPU + native I/D-mem or AXI RAM +
-  `msip_peri` MMIO slave on the peri bus + `mem_probe` generate block
-  exposing a window of the data RAM to the VCD). Ports only
-  `clk_i`/`rstn_i`/`led_o`; CPU taps stay internal, probed via the
-  Verilator hierarchy.
+- `sim_top.sv`    — sim wrapper (CPU + native I/D-mem +
+  `msip_peri` + `clint_timer` MMIO slaves on the peri bus (behind the
+  peri 1→2 xbar) + `mem_probe` generate block exposing a window of the
+  data RAM to the VCD). Ports only `clk_i`/`rstn_i`/`led_o`; CPU taps
+  stay internal, probed via the Verilator hierarchy.
 - `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs
   incl. writeback values, stall breakdown, park/`MAX_CYC` stop).
 - `imem.hex`/`dmem.hex` — Harvard oracle preload (code / data).
-- `program.hex`   — von-Neumann oracle preload (RV32I/RVC/M/CSR).
-- `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs;
-  `VON_NEUMANN=1` selects the legacy build).
+- `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs).
 - `hw/native_mem_tb/` — native RAM compliance test.
 - `hw/ram_tb/`       — AXI4-Lite RAM compliance test.
 - `cosim/`           — shared co-sim assets: `cosim_diff.py` +
@@ -210,6 +219,8 @@ cd cosim/ecall && make cosim   # -> "PASS -- matched 17 retires" (run from sim/)
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
 - `sw_trap/`      — standalone M-mode trap-exercise program
   (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
+- `sw_timer/`     — standalone M-mode timer-interrupt program
+  (MTIE+MIE, `mtimecmp=100`, WFI wake, self-checking — see "Timer oracle").
 
 Build artefacts (`obj_dir/`, `sw/build/`, `cosim/ecall/build/`,
 `cosim/quicksort/*.log`, `*.vcd`, `*.log`) are gitignored.

@@ -20,9 +20,11 @@ import rv32_pkg::*;
 *     into the CSR file's dedicated trap-write ports (separate from the
 *     csrrw RMW port). Each writes a different register, so all four can
 *     fire in one cycle.
-*   - int_pending_o : a machine software interrupt is pending and enabled
-*     (mstatus.MIE & mip.MSIP & mie.MSIE). Read by execute to decide
+*   - int_pending_o : a machine interrupt is pending and enabled
+*     (mstatus.MIE & (MSIP&MSIE | MTIP&MTIE)). Read by execute to decide
 *     take_interrupt and to wake WFI halt.
+*   - int_cause_o  : the resolved interrupt cause (MSI > MTI priority, MEI
+*     not wired). Execute uses it as the mcause for the interrupt entry.
 *
 * Priority (resolved by the execute stage before calling in):
 *   sync trap > interrupt > mret  (a faulting instruction traps; an
@@ -30,9 +32,10 @@ import rv32_pkg::*;
 *   mret returns only when neither traps nor interrupts fire).
 *
 * mcause: synchronous exceptions carry mcause[31]=0 (code in [30:0]);
-* the machine software interrupt carries mcause[31]=1, code=3. The
-* execute stage passes the fully-resolved cause_i (MCAUSE_* from the
-* package), so this module just forwards it.
+* interrupts carry mcause[31]=1 (MSI code=3, MTI code=7). The execute stage
+* passes the fully-resolved cause_i (MCAUSE_* from the package) for sync
+* traps, and takes int_cause_o for interrupts; this module forwards
+* cause_i unchanged.
 *
 * mtvec MODE (mtvec[1:0]):
 *   DIRECT   (00) -> all traps/interrupts to BASE = {mtvec[31:2],2'b00}.
@@ -81,18 +84,28 @@ module trap_unit (
     output wire [XLEN-1:0] csr_d_mstatus_o,
 
     // Pending+enabled machine software interrupt (for execute / WFI wake).
-    output wire int_pending_o
+    output wire int_pending_o,
+
+    // Resolved interrupt cause (MSI > MTI priority; MEI not wired). Execute
+    // uses this as the mcause for the interrupt entry.
+    output wire [XLEN-1:0] int_cause_o
 );
 
     // -----------------------------------------------------------------
-    // Interrupt pending: MIE globally enabled AND a software interrupt is
-    // pending (mip.MSIP) AND locally enabled (mie.MSIE). Only MSIP is
-    // wired; MTIP/MEIP have no source yet (hardwired 0 in the CSR file).
+    // Interrupt pending: MIE globally enabled AND at least one source is
+    // pending+locally-enabled. MSI > MTI priority (MEI not wired yet).
     // -----------------------------------------------------------------
     wire mie_m = mstatus_i[MSTATUS_MIE_BIT];
     wire msip_p = mip_i[3];  // MSIP
     wire msie_e = mie_i[3];  // MSIE
-    assign int_pending_o = mie_m & msip_p & msie_e;
+    wire mtip_p = mip_i[7];  // MTIP
+    wire mtie_e = mie_i[7];  // MTIE
+
+    wire msi_pending = msip_p & msie_e;
+    wire mti_pending = mtip_p & mtie_e;
+
+    assign int_pending_o = mie_m & (msi_pending | mti_pending);
+    assign int_cause_o   = msi_pending ? MCAUSE_MSI : MCAUSE_MTI;
 
     // -----------------------------------------------------------------
     // Redirect address.

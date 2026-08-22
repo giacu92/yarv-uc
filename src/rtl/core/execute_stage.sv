@@ -82,9 +82,13 @@ module execute_stage (
     // trap unit consumes them, drives the CSR trap-write bundle + the fetch
     // redirect, and reports the pending+enabled interrupt back here.
     //
-    // A pending+enabled machine software interrupt (from the trap unit's
-    // read of mstatus.MIE / mip.MSIP / mie.MSIE).
+    // A pending+enabled machine interrupt (from the trap unit's read of
+    // mstatus.MIE / mip / mie): MSIP and/or MTIP. Read to decide
+    // take_interrupt and to wake WFI halt.
     input wire            int_pending_i,
+    // The trap unit's resolved interrupt cause (MSI > MTI priority), used
+    // as the mcause when an interrupt is taken.
+    input wire [XLEN-1:0] int_cause_i,
     // The trap unit's resolved fetch target (mtvec vector for traps /
     // interrupts, mepc for mret). Merged with the normal branch redirect.
     input wire [XLEN-1:0] trap_redirect_addr_i,
@@ -123,11 +127,9 @@ module execute_stage (
     // Native memory interface (LSU): loads/stores/Zilx launch here.
     output mem_req_t mem_req_o,
     input  mem_rsp_t mem_rsp_i,
-`ifndef VON_NEUMANN
     // Native memory interface for peripherals
     output mem_req_t peri_req_o,
     input  mem_rsp_t peri_rsp_i,
-`endif
 
     // ex_* per-stage taps (E/M register): pc / instr / valid of the retired
     // op. Named like fetch's fe_*_o (no _dbg suffix) so every pipeline stage
@@ -235,20 +237,14 @@ module execute_stage (
     // EX_MEM_WAIT (decode stalls de_i), so this one combinational bit drives
     // both the request target and the response source — no tracking flops
     // needed (the LSU is single-outstanding).
-`ifndef VON_NEUMANN
     wire is_peri = alu_result[PERI_ADDR_BIT];
-`endif
 
-    // Effective LSU response: the selected target's rsp (Harvard dmem/peri),
-    // or the single bus rsp (AXI-memory build). All launch/done/load logic
-    // reads this so a peri op does not falsely retire on the D-mem's
-    // wready/rvalid (the bug from splitting only the request side).
+    // Effective LSU response: the selected target's rsp (Harvard dmem/peri).
+    // All launch/done/load logic reads this so a peri op does not falsely
+    // retire on the D-mem's wready/rvalid (the bug from splitting only the
+    // request side).
     mem_rsp_t lsu_rsp;
-`ifndef VON_NEUMANN
     assign lsu_rsp = is_peri ? peri_rsp_i : mem_rsp_i;
-`else
-    assign lsu_rsp = mem_rsp_i;
-`endif
 
     wire  mem_launch_hs = mem_launch & lsu_rsp.wready;
 
@@ -372,7 +368,7 @@ module execute_stage (
     wire [XLEN-1:0] sync_cause = mem_misaligned ?
         (de_i.mem_write ? MCAUSE_SAD_MIS : MCAUSE_LAD_MIS) : de_i.exception_cause;
     wire [XLEN-1:0] sync_tval = mem_misaligned ? alu_result : de_i.exception_tval;
-    wire [XLEN-1:0] trap_cause = take_interrupt ? MCAUSE_MSI : sync_cause;
+    wire [XLEN-1:0] trap_cause = take_interrupt ? int_cause_i : sync_cause;
     wire [XLEN-1:0] trap_tval = take_interrupt ? 32'd0 : sync_tval;
     // mepc: faulting instr pc (sync trap), or the suppressed instr pc
     // (interrupt), or the WFI-wake pc (interrupt taken after WFI).
@@ -519,7 +515,6 @@ module execute_stage (
     logic [XLEN-1:0] store_wdata;
     assign store_wdata = de_i.rs2_data << {alu_result[1:0], 3'b000};
 
-`ifndef VON_NEUMANN
     // Harvard: steer the launch to D-mem (is_peri=0) or the peri bridge
     // (is_peri=1). Both ports get full defaults so the non-selected port is
     // cleanly idle (no latch / no stray wvalid).
@@ -552,16 +547,6 @@ module execute_stage (
             mem_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
         end
     end
-`else
-    always_comb begin
-        mem_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
-        mem_req_o.we     = de_i.mem_write;
-        mem_req_o.addr   = alu_result;  // EA
-        mem_req_o.wdata  = store_wdata;
-        mem_req_o.wstrb  = store_wstrb;
-        mem_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
-    end
-`endif
 
     // =================================================================
     // Branch resolve + redirect
