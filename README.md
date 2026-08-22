@@ -10,21 +10,20 @@ Disclaimer: This project is created by me with the assistance of Claude Code
 > machine-mode trap/exception/interrupt machinery are implemented and
 > sim-verified (Verilator + Spike co-sim), but several peripherals and
 > interrupt sources are still missing — see **Roadmap** below. Synthesis
-> + PnR of the most recent (trap) changes have not been re-confirmed on
-> the build host yet.
+> + PnR are re-confirmed on the build host (2026-08-22): the core closes
+> **35 MHz** (knife-edge, +0.004 ns slack) with a comfortable **25 MHz**
+> PLL-bypass fallback — see the timing note in **Status** below.
 
 An RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based
 board. The board is clocked by a 25 MHz single-ended reference from an
 MS5351M clock generator (CLK0 on PIN10, LVCMOS33); an on-chip rPLL
-multiplies it up to a 40 MHz `clk_core` that drives the whole fabric.
+multiplies it up to a 35 MHz `clk_core` that drives the whole fabric.
 
 The core is an **in-order, 3-stage pipeline — Fetch / Decode / Execute
 (F/D/E)** — with a **Harvard** memory system: a dedicated
 read-only I-mem for fetch and a byte-strobed D-mem for the LSU, with AXI
-kept only for peripherals. A compile-time `VON_NEUMANN` switch retains the
-legacy single-AXI-master topology (fetch+LSU share one port through a
-`mem_arbiter` + crossbar) as a fallback. Implemented so far:
+kept only for peripherals. Implemented so far:
 
 - **Fetch** — single-outstanding overlap-prefetch of 32-bit words over a
   native memory interface, with a 1-entry skid buffer (2-deep FIFO: F/D
@@ -68,58 +67,67 @@ legacy single-AXI-master topology (fetch+LSU share one port through a
   **not** retired (matches the RISC-V spec + Spike). A machine
   **software interrupt** (mcause=0x8000_0003) is injected by an
   `msip_peri` AXI4-Lite MMIO slave at peri base `0x1000_0000` (write
-  bit[0] sets/clears mip.MSIP); taken at a retire boundary or on a WFI
-  wake. A combinational `trap_unit` (peer of execute) resolves entry /
+  bit[0] sets/clears mip.MSIP); a machine **timer interrupt**
+  (mcause=0x8000_0007) is sourced by a `clint_timer` AXI4-Lite MMIO slave
+  at peri `0x1000_1000+` (64-bit free-running `mtime` + 64-bit `mtimecmp`;
+  `mtime >= mtimecmp` → `mtip` → `mip.MTIP`, cleared by writing
+  `mtimecmp > mtime`). Both sit behind a reused `axi4_lite_xbar` 1→2
+  peri mux (`addr[12]`: MSIP vs timer). Interrupts are taken at a retire
+  boundary (the suppressed instr re-runs after `mret`) or on a WFI wake
+  (`mepc` = wfi+4). `int_cause` selects MSI > MTI priority (MEI not
+  wired). A combinational `trap_unit` (peer of execute) resolves entry /
   `mret` / interrupt redirect and drives the CSR trap-write bundle.
 
 Still deferred: **S/U mode** + delegation (machine mode only, no
 medeleg/mideleg, no PMP), **instruction-access-fault** /
-instruction-address-misaligned traps, and **timer / external
-interrupts** (`mtime` / mip.MTIP, mip.MEIP — only the MSIP software
-interrupt is wired so far; `mip.MTIP`/`MEIP` hardwired 0). `fence.i` is
-a nop (Harvard has no D->I write path — self-modifying code unsupported).
-Synth + PnR of the trap path are **not yet re-confirmed** — the last
-confirmed closure (pre-trap) was Harvard clean + 40 MHz PnR; rerun
-`synth_check.tcl` + `pnr_check.tcl` on the build host once it is back.
+instruction-address-misaligned traps, and the **external interrupt**
+(`mip.MEIP` — MSIP and MTIP are wired; MEIP has no source yet).
+`fence.i` is a nop (Harvard has no D->I write path — self-modifying code
+unsupported). Synth + PnR of the trap + timer path are **re-confirmed**
+on the build host (2026-08-22): the 64-bit timer compare (two-stage
+pipelined) + trap redirect mux exposed the route-dominated CSR-address
+fan-out critical path at ~37 MHz actual, so the target was lowered
+50 → 40 → **35 MHz** (rPLL `IDIV_SEL=4`/`FBDIV_SEL=6`/`ODIV_SEL=16`,
+VCO 560 MHz). PnR closes 35 MHz at 35.004 MHz Actual Fmax, worst setup
+slack +0.004 ns, TNS 0 — a **knife-edge** closure (essentially zero
+margin; may not repeat run-to-run). The comfortable fallback is the
+**25 MHz PLL-bypass** (`clk_core = clk_i` direct, +2.248 ns slack). To
+reclaim a safe 40 MHz, the async CSR read must be pipelined into a
+registered 1-cycle read (an invasive Zicsr read-latency change, deferred).
 
 ## Roadmap (what is next)
 
-The peripheral/interrupt story is the current active front. Only the
-**MSIP** software interrupt (`msip_peri`, MMIO bit[0] → `mip.MSIP`) is
-wired today; `mip.MTIP`/`MEIP` are hardwired 0 and the peri bus has a
-single slave. The planned work, in order:
+The peripheral/interrupt story is the current active front. **MSIP**
+(machine software interrupt, `msip_peri` → `mip.MSIP`) and **MTIP**
+(machine timer interrupt, `clint_timer` → `mip.MTIP`) are both wired,
+behind a 1→2 peri mux (`axi4_lite_xbar`, `addr[12]` decode). `mip.MEIP`
+still has no source. The remaining work, in order:
 
-1. **CLINT-style timer (`mtime`/`mtimecmp` → MTIP).** A 64-bit `mtime`
-   + 64-bit `mtimecmp` exposed as two 32-bit MMIO register pairs.
-   Atomic 64-bit reads on RV32 use the standard software pattern (read
-   high, read low, re-read high, retry on rollover — no special hardware
-   needed). The `mtime >= mtimecmp` compare is done inside the peripheral,
-   which outputs a single level bit into `csr_regfile.sv` the same way
-   `msip_o` already drives `mip[3]`. Reuses `msip_peri.sv`'s AXI4-Lite
-   slave skeleton as a base.
-2. **Multi-slave address-decode mux on the peri bus.** `axi_bus_peri`
-   currently has only `msip_peri` as a slave and accepts any address
-   unconditionally. A small 1→N AXI4-Lite mux inside the peri domain
-   (same pattern as the existing 1→2 `axi4_lite_xbar` for the mem/peri
-   split, just one level down) is needed before a second slave can land.
-   This is the actual blocker for UART / timer / GPIO coexistence.
-3. **Wire the UART in.** An AXI4-Lite UART slave (`axi4_lite_uart.sv`)
+1. **Wire the UART in.** An AXI4-Lite UART slave (`axi4_lite_uart.sv`)
    already exists — 8N1, single-buffer TX/RX, a 5-register MMIO map
    (TXDATA/RXDATA/STATUS/CTRL/BAUDDIV), level-sensitive interrupt. It is
-   not yet wired into `top_module.sv` (blocked on item 2) and not yet
-   simulated or synthesized.
-4. **GPIO.** Direction / output / input registers, per-pin or global
+   not yet wired into `top_module.sv` and not yet simulated or
+   synthesized. Needs a generalized 1→N peri mux (the current 1→2 covers
+   MSIP + timer; a 3rd slave needs the wider mux).
+2. **GPIO.** Direction / output / input registers, per-pin or global
    interrupt. Same MMIO/AXI4-Lite slave template as UART/MSIP.
-5. **Simple PLIC-style interrupt controller.** Deprioritized: with only
-   MSIP + (future) MTIP + UART, direct `mie`/`mip` routing is still
-   manageable without an arbiter. Revisit once 3+ independent IRQ
-   sources exist (UART + GPIO + timer).
+3. **Simple PLIC-style interrupt controller.** Deprioritized: with only
+   MSIP + MTIP + UART, direct `mie`/`mip` routing is still manageable
+   without an arbiter. Revisit once 3+ independent IRQ sources exist
+   (UART + GPIO + timer).
 
-Also still open: timer/external interrupts (covered by item 1 + future
-MEIP source), a vectored-mode interrupt co-sim (direct mode is covered),
-and re-confirming 40 MHz synth + PnR closure with the trap path on the
-build host. S/U mode, delegation, PMP, and instruction-access-fault traps
-remain deferred.
+Done (for reference): CLINT-style timer (`clint_timer.sv` — 64-bit
+`mtime`/`mtimecmp`, two-stage pipelined `mtime >= mtimecmp` compare →
+`mtip` → `mip.MTIP`) and the peri-bus 1→2 address-decode mux (reused
+`axi4_lite_xbar`, `addr[12]`: MSIP vs timer). Both sim-verified (standalone
+timer oracle `sim/sw_timer`, MSIP/trap oracle `sim/sw_trap`, Spike cosim
+of an illegal-instruction trap `sim/cosim/ecall`).
+
+Also still open: the external interrupt (MEIP source — UART IRQ will be
+the first), a vectored-mode interrupt co-sim (direct mode is covered),
+and a safe 40 MHz re-target (needs the async CSR read pipelined — see
+the timing note above). S/U mode, delegation, PMP, and
+instruction-access-fault traps remain deferred.
 
 The CPU exposes **three** ports (Harvard): a native `imem` (fetch,
 read-only), a native `dmem` (LSU data, byte-strobed), and an AXI4-Lite
@@ -130,18 +138,15 @@ top is pure point-to-point wires — no crossbar. The LSU decodes
 `addr[PERI_ADDR_BIT]` itself (`0` → D-mem at low addresses, `1` → peri at
 `0x1000_0000+`).
 
-The legacy **von-Neumann** build (`VON_NEUMANN` defined) collapses the CPU
-to one `bus_axi` master: fetch+LSU share a `mem_arbiter` (LSU priority) →
-the bridge, and the board top's `axi4_lite_xbar` splits mem vs peri.
-
 ## Repository layout
 
 ```
 src/rtl/pkg/   rv32_pkg.sv          — types, opcodes, de_t D/E control struct
 src/rtl/core/  pipeline stages + CPU top + reg file + ALU + trap unit + board top
-src/rtl/bus/   AXI4-Lite interface + master bridge + arbiter + crossbar
-src/rtl/utils/ axi4_lite_ram.sv (AXI slave), native_ram.sv (Harvard I/D-mem),
+src/rtl/bus/   AXI4-Lite interface + master bridge + crossbar (peri mux)
+src/rtl/utils/ native_ram.sv (Harvard I/D-mem), axi4_lite_ram.sv (AXI slave, sim),
                msip_peri.sv (MSIP MMIO slave — machine software interrupt),
+               clint_timer.sv (CLINT timer MMIO slave — machine timer interrupt),
                axi4_lite_uart.sv (UART MMIO slave — exists, not yet wired in)
 src/phys/      pin assignment (.cst) + timing constraints (.sdc)
 impl/          Gowin EDA project + synthesis/PnR Tcl + reports
@@ -165,10 +170,9 @@ make sw-run     # build the C program + run the sim loading it (Harvard)
 
 Each run prints a retire/IPC/stall summary. On the Harvard build the
 recursive quicksort (`make sw-run`) retires 2172 instructions in 4711
-cycles -> **IPC ~0.46** (9.5% of cycles stalled), down from 5863 cycles /
-IPC ~0.37 on the legacy von-Neumann build — the dedicated I-mem removes
-fetch/LSU bus contention. The legacy build is selected with
-`make VON_NEUMANN=1 run` (+ `+INIT=` for the single-image oracle).
+cycles -> **IPC ~0.46** (9.5% of cycles stalled); the dedicated I-mem
+removes fetch/LSU bus contention (the dropped legacy von-Neumann build
+was 5863 cycles / IPC ~0.37).
 
 See `sim/README.md` for the logs, VCD/GTKWave, the native-RAM
 (`sim/hw/native_mem_tb/`) and AXI4-Lite RAM (`sim/hw/ram_tb/`) compliance

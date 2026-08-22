@@ -52,37 +52,71 @@ module top_module (
     //   clk_i = 25 MHz (MS5351M clock generator, crystal-fed; CLK0 on
     //   PIN10, single-ended LVCMOS33)
     //
-    // Internal CPU clock:
-    //   clk_core = clk_i = 25 MHz (direct, no rPLL).
+    // Internal CPU clock (rPLL CLKOUT) — target 35 MHz:
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 7 / 5 = 35 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=6 -> FBDIV=7; ODIV_SEL=16 sets
+    //   the VCO = 25*7*16/5 = 560 MHz and does NOT divide CLKOUT).
+    //   Period = 40 * 5 / 7 = 28.571 ns. Constrained in the SDC.
     //
-    // The core was previously clocked at 40 MHz via an rPLL (25 * 8 / 5).
-    // Adding the machine timer (CLINT 64-bit mtime/mtimecmp) + the trap
-    // redirect path exposed the route-dominated CSR-address fan-out
-    // (async CSR read mux + write-decode -> fetch pc_q / regfile DI) at
-    // ~37 MHz actual Fmax, so 40 MHz no longer closes. Rather than pipeline
-    // the async CSR read (an invasive change to Zicsr read latency), the
-    // target is backed off to 25 MHz. Since clk_i is already a clean
-    // 25 MHz crystal clock, regenerating it through a 1:1 rPLL would only
-    // add jitter (and VCO-range risk) for no gain — so the PLL is dropped
-    // and clk_core is clk_i directly. Period = 40 ns. Constrained in the
-    // SDC as the single clk25 clock (no generated clock). A future higher-
-    // frequency target re-adds the rPLL (FBDIV/IDIV > 1, VCO 500-1250 MHz).
+    // PnR closes 35 MHz knife-edge: 35.004 MHz Actual Fmax, +0.004 ns
+    // worst setup slack (verified 2026-08-22). The route-dominated
+    // CSR-address fan-out critical path runs at ~37 MHz actual, so 35 MHz
+    // is the boundary — essentially zero margin, may not repeat run-to-run.
+    // Comfortable fallback if a re-run fails: drop the rPLL and tie
+    //   assign clk_core = clk_i;   // 25 MHz PLL-bypass, +2.248 ns slack
+    // (the rPLL cannot do a clean 25 MHz out: VCO = 25*ODIV_SEL <= 400
+    // < the 500 MHz floor, so 25 MHz bypasses the PLL entirely).
+    //
+    // VCO must stay in 500-1250 MHz (GowinSynthesis EX0311 range), and
+    // ODIV_SEL is a bounded rPLL parameter (max 16 on this primitive;
+    // larger values get replaced by the default 8, dropping the VCO
+    // below the floor and tripping EX0311). For 35 MHz out the VCO is
+    // 35*ODIV_SEL, so ODIV_SEL=16 gives the max VCO = 560 MHz (above the
+    // 500 floor, +60 margin).
     // -----------------------------------------------------------------
 
-    wire clk_core = clk_i;
+    wire clk_core;
+    wire pll_lock;
+
+    rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
+        .FCLKIN   ("25"),
+        .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
+        .FBDIV_SEL(6),     // -> CLKOUT = 35 MHz (range: 3.125-600 MHz)
+        .ODIV_SEL (16)     // -> VCO = 560 MHz (range: 500-1250 MHz; ODIV_SEL max 16)
+    ) pll (
+        .CLKOUTP (),
+        .CLKOUTD (),
+        .CLKOUTD3(),
+        .RESET   (1'b0),
+        .RESET_P (1'b0),
+        .CLKFB   (1'b0),
+        .FBDSEL  (6'b0),
+        .IDSEL   (6'b0),
+        .ODSEL   (6'b0),
+        .PSDA    (4'b0),
+        .DUTYDA  (4'b0),
+        .FDLY    (4'b0),
+        .CLKIN   (clk_i),     // 25 MHz
+        .CLKOUT  (clk_core),  // 35 MHz
+        .LOCK    (pll_lock)
+    );
 
     // -----------------------------------------------------------------
     // Reset synchronization
     //
-    // Reset is asserted while the external reset is asserted;
-    // deassertion is synchronized to clk_core (clk_i). With no PLL there
-    // is no lock signal to wait on.
+    // Reset is asserted while:
+    //   - external reset is asserted, OR
+    //   - PLL has not locked yet.
+    //
+    // Deassertion is synchronized to clk_core.
     // -----------------------------------------------------------------
 
     logic [1:0] rst_sync;
 
     always_ff @(posedge clk_core) begin
         if (!rstn_i) begin
+            rst_sync <= 2'b00;
+        end else if (!pll_lock) begin
             rst_sync <= 2'b00;
         end else begin
             rst_sync <= {rst_sync[0], 1'b1};
@@ -103,9 +137,9 @@ module top_module (
     axi4_lite_if axi_bus_timer ();
 
     // Single clock domain: the whole fabric (CPU bridge, memories, the
-    // buses) runs on clk_core (= clk_i, 25 MHz) / rstn_core. There is NO
-    // clock-domain crossing — clk_i drives the fabric directly (no rPLL),
-    // and rstn_i is the async board reset that feeds the synchronizer.
+    // buses) runs on clk_core / rstn_core. There is NO clock-domain
+    // crossing — clk_i (25 MHz) only feeds the rPLL, and rstn_i is the
+    // async board reset that feeds the synchronizer.
     assign axi_bus_peri.aclk     = clk_core;
     assign axi_bus_peri.aresetn  = rstn_core;
     assign axi_bus_msip.aclk     = clk_core;
