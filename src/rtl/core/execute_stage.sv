@@ -5,61 +5,53 @@
 import rv32_pkg::*;
 
 /**
- * Execute stage (DRAFT) — consumes the D/E control word (de_i) from
- * decode and:
+ * Execute stage — consumes the D/E control word (de_i) from decode and:
  *
  *   - selects the ALU operands (rs1 / rs2 / pc / imm / pc4 / rs1-shifted)
  *     per de_i.alu_src_a / alu_src_b;
  *   - drives the ALU (base RV32I + M + Zilx EA), launching the
  *     multi-cycle DIV/REM with start_i and stalling the pipe until the
  *     ALU asserts result_valid_o;
- *   - writes back ALU / PC4 / load (MEM) results to the register file
- *     (stores carry no reg writeback); loads retire via WB_MEM once the
- *     read response arrives;
+ *   - writes back ALU / PC4 / load (MEM) / old-CSR results to the
+ *     register file (stores carry no reg writeback); loads retire via
+ *     WB_MEM once the read response arrives;
+ *   - exports ex_wb_en_o / ex_wb_addr_o / ex_wb_data_o to decode the
+ *     same cycle a writeback retires, so decode's fwd_rs1/fwd_rs2
+ *     forward the fresh value directly into the D/E register instead
+ *     of re-reading the regfile — RAW hazards at distance-1 (including
+ *     load-use and DIV/REM) cost zero bubbles;
  *   - resolves branches and redirects fetch (branch_valid_o /
  *     branch_addr_o), flushing decode's D/E register on a taken branch;
+ *   - resolves sync traps / mret / interrupts at the commit point and
+ *     drives the trap unit interface;
  *   - drives the native mem_req_o / mem_rsp_i port (the LSU) toward the
- *     peri bridge: loads/stores/Zilx indexed loads launch, stall the pipe
- *     until the response, and retire.
+ *     peri bridge: loads/stores/Zilx indexed loads launch, stall the
+ *     pipe until the response (loads) or retire on launch-accept
+ *     (posted stores), and retire.
  *
- * The CPU top used to tie the reg-file write port, the fetch redirect,
- * and decode's stall/flush to inert constants; this stage now drives
- * them. fe_* (fetch) / de_* (decode) / ex_* (execute) taps follow the
+ * fe_* (fetch) / de_* (decode) / ex_* (execute) taps follow the
  * stage-sigil convention: ex_* is the E/M register — pc / instr / valid
  * of the retired operation.
  *
  * Memory (LSU): loads / stores / Zilx indexed loads launch on the native
- * mem_req_o / mem_rsp_i port (the peri bridge). A unified FSM extends the
- * DIV/REM busy state with EX_MEM_WAIT: a mem op launches the cycle it is
- * valid in EX_IDLE (wvalid=1, bridge wready=1 in its idle), then the pipe
- * stalls in EX_MEM_WAIT until the read response (rvalid, load) or the
- * write-ack (bvalid, store) retires it. Loads write back via WB_MEM with
- * sub-word extract + sign/zero extension; stores carry pre-shifted data
- * and byte strobes (no reg writeback). The decode stall-on-RAW interlock
- * then covers load-use: a consumer right behind a load is held in decode
- * while the load occupies execute, and bubbles the cycle the load's wb_en
- * pulses — so it re-reads the fresh loaded value (one bubble, no bypass).
+ * mem_req_o / mem_rsp_i (or peri_req_o / peri_rsp_i) port. A unified FSM
+ * extends the DIV/REM busy state with EX_MEM_WAIT: a mem op launches the
+ * cycle it is valid in EX_IDLE (wvalid=1, bridge wready=1 in its idle),
+ * then the pipe stalls in EX_MEM_WAIT until the read response (rvalid,
+ * load) retires it. Stores are posted: they retire the same cycle as
+ * launch-accept, not on bvalid — the bridge owns the write->B round
+ * trip and naturally stalls any following mem op via wready until the
+ * store actually completes (RAW-through-memory ordering preserved
+ * there). Loads write back via WB_MEM with sub-word extract +
+ * sign/zero extension.
  *
- * Known DRAFT limitations:
+ * Current limitations:
  *
- *   - No bypass path. Register RAW hazards are resolved by decode's
- *     stall-on-RAW interlock (one bubble), not by forwarding. Load-use is
- *     covered the same way (the load's extra execute cycles hold the
- *     consumer in decode; the wb_en pulse triggers the bubble). No
- *     forwarding means each dependent op pays the bubble.
- *
- *   - No trap / exception support. A misaligned access (LH/LHU at
- *     addr[0]=1, LW at addr[1:0]!=0, or the SH/SW equivalents) is
- *     SUPPRESSED — not launched, not retired, no writeback — rather than
- *     trapping. Cross-word sub-word accesses that would need two beats
- *     are not handled. The Zicsr CSR RMW is in (CSRRW/S/C + immediate
- *     variants retire via csr_regfile), but ecall/ebreak/mret/wfi and
- *     trap entry/return are still absent — add the exception pipeline
- *     before relying on aligned-only code.
- *
- *   - DIV/REM result is not bypassed (see hazard note): a consumer in
- *     the slot right after the div reads the stale value — resolved by
- *     the interlock's bubble, not forwarding.
+ *   - No trap delegation / PMP / S-U mode (machine mode only).
+ *   - A misaligned access (LH/LHU at addr[0]=1, LW/SW at addr[1:0]!=0)
+ *     raises a load/store-address-misaligned sync trap; a sub-word
+ *     access crossing a word boundary is not handled.
+ *   - DIV/REM overflow (INT_MIN / -1) is not handled (see alu.sv).
  *
  * Naming: ports *_i/_o; internals no prefix; flops _q/_d; instances u_*.
  */

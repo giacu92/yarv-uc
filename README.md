@@ -10,9 +10,11 @@ Disclaimer: This project is created by me with the assistance of Claude Code
 > machine-mode trap/exception/interrupt machinery are implemented and
 > sim-verified (Verilator + Spike co-sim), but several peripherals and
 > interrupt sources are still missing — see **Roadmap** below. Synthesis
-> + PnR are re-confirmed on the build host (2026-08-22): the core closes
-> **35 MHz** (knife-edge, +0.004 ns slack) with a comfortable **25 MHz**
-> PLL-bypass fallback — see the timing note in **Status** below.
+> + PnR are re-confirmed on the build host (2026-08-22, pre-forwarding):
+> the core closes **35 MHz** (knife-edge, +0.004 ns slack) with a
+> comfortable **25 MHz** PLL-bypass fallback — see the timing note in
+> **Status** below. The execute→decode forward path is uncommitted WIP
+> (cosim still PASS) and not yet timing-re-verified.
 
 An RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based
@@ -35,9 +37,12 @@ kept only for peripherals. Implemented so far:
   handles RV32I + M + C + Zilx indexed loads + Zicsr CSR ops. Odd-half
   (upper-half) branch targets and 32-bit instructions spanning a
   fetch-word boundary (stitched from two consecutive words) are handled.
-  A stall-on-RAW interlock bubbles the D/E register one cycle when
-  decode's live sources match execute's retiring writeback, so dependent
-  ops re-read the regfile after the producer commits (no bypass path).
+  An execute→decode forward path (fwd_rs1/fwd_rs2) injects execute's
+  retiring writeback value into the D/E operands when it matches a
+  decoded source reg, so distance-1 RAW hazards (ALU / DIV-REM /
+  load-use) resolve same-cycle with zero bubbles (bypass, no stall
+  interlock). Distance-2+ hazards read the regfile after the write
+  committed.
 - **Execute + LSU** — ALU (base RV32I + single-cycle MUL via DSP +
   multi-cycle DIV/REM + Zilx effective address), reg-file writeback
   (ALU/PC4/load/**old-CSR**), branch resolve with fetch redirect, and a
@@ -84,14 +89,17 @@ instruction-address-misaligned traps, and the **external interrupt**
 (`mip.MEIP` — MSIP and MTIP are wired; MEIP has no source yet).
 `fence.i` is a nop (Harvard has no D->I write path — self-modifying code
 unsupported). Synth + PnR of the trap + timer path are **re-confirmed**
-on the build host (2026-08-22): the 64-bit timer compare (two-stage
-pipelined) + trap redirect mux exposed the route-dominated CSR-address
-fan-out critical path at ~37 MHz actual, so the target was lowered
-50 → 40 → **35 MHz** (rPLL `IDIV_SEL=4`/`FBDIV_SEL=6`/`ODIV_SEL=16`,
-VCO 560 MHz). PnR closes 35 MHz at 35.004 MHz Actual Fmax, worst setup
-slack +0.004 ns, TNS 0 — a **knife-edge** closure (essentially zero
-margin; may not repeat run-to-run). The comfortable fallback is the
-**25 MHz PLL-bypass** (`clk_core = clk_i` direct, +2.248 ns slack). To
+on the build host (2026-08-22), **before the forward path was added**:
+the 64-bit timer compare (two-stage pipelined) + trap redirect mux
+exposed the route-dominated CSR-address fan-out critical path at
+~37 MHz actual, so the target was lowered 50 → 40 → **35 MHz** (rPLL
+`IDIV_SEL=4`/`FBDIV_SEL=6`/`ODIV_SEL=16`, VCO 560 MHz). PnR closes
+35 MHz at 35.004 MHz Actual Fmax, worst setup slack +0.004 ns, TNS 0 —
+a **knife-edge** closure (essentially zero margin; may not repeat
+run-to-run). The comfortable fallback is the **25 MHz PLL-bypass**
+(`clk_core = clk_i` direct, +2.248 ns slack). The execute→decode forward
+path is **uncommitted WIP** (cosim still PASS) and its timing impact on
+that knife-edge path is **not yet re-verified**. To
 reclaim a safe 40 MHz, the async CSR read must be pipelined into a
 registered 1-cycle read (an invasive Zicsr read-latency change, deferred).
 

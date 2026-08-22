@@ -52,12 +52,12 @@ import rv32_pkg::*;
  * following fetch is the next word (low half), not another odd-half
  * address.
  *
- * stall_o feeds fetch's stall_i, back-pressuring the pipe on a DIV/REM
- * stall (stall_i from execute) or a RAW hazard (raw_haz — see the
- * interlock block below). The hold_q && fe_valid_i term fires for a
- * compressed-upper hold alongside a fresh F/D word (gated on
- * !hold_is_span so a spanning stitch, which consumes W+1, does not
- * false-stall); the stall_i and raw_haz terms carry real back-pressure.
+ * stall_o feeds fetch's stall_i, back-pressuring the pipe only on
+ * execute's stall_i (DIV/REM busy / mem-wait) or a compressed-upper
+ * hold colliding with a fresh F/D word (resource_stall). RAW hazards
+ * are NOT a source of back-pressure: execute-to-decode forwarding
+ * (fwd_rs1/fwd_rs2, see below) resolves same-cycle RAW at decode
+ * without stalling fetch or bubbling D/E.
  *
  * Decoded opcodes that ride the D/E register to execute:
  *   OPC_AMO with Zilx funct5 (10010 unscaled / 11010 scaled) -> indexed-load
@@ -103,11 +103,12 @@ module decode_stage (
     input wire stall_i,
     input wire flush_i,
 
-    // Execute writeback observation for the RAW interlock: when execute
+    // Execute writeback observation for the forward path: when execute
     // retires a register write this cycle (ex_wb_en_i) to a destination
-    // (ex_wb_addr_i) that the instruction being decoded reads, decode
-    // bubbles the D/E register and holds F/D one cycle so the reg-file
-    // async read repeats after the writeback commits (see raw_haz below).
+    // (ex_wb_addr_i, ex_wb_data_i) that the instruction being decoded
+    // reads, decode forwards the fresh value straight into the D/E
+    // operands instead of the stale async regfile read (see fwd_rs1 /
+    // fwd_rs2 below) — zero bubble, no D/E bubble and no F/D hold.
     input wire            ex_wb_en_i,
     input wire [     4:0] ex_wb_addr_i,
     // Execute writeback data: same cycle as ex_wb_en_i/ex_wb_addr_i,
@@ -476,35 +477,21 @@ module decode_stage (
     de_t de_q, de_d, de_next;
 
     // =================================================================
-    // RAW hazard interlock
+    // RAW hazard resolution (execute -> decode forwarding)
     //
-    // Detect a read-after-write hazard at the single in-order distance:
-    // the instruction being decoded this cycle vs the instruction retiring
-    // in execute this cycle. Decode's live combinational source addresses
-    // (rs1_addr_dec / rs2_addr_dec, forced to x0 when unused, so an unused
-    // source can never match) are compared against execute's writeback
-    // destination. When execute retires a writeback this cycle (ex_wb_en_i)
-    // to a register the decoded instruction reads, raw_haz BUBBLES the D/E
-    // register and HOLDS F/D + the hold buffer for one cycle: the reg-file
-    // async read repeats next cycle after the writeback has committed, so
-    // the consumer captures the fresh value instead of the stale one.
-    //
-    // This is a distinct action from stall_i (which holds de_q and would
-    // make execute re-run the instruction — double writeback, and for a
-    // finished DIV/REM it would relaunch the divider) and from flush_i
-    // (which kills D/E AND redirects fetch). raw_haz only bubbles D/E;
-    // execute retires its writeback this cycle and gets an invalid slot
-    // next cycle (no re-run).
-    //
-    // Gated on decoded_valid (covers BOTH a fresh F/D word AND a
-    // hold-buffer upper half — the latter decodes with fe_valid_i=0, so
-    // gating on fe_valid_i alone would miss a hazard where the low half
-    // of a compressed pair writes rd and the stashed upper half reads
-    // it). ~flush_i skips the stall when E_N is a taken JAL/JALR (writes
-    // link AND redirects — fall-through discarded). ex_wb_en_i is high
-    // only on the retire cycle, so DIV/REM busy cycles (wb_en=0, already
-    // covered by ex_stall) don't falsely trigger — only the div-done
-    // cycle does.
+    // Replaces the former stall-on-RAW bubble interlock. Decode's live
+    // combinational source addresses (rs1_addr_dec / rs2_addr_dec, forced
+    // to x0 when unused, so an unused source can never match) are compared
+    // against execute's retiring writeback destination. When execute
+    // retires a writeback this cycle (ex_wb_en_i) to a register the decoded
+    // instruction reads, the fresh value is forwarded straight into the
+    // D/E operands instead of the stale async regfile read (see fwd_rs1 /
+    // fwd_rs2 below) — zero bubble, no D/E bubble and no F/D hold. The
+    // legacy raw_haz bubble logic is retained commented-out below for
+    // reference; it is no longer in the stall_o term.
+    // =================================================================
+    // (legacy, DISABLED) RAW hazard bubble interlock — replaced by
+    // fwd_rs1/fwd_rs2 forwarding. Kept for reference.
     // =================================================================
     //logic raw_haz;
     //assign raw_haz = decoded_valid & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
@@ -683,8 +670,8 @@ module decode_stage (
         // A COMPLETE instruction is available this cycle: every case
         // EXCEPT span_wait (upper-half word not here yet) and target_span
         // (just stashed the low half, waiting for the stitch). This feeds
-        // de_d.valid and the RAW interlock, so neither wait state emits a
-        // spurious valid or false-triggers raw_haz.
+        // de_d.valid and the forward-path compare, so neither wait state
+        // emits a spurious valid or false-triggers a forward.
         decoded_valid = span_complete | is_hold_plain | (target_upper && !target_span) |
             (fe_valid_i && !hold_q && !target_upper);
 
@@ -1229,10 +1216,6 @@ module decode_stage (
 
         if (flush_i) begin
             hold_d = 1'b0;  // redirect: drop any stashed half
-            //        end else if (raw_haz || stall_i) begin
-            //            // RAW interlock / DIV-REM stall: preserve the stash (the
-            //            // consumer re-runs next cycle). raw_haz cannot fire during
-            //            // span_wait/target_span (decoded_valid=0), but is harmless.
         end else if (stall_i) begin
             // DIV-REM / mem-wait stall: preserve the stash.
         end else if (span_wait) begin
@@ -1276,10 +1259,7 @@ module decode_stage (
     always_comb begin
         if (flush_i) begin
             de_next = '0;
-            //      end else if (raw_haz) begin
-            //          de_next = '0;  // RAW interlock: bubble D/E (execute gets an invalid slot)
         end else if (stall_i) begin
-            //            de_next = de_q;  // DIV/REM stall: hold
             de_next = de_q;  // DIV/REM / mem-wait stall: hold
         end else begin
             de_next = de_d;
@@ -1287,19 +1267,19 @@ module decode_stage (
     end
 
     // =================================================================
-    // Back-pressure to fetch (DIV/REM stall or RAW hazard).
+    // Back-pressure to fetch (compressed-upper hold or DIV/REM / mem-wait
+    // stall only — RAW is no longer a source of back-pressure; the
+    // forward path resolves it without stalling fetch or bubbling D/E).
     // The hold_q && fe_valid_i term fires for a compressed-upper hold
     // alongside a fresh F/D word (the stash takes priority -> hold F/D).
     // It is gated on !hold_is_span: a spanning hold with fe_valid is
     // span_complete, which CONSUMES word W+1 (no stall) -- without the
     // gate, the stitch would wrongly hold F/D and re-see W+1. span_wait
-    // has fe_valid=0 (no term). The stall_i and raw_haz terms carry real
+    // has fe_valid=0 (no term). The stall_i term carries real
     // back-pressure.
     // =================================================================
     wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
     wire backpressure_stall = stall_i;
-    //  wire raw_stall = raw_haz;
-    //  assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i || raw_haz;
     assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
 
     // Register-read addresses drive the reg file.
