@@ -5,15 +5,12 @@
 import rv32_pkg::*;
 
 /**
- * Simulation top (Verilator). Mirrors the board-top wiring of
- * `top_module`:
+ * Simulation top (Verilator). Mirrors top_module's peri bus wiring:
  *
- *   CPU.imem -> native_ram u_imem (read-only, preloaded via +IINIT)
- *   CPU.dmem -> native_ram u_dmem (byte-strobed RW, preloaded via +DINIT)
- *   CPU.axi_peri -> axi_bus_peri -> axi4_lite_xbar (peri 1->2, addr[12])
- *                    |-> u_msip  (0x1000_0000)
+ *   CPU.axi_peri -> axi_bus_peri -> axi4_lite_xbar_3 (1->3, base+size)
+ *                    |-> u_uart  (0x1000_0000)
  *                    |-> u_timer (0x1000_1000+)
- *
+ *                    |-> u_msip  (0x1000_3000)
  * Fetch and the LSU each have a dedicated BSRAM (Harvard). The peri bus
  * carries the MSIP + CLINT timer MMIO slaves behind the peri xbar.
  *
@@ -38,11 +35,12 @@ module sim_top (
 );
 
     // -----------------------------------------------------------------
-    // AXI4-Lite peripheral bus (trunk modport) + peri 1->2 split.
+    // AXI4-Lite peripheral bus (trunk modport) + peri 1->3 split.
     // -----------------------------------------------------------------
     axi4_lite_if axi_bus_peri ();
     axi4_lite_if axi_bus_msip ();
     axi4_lite_if axi_bus_timer ();
+    axi4_lite_if axi_bus_uart ();
 
     assign axi_bus_peri.aclk     = clk_i;
     assign axi_bus_peri.aresetn  = rstn_i;
@@ -50,6 +48,8 @@ module sim_top (
     assign axi_bus_msip.aresetn  = rstn_i;
     assign axi_bus_timer.aclk    = clk_i;
     assign axi_bus_timer.aresetn = rstn_i;
+    assign axi_bus_uart.aclk     = clk_i;
+    assign axi_bus_uart.aresetn  = rstn_i;
 
     // -----------------------------------------------------------------
     // Native memory ports. Fetch and the LSU each get a dedicated
@@ -163,14 +163,17 @@ module sim_top (
     //   addr[12]=0 -> m_mem_axi  -> u_msip  (0x1000_0000)
     //   addr[12]=1 -> m_peri_axi -> u_timer (0x1000_1000+)
     // -----------------------------------------------------------------
-    axi4_lite_xbar #(
-        .SEL_BIT(12)
+    axi4_lite_xbar_3 #(
+        .BASE0(32'h1000_0000), .SIZE0(32'h0000_1000),  // uart
+        .BASE1(32'h1000_1000), .SIZE1(32'h0000_2000),  // timer
+        .BASE2(32'h1000_3000), .SIZE2(32'h0000_1000)   // msip
     ) u_peri_xbar (
-        .clk_i     (clk_i),
-        .rstn_i    (rstn_i),
-        .s_axi     (axi_bus_peri.slave),
-        .m_mem_axi (axi_bus_msip.master),
-        .m_peri_axi(axi_bus_timer.master)
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .s_axi (axi_bus_peri.slave),
+        .m0_axi(axi_bus_uart),
+        .m1_axi(axi_bus_timer.master),
+        .m2_axi(axi_bus_msip.master)
     );
 
     msip_peri u_msip (
@@ -185,6 +188,21 @@ module sim_top (
         .rstn_i(rstn_i),
         .axi   (axi_bus_timer.slave),
         .mtip_o(mtip)
+    );
+
+    wire uart_irq;
+    wire uart_txd;
+
+    axi4_lite_uart #(
+        .CLK_FREQ_HZ(50_000_000),  // sim clock is a free-running C++ tick, not board-accurate
+        .BAUD_RATE  (115200)
+    ) u_uart (
+        .clk_i (clk_i),
+        .rstn_i(rstn_i),
+        .axi   (axi_bus_uart),
+        .txd_o (uart_txd),
+        .rxd_i (1'b1),  // idle line; no RX stimulus in this harness
+        .uart_irq_o(uart_irq)
     );
 
     // -----------------------------------------------------------------

@@ -27,6 +27,7 @@ sim/*.log
 
 # C-program build artefacts (sim/sw: C -> program.hex, regenerable)
 sim/sw/build/
+sim/sw-yarvmon/build/
 sim/sw_trap/build/
 sim/sw_timer/build/
 sim/cosim/ecall/build/
@@ -52,3 +53,4 @@ sim/cosim/ecall/rtl.trace
 # Python bytecode (cosim_diff.py runs)
 sim/cosim/__pycache__/
 sim/cosim/ecall/__pycache__/
+

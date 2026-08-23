@@ -41,6 +41,10 @@ module top_module (
     input wire clk_i,
     input wire rstn_i,
 
+    // UART
+    input  wire uart_rxd_i,
+    output wire uart_txd_o,
+
     // Debug LEDs: low 4 bits of the fetch PC.
     output wire [3:0] led_o
 );
@@ -135,6 +139,7 @@ module top_module (
     axi4_lite_if axi_bus_peri ();
     axi4_lite_if axi_bus_msip ();
     axi4_lite_if axi_bus_timer ();
+    axi4_lite_if axi_bus_uart ();
 
     // Single clock domain: the whole fabric (CPU bridge, memories, the
     // buses) runs on clk_core / rstn_core. There is NO clock-domain
@@ -146,6 +151,8 @@ module top_module (
     assign axi_bus_msip.aresetn  = rstn_core;
     assign axi_bus_timer.aclk    = clk_core;
     assign axi_bus_timer.aresetn = rstn_core;
+    assign axi_bus_uart.aclk     = clk_core;
+    assign axi_bus_uart.aresetn  = rstn_core;
 
     // Debug tap: decode or execute stage stall.
     wire dbg_stall;
@@ -238,14 +245,20 @@ module top_module (
     //   addr[12]=0 -> m_mem_axi  -> MSIP  (0x1000_0000)
     //   addr[12]=1 -> m_peri_axi -> timer (0x1000_1000+)
     // -----------------------------------------------------------------
-    axi4_lite_xbar #(
-        .SEL_BIT(12)
+    axi4_lite_xbar_3 #(
+        .BASE0(32'h1000_0000),
+        .SIZE0(32'h0000_1000),  // uart
+        .BASE1(32'h1000_1000),
+        .SIZE1(32'h0000_2000),  // timer
+        .BASE2(32'h1000_3000),
+        .SIZE2(32'h0000_1000)   // msip
     ) u_peri_xbar (
-        .clk_i     (clk_core),
-        .rstn_i    (rstn_core),
-        .s_axi     (axi_bus_peri.slave),
-        .m_mem_axi (axi_bus_msip.master),
-        .m_peri_axi(axi_bus_timer.master)
+        .clk_i (clk_core),
+        .rstn_i(rstn_core),
+        .s_axi (axi_bus_peri.slave),
+        .m0_axi(axi_bus_uart),
+        .m1_axi(axi_bus_timer.master),
+        .m2_axi(axi_bus_msip.master)
     );
 
     // -----------------------------------------------------------------
@@ -273,6 +286,24 @@ module top_module (
     );
 
     // -----------------------------------------------------------------
+    // UART Controller
+    // -----------------------------------------------------------------
+    logic uart_irq;
+
+    axi4_lite_uart #(
+        .CLK_FREQ_HZ(35e6),
+        .BAUD_RATE  (115200)
+    ) uart_i (
+        .clk_i (clk_core),
+        .rstn_i(rstn_core),
+        .axi   (axi_bus_uart),
+        .txd_o (uart_txd_o),
+        .rxd_i (uart_rxd_i),
+
+        .uart_irq_o(uart_irq)
+    );
+
+    // -----------------------------------------------------------------
     // Debug LEDs:
     // led_o[0]: stall indicator (high when the CPU is stalled, low when it is running)
     // led_o[3:1]: free-running counter on clk_core (alive indicator).
@@ -291,4 +322,5 @@ module top_module (
     assign led_o[0]   = dbg_stall;
 
 endmodule
+
 `resetall

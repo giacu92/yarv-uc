@@ -25,6 +25,8 @@
 
 #define N 32
 
+#include "uart.h"
+
 /* Initialized .data array (part of the RAM image, so it lands in memory
  * without needing .bss zeroing). volatile forces a real load/store per
  * access and stops -O2 from constant-folding the whole sort. */
@@ -88,9 +90,20 @@ int main(void)
 
     /* Verify ascending order; return a recognizable marker in a0.
      * 0x600D == sorted, 0x00000BAD == still unsorted (sort broken). */
+    int ok = 1;
     for (int i = 1; i < N; i++) {
         if (arr[i - 1] > arr[i])
-            return 0x00000BAD;
+        {
+            ok = 0;
+            break;
+        }
     }
-    return 0x600D;
+
+    if (ok) {
+        uart_puts("OK\r\n");
+        return 0x600D;
+    } else {
+        uart_puts("FAIL\r\n");
+        return 0x00000BAD;
+    }
 }

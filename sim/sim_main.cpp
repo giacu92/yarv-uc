@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     // env var (e.g. MAX_CYC=20000 make run) for longer-running programs.
     const int max_cyc = [] {
         const char *e = getenv("MAX_CYC");
-        return e ? atoi(e) : 8000;
+        return e ? atoi(e) : 80000;
     }();
 
     // Optional machine-readable commit log for co-sim (diff vs Spike).

@@ -1,9 +1,15 @@
 package rv32_pkg;
 
 
-    localparam int unsigned XLEN          = 32;
-    localparam int unsigned STRB_WIDTH    = XLEN / 8;
-    localparam int unsigned AXI4_LEN      = 32;
+    localparam int unsigned XLEN = 32;
+    localparam int unsigned STRB_WIDTH = XLEN / 8;
+    localparam int unsigned AXI4_LEN = 32;
+
+    // Machine software interrupt MMIO register (peri region, PERI_ADDR_BIT=28).
+    // A write of bit[0] sets/clears mip.MSIP. Peri base = 0x1000_0000.
+    localparam logic [XLEN-1:0] MSIP_PERI_ADDR = 32'h1000_3000;
+    localparam logic [XLEN-1:0] UART_BASE = 32'h1000_0000;
+    localparam logic [XLEN-1:0] MTIMER_BASE = 32'h1000_1000;
 
     // ---------------------------------------------------------------
     // Bus address decode: the single AXI4-Lite master port carries
@@ -196,15 +202,11 @@ package rv32_pkg;
     localparam logic [1:0] MTVEC_DIRECT = 2'b00;
     localparam logic [1:0] MTVEC_VECTORED = 2'b01;
 
-    // Machine software interrupt MMIO register (peri region, PERI_ADDR_BIT=28).
-    // A write of bit[0] sets/clears mip.MSIP. Peri base = 0x1000_0000.
-    localparam logic [XLEN-1:0] MSIP_PERI_ADDR = 32'h1000_0000;
 
     // Machine timer MMIO registers (CLINT-style). The timer lives in the
     // peri region at MTIMER_BASE (0x1000_1000), selected by the peri xbar on
     // addr[12]=1 (msip is at addr[12]=0). mtime is a free-running 64-bit
     // counter (RO); mtimecmp is the 64-bit compare (RW). mtip = mtime>=mtimecmp.
-    localparam logic [XLEN-1:0] MTIMER_BASE = 32'h1000_1000;
     localparam int unsigned MTIME_OFF = 5'h0;  // mtime_lo @ +0, mtime_hi @ +4
     localparam int unsigned MTIMECMP_OFF = 5'h8;  // mtimecmp_lo @ +8, mtimecmp_hi @ +C
 
