@@ -270,3 +270,5 @@ package rv32_pkg;
     } de_t;
 
 endpackage
+
+`resetall

@@ -154,7 +154,7 @@ module sim_top (
     //   sim_top.g_mem_probe[<i>].mem_probe_w
     // -----------------------------------------------------------------
     localparam int unsigned PROBE_BASE_WORD = 64'h800;  // DMEM 0x2000 (.data / pass marker)
-    localparam int unsigned PROBE_LEN       = 64'd32;
+    localparam int unsigned PROBE_LEN = 64'd32;
 
     genvar gi;
     generate

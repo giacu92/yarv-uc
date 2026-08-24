@@ -57,9 +57,9 @@ module axi4_lite_ram #(
     // -----------------------------------------------------------------
     // Local params
     // -----------------------------------------------------------------
-    localparam int DATA_W      = axi.DATA_WIDTH;
-    localparam int STRB_W      = DATA_W / 8;
-    localparam int BYTES_W     = $clog2(STRB_W);    // byte-select bits
+    localparam int DATA_W = axi.DATA_WIDTH;
+    localparam int STRB_W = DATA_W / 8;
+    localparam int BYTES_W = $clog2(STRB_W);  // byte-select bits
     localparam int WORD_ADDR_W = ADDR_W - BYTES_W;
     localparam int DEPTH_WORDS = 1 << WORD_ADDR_W;  // addressable words
 

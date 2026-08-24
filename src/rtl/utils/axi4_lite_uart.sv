@@ -86,15 +86,14 @@ module axi4_lite_uart #(
 );
 
     localparam int DATA_W = axi.DATA_WIDTH;
-    localparam logic [15:0] BAUD_DIV_RESET =
-        16'((CLK_FREQ_HZ / BAUD_RATE) - 1);
+    localparam logic [15:0] BAUD_DIV_RESET = 16'((CLK_FREQ_HZ / BAUD_RATE) - 1);
 
     // Word offsets (byte addr[4:2], word-aligned; addr[1:0] ignored like
     // the rest of the fabric — every access here is a single 32-bit beat).
-    localparam logic [2:0] REG_TXDATA  = 3'd0;
-    localparam logic [2:0] REG_RXDATA  = 3'd1;
-    localparam logic [2:0] REG_STATUS  = 3'd2;
-    localparam logic [2:0] REG_CTRL    = 3'd3;
+    localparam logic [2:0] REG_TXDATA = 3'd0;
+    localparam logic [2:0] REG_RXDATA = 3'd1;
+    localparam logic [2:0] REG_STATUS = 3'd2;
+    localparam logic [2:0] REG_CTRL = 3'd3;
     localparam logic [2:0] REG_BAUDDIV = 3'd4;
 
     // =================================================================
