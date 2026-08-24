@@ -42,7 +42,13 @@ module top_module (
     // The MS5351M drives independent single-ended CMOS clocks; CLK0 is on
     // PIN10. Used as a plain LVCMOS33 input (no differential / LVDS).
     input wire clk_i,
-    input wire rstn_i,
+    // Board reset button S1 on PIN88. This board's button is ACTIVE-HIGH:
+    // pressed = PIN88 HIGH = reset; released = LOW = run (the board pulls
+    // the pin low when released). So the reset here is active-high — the
+    // system runs with the button untouched and resets only while S1 is
+    // held. (An earlier build treated this pin as active-low rstn_i, which
+    // inverted the polarity and forced the button to be held to run.)
+    input wire rst_i,
 
     // UART
     input  wire uart_rxd_i,
@@ -82,43 +88,60 @@ module top_module (
     // 500 floor, +60 margin).
     // -----------------------------------------------------------------
 
-    // clk_core frequency, in Hz. MUST track the rPLL settings below: it is
-    // what the UART divides down to hit BAUD_RATE, so taking the documented
-    // 25 MHz PLL-bypass fallback without editing this too leaves the UART
-    // running 40% fast (garbage on the wire).
-    localparam int unsigned CLK_CORE_HZ = 35_000_000;
+    // clk_core frequency, in Hz. MUST track the clock source below: it is
+    // what the UART divides down to hit BAUD_RATE, so editing the clock
+    // source without editing this too leaves the UART running at the wrong
+    // baud (garbage on the wire).
+    //
+    // *** 25 MHz PLL-BYPASS MODE (active). ***
+    // clk_core = clk_i directly (the 25 MHz MS5351M reference on PIN10),
+    // rPLL disabled. This is the documented fallback (+2.248 ns setup
+    // slack vs the knife-edge 35 MHz rPLL path) AND a diagnostic: it
+    // removes the rPLL from the picture, so if the design still does not
+    // come alive on silicon the clock reference itself (clk_i / MS5351M)
+    // is the culprit, not the rPLL. UART baud at 25 MHz: BAUDDIV resets to
+    // CLK_FREQ_HZ/BAUD_RATE-1 = 216, so baud = 25e6/217 = 115 207 Hz
+    // (115200, 0.006% off, well within RS-232 tolerance). To return to
+    // 35 MHz: restore the rPLL instance below and set CLK_CORE_HZ =
+    // 35_000_000.
+    localparam int unsigned CLK_CORE_HZ = 25_000_000;
 
-    wire clk_core;
-    wire pll_lock;
+    wire clk_core = clk_i;  // PLL-bypass: core runs on the 25 MHz reference
+    wire pll_lock = 1'b1;  // no rPLL -> always "locked"
 
-    rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
-        .FCLKIN   ("25"),
-        .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
-        .FBDIV_SEL(6),     // -> CLKOUT = 35 MHz (range: 3.125-600 MHz)
-        .ODIV_SEL (16)     // -> VCO = 560 MHz (range: 500-1250 MHz; ODIV_SEL max 16)
-    ) pll (
-        .CLKOUTP (),
-        .CLKOUTD (),
-        .CLKOUTD3(),
-        .RESET   (1'b0),
-        .RESET_P (1'b0),
-        .CLKFB   (1'b0),
-        .FBDSEL  (6'b0),
-        .IDSEL   (6'b0),
-        .ODSEL   (6'b0),
-        .PSDA    (4'b0),
-        .DUTYDA  (4'b0),
-        .FDLY    (4'b0),
-        .CLKIN   (clk_i),     // 25 MHz
-        .CLKOUT  (clk_core),  // 35 MHz
-        .LOCK    (pll_lock)
-    );
+    // rPLL instance (disabled in bypass mode). Restore this block (and
+    // change CLK_CORE_HZ to 35_000_000, clk_core/pll_lock back to declared
+    // wires) to retarget 35 MHz. Kept here so the bypass is a one-spot
+    // toggle, not a delete-and-rewrite.
+    // rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
+    //     .FCLKIN   ("25"),
+    //     .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
+    //     .FBDIV_SEL(6),     // -> CLKOUT = 35 MHz (range: 3.125-600 MHz)
+    //     .ODIV_SEL (16)     // -> VCO = 560 MHz (range: 500-1250 MHz; ODIV_SEL max 16)
+    // ) pll (
+    //     .CLKOUTP (),
+    //     .CLKOUTD (),
+    //     .CLKOUTD3(),
+    //     .RESET   (1'b0),
+    //     .RESET_P (1'b0),
+    //     .CLKFB   (1'b0),
+    //     .FBDSEL  (6'b0),
+    //     .IDSEL   (6'b0),
+    //     .ODSEL   (6'b0),
+    //     .PSDA    (4'b0),
+    //     .DUTYDA  (4'b0),
+    //     .FDLY    (4'b0),
+    //     .CLKIN   (clk_i),     // 25 MHz
+    //     .CLKOUT  (clk_core),  // 35 MHz
+    //     .LOCK    (pll_lock)
+    // );
 
     // -----------------------------------------------------------------
     // Reset synchronization
     //
     // Reset is asserted while:
-    //   - external reset is asserted, OR
+    //   - the external reset button S1 is pressed (rst_i HIGH — active-high
+    //     on this board, see the port comment), OR
     //   - PLL has not locked yet.
     //
     // Deassertion is synchronized to clk_core.
@@ -127,7 +150,7 @@ module top_module (
     logic [1:0] rst_sync;
 
     always_ff @(posedge clk_core) begin
-        if (!rstn_i) begin
+        if (rst_i) begin
             rst_sync <= 2'b00;
         end else if (!pll_lock) begin
             rst_sync <= 2'b00;
@@ -214,7 +237,7 @@ module top_module (
     // $readmemh in sim_top.
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (16),             // 64 KiB
+        .ADDR_W    (16),                              // 64 KiB
         .DATA_WIDTH(32),
         .READ_ONLY (1),
         // A read-only I-mem with no init and no write port is a zero-ROM:
@@ -222,13 +245,15 @@ module top_module (
         // all-illegal, and the whole pipeline (regfile/csr/alu/execute)
         // gets swept as dead code -- only fetch+decode survive because
         // they feed dbg_stall_o. So the I-mem MUST carry firmware for any
-        // meaningful (or even timing-representative) synthesis. This is
-        // the timing-closure / bring-up firmware (the sim oracle, a
-        // self-contained program that stores its own .data at runtime, so
-        // no D-mem preload is needed). A real product bitstream re-points
-        // this at the application firmware. Path is relative to the Gowin
-        // project dir (repo root).
-        .INIT_FILE ("sim/imem.hex")
+        // meaningful (or even timing-representative) synthesis. The
+        // default product firmware is YarvMon (sim/sw-yarvmon), a wozmon-
+        // style serial monitor over the UART (115200 8N1 on uart_rxd_i/
+        // uart_txd_o): type hex addresses to examine, ':' to deposit,
+        // '.' for a block dump, 'R' to call an address. Its image is built
+        // by `make` in sim/sw-yarvmon/ (imem.hex = .text/.text.init -> I-mem
+        // 0x0, dmem.hex = .rodata/.data -> D-mem 0x2000). Path is relative
+        // to the Gowin project dir (repo root).
+        .INIT_FILE ("sim/sw-yarvmon/build/imem.hex")
     ) u_imem (
         .clk_i    (clk_core),
         .rstn_i   (rstn_core),
@@ -238,13 +263,16 @@ module top_module (
 
     // -----------------------------------------------------------------
     // Data memory (byte-strobed read/write). Holds .rodata/.data/.bss
-    // and the stack. LSU's dedicated port.
+    // and the stack. LSU's dedicated port. Preloaded with the firmware's
+    // .rodata/.data image (dmem.hex, @ word 0x800 = byte 0x2000, matching
+    // the link VMA) so the monitor's strings/literals are present at
+    // power-up; .bss and the stack are zeroed by start.S / runtime use.
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (16),  // 64 KiB
+        .ADDR_W    (16),                              // 64 KiB
         .DATA_WIDTH(32),
         .READ_ONLY (0),
-        .INIT_FILE ("")
+        .INIT_FILE ("sim/sw-yarvmon/build/dmem.hex")
     ) u_dmem (
         .clk_i    (clk_core),
         .rstn_i   (rstn_core),

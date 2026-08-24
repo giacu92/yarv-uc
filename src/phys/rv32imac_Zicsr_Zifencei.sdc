@@ -17,21 +17,21 @@
 # 50/50 duty cycle.
 create_clock -name clk25 -period 40 [get_ports {clk_i}]
 
-# CPU core clock: rPLL CLKOUT drives the clk_core net.
-#   fCLKOUT = FCLKIN * FBDIV / IDIV = 25 * 7 / 5 = 35 MHz
-#   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=6 -> FBDIV=7; ODIV_SEL=16 sets the
-#   VCO = 25*7*16/5 = 560 MHz but does NOT divide CLKOUT).
-#   Period = 40 * 5 / 7 = 28.571 ns.  multiply_by 7 / divide_by 5 expresses
-#   the 7/5 ratio in smallest integers.
+# CPU core clock.
+# *** 25 MHz PLL-BYPASS MODE (active): clk_core = clk_i (no rPLL), so it
+# inherits the 25 MHz clk25 constraint above (40 ns). The generated-clock
+# constraint used for the 35 MHz rPLL build is commented out below. To
+# retarget 35 MHz: restore top_module's rPLL instance AND uncomment the
+# create_generated_clock here (and set pnr_check.tcl / cmd.do global_freq
+# back to 35.000). ***
 # Gowin auto-derives a clock on the rPLL output (named *.default_gen_clk);
 # this explicit constraint takes precedence (a PnR warning is expected and
 # harmless — it just names the clock clk_core for the timing reports).
-create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 7 -divide_by 5 [get_nets {clk_core}]
+# create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 7 -divide_by 5 [get_nets {clk_core}]
 
-# Async reset: treat rstn_i as asynchronous to the fabric clocks.
-# (We do not currently generate / assert rstn_i internally; this is
-# documentation for future use.)
-set_false_path -from [get_ports {rstn_i}]
+# Async reset: treat rst_i (board reset button S1, active-high on this
+# board) as asynchronous to the fabric clocks.
+set_false_path -from [get_ports {rst_i}]
 
 # Debug LEDs are not timing-critical (human eye).
 set_false_path -to [get_ports {led_o[*]}]
