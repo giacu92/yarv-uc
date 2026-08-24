@@ -171,6 +171,12 @@ module top_module (
     wire msip;
     wire mtip;
 
+    // Machine external interrupt: OR of the peripheral level IRQs. Only the
+    // UART raises one today; add further peripherals to this term (or swap in
+    // a PLIC) as they arrive.
+    wire uart_irq;
+    wire meip = uart_irq;
+
     // -----------------------------------------------------------------
     // CPU. Functional ports only — no debug crosses the CPU boundary
     // (the per-stage taps are internal; the simulation probes them via
@@ -187,7 +193,8 @@ module top_module (
         .dmem_req_o (dmem_req),
         .dmem_rsp_i (dmem_rsp),
         .msip_i     (msip),
-        .mtip_i     (mtip)
+        .mtip_i     (mtip),
+        .meip_i     (meip)
     );
 
     // -----------------------------------------------------------------

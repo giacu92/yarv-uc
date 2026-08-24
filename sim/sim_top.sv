@@ -63,6 +63,10 @@ module sim_top (
     // Interrupt pending bits (mip.MSIP / mip.MTIP sources).
     wire msip;
     wire mtip;
+    // Machine external interrupt: OR of the peripheral level IRQs (UART only
+    // today), same term as the board top.
+    wire uart_irq;
+    wire meip = uart_irq;
 
     // -----------------------------------------------------------------
     // CPU. Functional ports only; debug is observed via the Verilator
@@ -82,7 +86,8 @@ module sim_top (
         .dmem_req_o (dmem_req),
         .dmem_rsp_i (dmem_rsp),
         .msip_i     (msip),
-        .mtip_i     (mtip)
+        .mtip_i     (mtip),
+        .meip_i     (meip)
     );
 
     // -----------------------------------------------------------------
@@ -190,18 +195,17 @@ module sim_top (
         .mtip_o(mtip)
     );
 
-    wire uart_irq;
     wire uart_txd;
 
     axi4_lite_uart #(
         .CLK_FREQ_HZ(50_000_000),  // sim clock is a free-running C++ tick, not board-accurate
         .BAUD_RATE  (115200)
     ) u_uart (
-        .clk_i (clk_i),
-        .rstn_i(rstn_i),
-        .axi   (axi_bus_uart),
-        .txd_o (uart_txd),
-        .rxd_i (1'b1),  // idle line; no RX stimulus in this harness
+        .clk_i     (clk_i),
+        .rstn_i    (rstn_i),
+        .axi       (axi_bus_uart.slave),
+        .txd_o     (uart_txd),
+        .rxd_i     (1'b1),                // idle line; no RX stimulus in this harness
         .uart_irq_o(uart_irq)
     );
 

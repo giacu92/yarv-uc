@@ -68,7 +68,12 @@ module rv32imac_zicsr_zifencei (
     // Machine timer-interrupt pending bit from the CLINT timer MMIO slave
     // (on axi_peri at the board top). Drives mip.MTIP. Read-only from CSR
     // write — SW clears it by writing mtimecmp > mtime, not by writing mip.
-    input wire mtip_i
+    input wire mtip_i,
+
+    // Machine external-interrupt pending bit from the board-level peripheral
+    // IRQ tree (currently the UART's level IRQ). Drives mip.MEIP. Read-only
+    // from CSR write — SW clears it by servicing the peripheral.
+    input wire meip_i
 );
 
     // ===================================================================
@@ -233,6 +238,7 @@ module rv32imac_zicsr_zifencei (
         .d_mstatus_i   (d_mstatus),
         .msip_i        (msip_i),
         .mtip_i        (mtip_i),
+        .meip_i        (meip_i),
         .mtvec_o       (csr_mtvec),
         .mepc_o        (csr_mepc),
         .mstatus_o     (csr_mstatus),

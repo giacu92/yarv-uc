@@ -21,10 +21,11 @@ import rv32_pkg::*;
 *     csrrw RMW port). Each writes a different register, so all four can
 *     fire in one cycle.
 *   - int_pending_o : a machine interrupt is pending and enabled
-*     (mstatus.MIE & (MSIP&MSIE | MTIP&MTIE)). Read by execute to decide
-*     take_interrupt and to wake WFI halt.
-*   - int_cause_o  : the resolved interrupt cause (MSI > MTI priority, MEI
-*     not wired). Execute uses it as the mcause for the interrupt entry.
+*     (mstatus.MIE & (MEIP&MEIE | MSIP&MSIE | MTIP&MTIE)). Read by execute
+*     to decide take_interrupt and to wake WFI halt.
+*   - int_cause_o  : the resolved interrupt cause. Priority MEI > MSI > MTI
+*     (RISC-V privileged spec order). Execute uses it as the mcause for the
+*     interrupt entry.
 *
 * Priority (resolved by the execute stage before calling in):
 *   sync trap > interrupt > mret  (a faulting instruction traps; an
@@ -32,7 +33,8 @@ import rv32_pkg::*;
 *   mret returns only when neither traps nor interrupts fire).
 *
 * mcause: synchronous exceptions carry mcause[31]=0 (code in [30:0]);
-* interrupts carry mcause[31]=1 (MSI code=3, MTI code=7). The execute stage
+* interrupts carry mcause[31]=1 (MSI code=3, MTI code=7, MEI code=11). The
+* execute stage
 * passes the fully-resolved cause_i (MCAUSE_* from the package) for sync
 * traps, and takes int_cause_o for interrupts; this module forwards
 * cause_i unchanged.
@@ -97,19 +99,22 @@ module trap_unit (
 
     // -----------------------------------------------------------------
     // Interrupt pending: MIE globally enabled AND at least one source is
-    // pending+locally-enabled. MSI > MTI priority (MEI not wired yet).
+    // pending+locally-enabled. Priority MEI > MSI > MTI (spec order).
     // -----------------------------------------------------------------
     wire mie_m = mstatus_i[MSTATUS_MIE_BIT];
     wire msip_p = mip_i[3];  // MSIP
     wire msie_e = mie_i[3];  // MSIE
     wire mtip_p = mip_i[7];  // MTIP
     wire mtie_e = mie_i[7];  // MTIE
+    wire meip_p = mip_i[11];  // MEIP
+    wire meie_e = mie_i[11];  // MEIE
 
     wire msi_pending = msip_p & msie_e;
     wire mti_pending = mtip_p & mtie_e;
+    wire mei_pending = meip_p & meie_e;
 
-    assign int_pending_o = mie_m & (msi_pending | mti_pending);
-    assign int_cause_o   = msi_pending ? MCAUSE_MSI : MCAUSE_MTI;
+    assign int_pending_o = mie_m & (mei_pending | msi_pending | mti_pending);
+    assign int_cause_o   = mei_pending ? MCAUSE_MEI : msi_pending ? MCAUSE_MSI : MCAUSE_MTI;
 
     // -----------------------------------------------------------------
     // Redirect address.

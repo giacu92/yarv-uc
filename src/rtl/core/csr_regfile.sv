@@ -68,6 +68,13 @@ module csr_regfile (
     // the slave is the only source.
     input wire mtip_i,
 
+    // Machine external interrupt pending bit, driven by the peripheral IRQ
+    // OR-tree at the board top (currently the UART's level IRQ). Like MSIP /
+    // MTIP, mip.MEIP is read-only from CSR writes; SW clears it by servicing
+    // the peripheral (e.g. draining UART RX / disabling its CTRL enable),
+    // not by writing mip.
+    input wire meip_i,
+
     // Combinational CSR taps for the trap unit (mtvec / mepc redirect,
     // mstatus MIE/MPIE, mip / mie for interrupt pending). Separate
     // outputs so the trap path does not steal the async RMW read.
@@ -151,8 +158,8 @@ module csr_regfile (
             if (csr_wren_i && (csr_addr_i == CSR_ADDR_MTVEC))
                 regs[3] <= {csr_data_i[31:2], 1'b0, csr_data_i[0]};
 
-            // --- mie RMW: raw (MSIE/MTIE/MEIE are writable storage; no
-            // interrupt source for MTIE/MEIE yet). ---
+            // --- mie RMW: raw. MSIE / MTIE / MEIE are all backed by a real
+            // pending source (msip_peri / clint_timer / the peri IRQ tree). ---
             if (csr_wren_i && (csr_addr_i == CSR_ADDR_MIE)) regs[2] <= csr_data_i;
 
             // --- mscratch RMW: raw. ---
@@ -164,13 +171,14 @@ module csr_regfile (
                 regs[6] <= csr_data_i;
             if (!we_mtval_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MTVAL)) regs[7] <= csr_data_i;
 
-            // --- mip: MSIP (bit3) tracks msip_i and MTIP (bit7) tracks
-            // mtip_i every cycle (read-only from CSR write — SW clears them
-            // via the MMIO slaves, not by writing mip); MEIP(11) hardwired
-            // 0 (no external source yet). The other bits are RMW-writable. ---
+            // --- mip: MSIP (bit3), MTIP (bit7) and MEIP (bit11) track
+            // msip_i / mtip_i / meip_i every cycle (read-only from CSR write —
+            // SW clears them at the source: the MSIP MMIO register, mtimecmp,
+            // or the peripheral raising the external IRQ). The other bits are
+            // RMW-writable. ---
             regs[8][3]  <= msip_i;
             regs[8][7]  <= mtip_i;
-            regs[8][11] <= 1'b0;
+            regs[8][11] <= meip_i;
             if (csr_wren_i && (csr_addr_i == CSR_ADDR_MIP)) begin
                 regs[8][2:0]   <= csr_data_i[2:0];
                 regs[8][6:4]   <= csr_data_i[6:4];
@@ -188,7 +196,7 @@ module csr_regfile (
     assign csr_data_o = csr_rdata;
 
     // Trap-unit taps (combinational). mip_o reflects the live msip_i /
-    // hardwired-zero bits via regs[8] (updated every cycle above).
+    // mtip_i / meip_i bits via regs[8] (updated every cycle above).
     assign mtvec_o    = regs[3];
     assign mepc_o     = regs[5];
     assign mstatus_o  = regs[0];
