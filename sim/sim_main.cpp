@@ -58,6 +58,9 @@
 // sim_top-level net (not inside u_cpu), e.g. the dbg_stall_o sink.
 #define STAP(field) (top->rootp->sim_top__DOT__##field)
 
+// Taps inside the execute stage (one level below the CPU top).
+#define XTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_execute__DOT__##field)
+
 static vluint64_t sim_time = 0;
 
 // One full clock period: low half then high half, dumping the waveform
@@ -132,6 +135,43 @@ int main(int argc, char** argv) {
     int same_ret = 0;
     int park_cyc = -1;  // cycle the core was first detected parked
 
+    // ---- WFI-halt liveness checks -------------------------------------
+    // WFI freezes the whole pipe until a pending+enabled interrupt wakes it
+    // (execute_stage: wfi_stall = wfi_halt_q & ~int_pending). Two ways that
+    // can go wrong, both of which brick the core with no recovery but reset:
+    //
+    //  1. STUCK-AFTER-WAKE. wfi_halt_q must drop as soon as int_pending goes
+    //     high, whatever event actually wins arbitration that cycle. If it
+    //     only cleared on take_interrupt, a sync trap (illegal instruction /
+    //     misaligned access) sitting right behind the WFI would win the
+    //     priority contest, leave wfi_halt_q set, and then trap entry clears
+    //     mstatus.MIE -> int_pending falls -> wfi_stall re-asserts and freezes
+    //     the pipe INSIDE the handler, which can never retire the CSR write
+    //     that would re-enable interrupts. Post-fix, (wfi_halt_q &&
+    //     int_pending) lasts a single cycle; a halt still held long after a
+    //     wake was observed is that regression.
+    //
+    //  2. NEVER-WOKEN. A halt held for an implausibly long time with no
+    //     retires at all. Legal per spec (a WFI with no interrupt source
+    //     armed waits forever), but no oracle in this tree does that, so it
+    //     means the wake path broke.
+    //
+    // Both bounds are generous and env-overridable; they exist to turn a
+    // silent "ran to MAX_CYC" into a named failure.
+    const int wfi_stuck_n = []() {
+        const char *e = getenv("WFI_STUCK_N");
+        return e ? atoi(e) : 64;
+    }();
+    const int wfi_halt_n = []() {
+        const char *e = getenv("WFI_HALT_N");
+        return e ? atoi(e) : 4000;
+    }();
+    bool wfi_wake_seen  = false;  // (wfi_halt_q && int_pending) observed
+    int  wfi_since_wake = 0;      // cycles wfi_halt_q held since that wake
+    int  wfi_held       = 0;      // cycles wfi_halt_q held continuously
+    int  wfi_fail_cyc   = -1;
+    const char *wfi_fail_why = nullptr;
+
     char line[96];
     int cyc;
     for (cyc = 0; cyc < max_cyc; ++cyc) {
@@ -155,6 +195,34 @@ int main(int argc, char** argv) {
         // dec_stall | ex_stall, sunk to unused_dbg_stall in sim_top).
         // Sampled post-edge; counts RAW-hazard / DIV / LSU stalls.
         if (STAP(unused_dbg_stall)) ++stalled;
+
+        // ---- WFI-halt liveness (see the declarations above) ----
+        {
+            const bool halt = XTAP(wfi_halt_q) != 0;
+            const bool ipend = XTAP(int_pending_i) != 0;
+            if (!halt) {
+                wfi_held       = 0;
+                wfi_since_wake = 0;
+                wfi_wake_seen  = false;
+            } else {
+                ++wfi_held;
+                if (ipend) wfi_wake_seen = true;
+                if (wfi_wake_seen) ++wfi_since_wake;
+
+                if (wfi_fail_cyc < 0 && wfi_wake_seen && wfi_since_wake > wfi_stuck_n) {
+                    wfi_fail_cyc = cyc;
+                    wfi_fail_why =
+                        "wfi_halt_q still set >WFI_STUCK_N cycles after an interrupt "
+                        "went pending -- the WFI wake path lost arbitration (sync trap / "
+                        "mret) and never released the halt";
+                } else if (wfi_fail_cyc < 0 && wfi_held > wfi_halt_n) {
+                    wfi_fail_cyc = cyc;
+                    wfi_fail_why =
+                        "wfi_halt_q held >WFI_HALT_N cycles with no wake -- no enabled "
+                        "interrupt ever reached the core";
+                }
+            }
+        }
 
         // ---- fetch log (one line per cycle fe_valid is high) ----
         // Fetch is WORD-granular: it always advances by 4, never by 2 (the
@@ -279,6 +347,12 @@ int main(int argc, char** argv) {
                stalled, cyc, 100.0 * stalled / cyc);
     }
 
+    if (wfi_fail_cyc >= 0) {
+        printf("WFI-HALT FAIL at cycle %d: %s\n", wfi_fail_cyc, wfi_fail_why);
+    } else {
+        printf("WFI-halt check: OK\n");
+    }
+
     // Let a few final cycles ripple for the waveform tail.
     for (int i = 0; i < 4; ++i) tick(top, tfp);
 
@@ -287,5 +361,5 @@ int main(int argc, char** argv) {
     tfp->close();
     delete top;
     delete tfp;
-    return 0;
+    return wfi_fail_cyc >= 0 ? 1 : 0;
 }
