@@ -322,42 +322,48 @@ module decode_stage (
                             end
                         end
                     end
-                    3'b100: begin  // c.srli / c.srai / c.andi / c.sub
-                        //               / c.xor / c.or / c.and (CB / CA)
-                        // Selector = {c[12], c[11:10]}:
-                        //   000 srli  100 srai  001 andi
-                        //   010 sub   110 xor   011 or   111 and
-                        //   101 reserved -> illegal
-                        unique case ({
-                            c[12], c[11:10]
-                        })
-                            3'b000: begin  // c.srli  rd', shamt (RV32 shamt=c[6:2])
+                    3'b100: begin  // c.srli / c.srai / c.andi (CB) +
+                        //               c.sub / c.xor / c.or / c.and (CA)
+                        // All share rd' = c[9:7] (x8..x15) as BOTH rd and
+                        // rs1 (srli/srai/andi: rd=rs1=rd'; sub/xor/or/and:
+                        // rd=rs1=rd', rs2=rs2'=c[4:2]). c[12] is shamt[5]
+                        // (srli/srai) or imm[5] (andi); RV32 requires
+                        // shamt[5]=0 for srli/srai. Top selector = c[11:10]:
+                        //   00 srli  01 srai  10 andi
+                        //   11 arith by c[6:5]: 00 sub 01 xor 10 or 11 and
+                        unique case (c[11:10])
+                            2'b00: begin  // c.srli  rd', shamt (RV32 shamt=c[6:2])
                                 off = {25'b0, 2'b00, c[6:2]};
-                                res = mk_i(OPC_OP_IMM, crd, crd, 3'b101, off);
+                                res = mk_i(OPC_OP_IMM, crs1, crs1, 3'b101, off);
                             end
-                            3'b100: begin  // c.srai  rd', shamt
+                            2'b01: begin  // c.srai  rd', shamt
                                 off = {20'b0, 7'b0100000, c[6:2]};
-                                res = mk_i(OPC_OP_IMM, crd, crd, 3'b101, off);
+                                res = mk_i(OPC_OP_IMM, crs1, crs1, 3'b101, off);
                             end
-                            3'b001: begin  // c.andi  rd', imm
+                            2'b10: begin  // c.andi  rd', imm
                                 logic [5:0] imm6;
                                 imm6 = {c[12], c[6:2]};
                                 off  = {{26{imm6[5]}}, imm6};
-                                res  = mk_i(OPC_OP_IMM, crd, crd, 3'b111, off);
+                                res  = mk_i(OPC_OP_IMM, crs1, crs1, 3'b111, off);
                             end
-                            3'b010: begin  // c.sub  rd', rd' - rs2'
-                                res = mk_r(OPC_OP, crd, crd, crs2, 3'b000, 7'b0100000);
+                            2'b11: begin  // c.sub / c.xor / c.or / c.and (CA)
+                                unique case (c[6:5])
+                                    2'b00: begin  // c.sub  rd', rd' - rs2'
+                                        res = mk_r(OPC_OP, crs1, crs1, crs2, 3'b000, 7'b0100000);
+                                    end
+                                    2'b01: begin  // c.xor  rd', rd' ^ rs2'
+                                        res = mk_r(OPC_OP, crs1, crs1, crs2, 3'b100, 7'b0000000);
+                                    end
+                                    2'b10: begin  // c.or   rd', rd' | rs2'
+                                        res = mk_r(OPC_OP, crs1, crs1, crs2, 3'b110, 7'b0000000);
+                                    end
+                                    2'b11: begin  // c.and  rd', rd' & rs2'
+                                        res = mk_r(OPC_OP, crs1, crs1, crs2, 3'b111, 7'b0000000);
+                                    end
+                                    default: res = 32'h0000_0000;
+                                endcase
                             end
-                            3'b110: begin  // c.xor  rd', rd' ^ rs2'
-                                res = mk_r(OPC_OP, crd, crd, crs2, 3'b100, 7'b0000000);
-                            end
-                            3'b011: begin  // c.or   rd', rd' | rs2'
-                                res = mk_r(OPC_OP, crd, crd, crs2, 3'b110, 7'b0000000);
-                            end
-                            3'b111: begin  // c.and  rd', rd' & rs2'
-                                res = mk_r(OPC_OP, crd, crd, crs2, 3'b111, 7'b0000000);
-                            end
-                            default: res = 32'h0000_0000;  // 101 reserved
+                            default: res = 32'h0000_0000;
                         endcase
                     end
                     3'b101: begin  // c.j -> jal x0, offset
