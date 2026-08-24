@@ -12,12 +12,14 @@ Disclaimer: This project is created by me with the assistance of Claude Code
 > sources are now wired — MSIP, MTIP (CLINT timer), and MEIP (UART IRQ)
 > — behind a 1→3 peripheral mux with a DECERR terminator for unmapped
 > addresses; see **Roadmap** below for what is still missing. Synthesis
-> + PnR are re-confirmed on the build host (2026-08-22, **pre-forwarding**):
-> the core closes **35 MHz** (knife-edge, +0.004 ns slack) with a
-> comfortable **25 MHz** PLL-bypass fallback — see the timing note in
-> **Status** below. The execute→decode forward path is **committed** (cosim
-> still PASS) but its timing impact on that knife-edge path is **not yet
-> re-verified** on the build host.
+> + PnR are re-confirmed on the build host (2026-08-24, **post-forwarding,
+> with the UART + `axi4_lite_xbar_3` in the build**):
+> the **active build is the 25 MHz PLL-bypass** (`clk_core = clk_i`,
+> rPLL removed — the chosen operating point), with a verified-closing
+> **35 MHz** rPLL retarget option (knife-edge, +0.040 ns slack) — see
+> the timing note in **Status** below. The execute→decode forward path
+> is **committed and timing-re-verified** (cosim still PASS; 35 MHz
+> closes).
 
 An RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based
@@ -102,20 +104,27 @@ instruction-address-misaligned traps, an **illegal-CSR-access** trap
 **PLIC-style interrupt controller** (MEIP is a single ORed level with no
 cause register — the ISR must poll). `fence.i` is a nop (Harvard has no
 D->I write path — self-modifying code unsupported). Synth + PnR of the
-trap + timer path are **re-confirmed** on the build host (2026-08-22),
-**before the forward path was added**:
+trap + timer path are **re-confirmed** on the build host (2026-08-24,
+**post-forwarding, with the UART + `axi4_lite_xbar_3` in the build**):
 the 64-bit timer compare (two-stage pipelined) + trap redirect mux
 exposed the route-dominated CSR-address fan-out critical path at
-~37 MHz actual, so the target was lowered 50 → 40 → **35 MHz** (rPLL
-`IDIV_SEL=4`/`FBDIV_SEL=6`/`ODIV_SEL=16`, VCO 560 MHz). PnR closes
-35 MHz at 35.004 MHz Actual Fmax, worst setup slack +0.004 ns, TNS 0 —
-a **knife-edge** closure (essentially zero margin; may not repeat
-run-to-run). The comfortable fallback is the **25 MHz PLL-bypass**
-(`clk_core = clk_i` direct, +2.248 ns slack). The execute→decode forward
-path is **committed** (cosim still PASS) but its timing impact on that
-knife-edge path is **not yet re-verified**. To
-reclaim a safe 40 MHz, the async CSR read must be pipelined into a
-registered 1-cycle read (an invasive Zicsr read-latency change, deferred).
+~37 MHz actual (pre-forwarding), so the target was lowered 50 → 40 →
+**35 MHz** (rPLL `IDIV_SEL=4`/`FBDIV_SEL=6`/`ODIV_SEL=16`, VCO 560 MHz).
+PnR closes 35 MHz at **35.049 MHz Actual Fmax, worst setup slack
++0.040 ns, TNS 0** — a **knife-edge** closure (~40 ps margin; may not
+repeat run-to-run), slightly better than the pre-forwarding
+35.004/+0.004. The critical path shifted post-forwarding to the
+**regfile async read → decode forward mux** (the bypass fanning into
+the D/E operands, 17 logic levels), so the bypass — not the CSR fan-out
+— is now the limiter. The **active build is the 25 MHz PLL-bypass**
+(`clk_core = clk_i` direct, rPLL removed, +2.248 ns slack — the chosen
+operating point); the 35 MHz rPLL config above is the verified-closing
+retarget option (restore the rPLL instance + SDC generated clock +
+`global_freq 35.000` to switch). The execute→decode forward path is
+**committed and timing-re-verified** (cosim still PASS; 35 MHz closes).
+To reclaim a safe 40 MHz, the async CSR read must be pipelined into a
+registered 1-cycle read and/or the forward mux registered (invasive
+Zicsr / decode-latency change, deferred).
 
 ## Roadmap (what is next)
 
@@ -126,15 +135,17 @@ The peripheral/interrupt story is the current active front. **MSIP**
 all wired, behind a 1→3 peri mux (`axi4_lite_xbar_3`, base+size windows
 from `rv32_pkg`; unmapped → DECERR). The remaining work, in order:
 
-1. **Assign the UART pins in the Gowin project.** The UART is wired into
-   `top_module.sv` and `sim_top.sv` (TXDATA/RXDATA/STATUS/CTRL/BAUDDIV
-   MMIO at `UART_BASE` 0x1000_0000, 8N1 single-buffer, level IRQ → MEIP,
-   `rxd_i` double-flopped off the async pin, baud divisor reset tied to
-   `CLK_CORE_HZ`), but it is **not yet in the `.gprj` file list** and has
-   no pin assignment in `.cst` — currently sim/RTL only, not synthesized.
-   `BAUDDIV` is already a programmable RW register (reset from
-   `CLK_FREQ_HZ/BAUD_RATE`, reprogrammable at runtime, applied only when
-   TX+RX are idle so an in-flight frame is never corrupted).
+1. **UART — wired + synthesized, bring-up pending on hardware.** The
+   UART (`axi4_lite_uart.sv`, TXDATA/RXDATA/STATUS/CTRL/BAUDDIV MMIO at
+   `UART_BASE` 0x1000_0000, 8N1 single-buffer, level IRQ → MEIP, `rxd_i`
+   double-flopped off the async pin) is wired into `top_module.sv` and
+   `sim_top.sv`, **added to the `.gprj`** with `axi4_lite_xbar_3.sv`, and
+   **has pin assignments in `.cst`** (`uart_txd_o` PIN69, `uart_rxd_i`
+   PIN70, the onboard BL616 USB-UART bridge) — synthesized + PnR'd
+   2026-08-24. Not yet exercised on hardware. `BAUDDIV` is already a
+   programmable RW register (reset from `CLK_FREQ_HZ/BAUD_RATE`,
+   reprogrammable at runtime, applied only when TX+RX are idle so an
+   in-flight frame is never corrupted).
 2. **GPIO.** Direction / output / input registers, per-pin or global
    interrupt. Same MMIO/AXI4-Lite slave template as UART/MSIP.
 3. **Simple PLIC-style interrupt controller.** MEIP is a single ORed
