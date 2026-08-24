@@ -12,7 +12,16 @@ import rv32_pkg::*;
  * interface-array indexing — Gowin's elaborator does not support either
  * reliably), matching the working 1->2 xbar's pattern exactly.
  *
- *   sel 0 -> m0_axi   sel 1 -> m1_axi   sel 2 -> m2_axi   else -> no match
+ *   sel 0 -> m0_axi   sel 1 -> m1_axi   sel 2 -> m2_axi   3 -> no match
+ *
+ * An address that matches none of the three windows is NOT left to stall.
+ * It is completed locally by a decode-error terminator: the write is
+ * accepted and answered with BRESP = DECERR, the read is answered with
+ * RRESP = DECERR and RDATA = 0. Without it the slave-side ready stays low
+ * forever and the CPU's LSU parks in EX_MEM_WAIT with no way out but reset
+ * -- which is easy to hit, because the LSU routes the WHOLE
+ * 0x1000_0000..0x1FFF_FFFF region here on addr[PERI_ADDR_BIT] while only the
+ * three windows are mapped.
  */
 module axi4_lite_xbar_3 #(
     parameter logic [31:0] BASE0 = 32'h1000_0000,
@@ -42,6 +51,20 @@ module axi4_lite_xbar_3 #(
         if (addr >= BASE2 && addr < BASE2 + SIZE2) return 2'd2;
         return 2'd3;  // no match
     endfunction
+
+    // Decode-error terminator state (sel == 2'd3). Mirrors the minimal
+    // slave handshake the real peripherals use: registered BVALID held until
+    // the B handshake, RVALID held until RREADY, single-outstanding.
+    logic err_aw_seen_q;
+    logic err_w_seen_q;
+    logic err_bvalid_q;
+    logic err_rvalid_q;
+
+    wire  err_awready = !err_aw_seen_q && !err_bvalid_q;
+    wire  err_wready = !err_w_seen_q && !err_bvalid_q;
+    wire  err_arready = !err_rvalid_q;
+
+    localparam logic [1:0] RESP_DECERR = 2'b11;
 
     logic       wr_busy_q;
     logic [1:0] wr_sel_q;
@@ -114,7 +137,7 @@ module axi4_lite_xbar_3 #(
                     m2_axi.awvalid = 1'b1;
                     s_axi.awready  = m2_axi.awready;
                 end
-                default: ;  // no match: stall (awready stays 0)
+                default: s_axi.awready = err_awready;  // no match: DECERR
             endcase
         end
 
@@ -133,7 +156,7 @@ module axi4_lite_xbar_3 #(
                     m2_axi.wvalid = 1'b1;
                     s_axi.wready  = m2_axi.wready;
                 end
-                default: ;
+                default: s_axi.wready = err_wready;  // no match: DECERR
             endcase
         end
 
@@ -155,7 +178,10 @@ module axi4_lite_xbar_3 #(
                     s_axi.bresp   = m2_axi.bresp;
                     m2_axi.bready = s_axi.bready;
                 end
-                default: ;
+                default: begin  // no match: DECERR
+                    s_axi.bvalid = err_bvalid_q;
+                    s_axi.bresp  = RESP_DECERR;
+                end
             endcase
         end
 
@@ -174,7 +200,7 @@ module axi4_lite_xbar_3 #(
                     m2_axi.arvalid = 1'b1;
                     s_axi.arready  = m2_axi.arready;
                 end
-                default: ;
+                default: s_axi.arready = err_arready;  // no match: DECERR
             endcase
         end
 
@@ -199,18 +225,47 @@ module axi4_lite_xbar_3 #(
                     s_axi.rresp   = m2_axi.rresp;
                     m2_axi.rready = s_axi.rready;
                 end
-                default: ;
+                default: begin  // no match: DECERR, rdata = 0
+                    s_axi.rvalid = err_rvalid_q;
+                    s_axi.rdata  = '0;
+                    s_axi.rresp  = RESP_DECERR;
+                end
             endcase
         end
     end
 
+    // Decode-error terminator handshakes (only when the live/latched select
+    // is the no-match code).
+    wire err_aw_hs = aw_hs && (wr_sel_live == 2'd3);
+    wire err_w_hs = s_axi.wvalid && s_axi.wready && (wr_sel_eff == 2'd3);
+    wire err_do_write = (err_aw_seen_q || err_aw_hs) && (err_w_seen_q || err_w_hs) && !err_bvalid_q;
+    wire err_b_hs = b_hs && (wr_sel_q == 2'd3);
+    wire err_ar_hs = ar_hs && (rd_sel_live == 2'd3);
+    wire err_r_hs = r_hs && (rd_sel_q == 2'd3);
+
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            wr_busy_q <= 1'b0;
-            wr_sel_q  <= 2'd0;
-            rd_busy_q <= 1'b0;
-            rd_sel_q  <= 2'd0;
+            wr_busy_q     <= 1'b0;
+            wr_sel_q      <= 2'd0;
+            rd_busy_q     <= 1'b0;
+            rd_sel_q      <= 2'd0;
+            err_aw_seen_q <= 1'b0;
+            err_w_seen_q  <= 1'b0;
+            err_bvalid_q  <= 1'b0;
+            err_rvalid_q  <= 1'b0;
         end else begin
+            if (err_aw_hs) err_aw_seen_q <= 1'b1;
+            if (err_w_hs) err_w_seen_q <= 1'b1;
+            if (err_do_write) begin
+                err_aw_seen_q <= 1'b0;
+                err_w_seen_q  <= 1'b0;
+                err_bvalid_q  <= 1'b1;
+            end
+            if (err_b_hs) err_bvalid_q <= 1'b0;
+
+            if (err_ar_hs) err_rvalid_q <= 1'b1;
+            else if (err_r_hs) err_rvalid_q <= 1'b0;
+
             if (aw_hs) begin
                 wr_busy_q <= 1'b1;
                 wr_sel_q  <= wr_sel_live;
