@@ -257,7 +257,6 @@ module axi4_lite_uart #(
     // =================================================================
     logic              rvalid_q;
     logic [DATA_W-1:0] rdata_q;
-    logic [       2:0] araddr_word_q;
 
     assign axi.arready = !rvalid_q || (rvalid_q && axi.rready);
     wire ar_hs = axi.arvalid && axi.arready;
@@ -285,14 +284,12 @@ module axi4_lite_uart #(
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            rvalid_q      <= 1'b0;
-            rdata_q       <= '0;
-            araddr_word_q <= '0;
+            rvalid_q <= 1'b0;
+            rdata_q  <= '0;
         end else begin
             if (ar_hs) begin
-                rvalid_q      <= 1'b1;
-                rdata_q       <= rdata_mux;
-                araddr_word_q <= axi.araddr[4:2];
+                rvalid_q <= 1'b1;
+                rdata_q  <= rdata_mux;
             end else if (rvalid_q && axi.rready) begin
                 rvalid_q <= 1'b0;
             end
