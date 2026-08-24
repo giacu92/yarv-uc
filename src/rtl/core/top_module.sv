@@ -79,6 +79,12 @@ module top_module (
     // 500 floor, +60 margin).
     // -----------------------------------------------------------------
 
+    // clk_core frequency, in Hz. MUST track the rPLL settings below: it is
+    // what the UART divides down to hit BAUD_RATE, so taking the documented
+    // 25 MHz PLL-bypass fallback without editing this too leaves the UART
+    // running 40% fast (garbage on the wire).
+    localparam int unsigned CLK_CORE_HZ = 35_000_000;
+
     wire clk_core;
     wire pll_lock;
 
@@ -293,19 +299,34 @@ module top_module (
     );
 
     // -----------------------------------------------------------------
-    // UART Controller
+    // UART Controller.
+    //
+    // uart_rxd_i comes off a board pin driven by a far-end transmitter with
+    // its own oscillator: asynchronous to clk_core no matter that the fabric
+    // is single-domain. Double-flop it before it reaches the RX sampler --
+    // axi4_lite_uart samples rxd_i straight into its shift register and has
+    // no framing-error flag, so a metastable sample would silently corrupt a
+    // received byte.
     // -----------------------------------------------------------------
-    logic uart_irq;
+    logic [1:0] uart_rxd_sync_q;
+
+    always_ff @(posedge clk_core) begin
+        if (!rstn_core) begin
+            uart_rxd_sync_q <= 2'b11;  // idle line is high
+        end else begin
+            uart_rxd_sync_q <= {uart_rxd_sync_q[0], uart_rxd_i};
+        end
+    end
 
     axi4_lite_uart #(
-        .CLK_FREQ_HZ(35e6),
+        .CLK_FREQ_HZ(CLK_CORE_HZ),
         .BAUD_RATE  (115200)
     ) uart_i (
         .clk_i (clk_core),
         .rstn_i(rstn_core),
-        .axi   (axi_bus_uart),
+        .axi   (axi_bus_uart.slave),
         .txd_o (uart_txd_o),
-        .rxd_i (uart_rxd_i),
+        .rxd_i (uart_rxd_sync_q[1]),
 
         .uart_irq_o(uart_irq)
     );

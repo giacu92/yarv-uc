@@ -49,14 +49,15 @@ import rv32_pkg::*;
 * subsequent bit at mid-period (half the baud divisor after the edge /
 * previous sample) for noise margin. Frames with stop bit sampled low are
 * silently accepted anyway (no framing-error flag) — add one only if you
-* need it; kept out to match the "minimo" scope.
+* need it; kept out to keep this peripheral minimal.
 *
-* rxd_i is NOT synchronized/debounced by this module — the AXI wrapper
-* around it (this file) assumes the top level double-flops rxd_i if it
-* crosses a clock domain from an external pin. On this project rxd_i is
-* combinational off the pin (single clock domain end to end, same as the
-* rest of the fabric per top_module.sv), but if you ever feed this from
-* an async source, add a 2-FF synchronizer before rxd_i.
+* rxd_i is NOT synchronized/debounced by this module: the caller must hand
+* it an already-synchronized signal. An external serial line is asynchronous
+* to clk_i by definition (the far-end transmitter has its own oscillator),
+* so top_module.sv double-flops the pin before driving rxd_i here. Do the
+* same at any other instantiation site -- sampling the raw pin into
+* rx_shift_q risks metastability, and there is no framing-error flag to
+* catch a corrupted bit.
 *
 * Protocol follows msip_peri.sv / axi4_lite_ram.sv: registered BVALID held
 * until the B handshake, RVALID held until RREADY, single-outstanding
