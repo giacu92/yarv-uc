@@ -1,39 +1,59 @@
+`resetall
+`timescale 1ns / 1ps
+`default_nettype none
+
 package rv32_pkg;
 
 
     localparam int unsigned XLEN = 32;
     localparam int unsigned STRB_WIDTH = XLEN / 8;
-    localparam int unsigned AXI4_LEN = 32;
-
-    // Machine software interrupt MMIO register (peri region, PERI_ADDR_BIT=28).
-    // A write of bit[0] sets/clears mip.MSIP. Peri base = 0x1000_0000.
-    localparam logic [XLEN-1:0] MSIP_PERI_ADDR = 32'h1000_3000;
-    localparam logic [XLEN-1:0] UART_BASE = 32'h1000_0000;
-    localparam logic [XLEN-1:0] MTIMER_BASE = 32'h1000_1000;
 
     // ---------------------------------------------------------------
-    // Bus address decode: the single AXI4-Lite master port carries
-    // both memory and memory-mapped-peripheral traffic. A top-level
-    // 1->2 crossbar splits it by address. PERI_ADDR_BIT selects which
-    // address bit distinguishes the two regions: addr[PERI_ADDR_BIT]=1
-    // -> peripheral (UART/GPIO/...), =0 -> memory (RAM). Default bit 28
-    // (0x1000_0000+ is peripheral), a conventional MMIO base, leaving
-    // 0x8000_0000+ and the low 256 MiB for RAM.
+    // Peripheral address map. These are the single source of truth for
+    // the peri xbar windows: the board top and the sim top pass them to
+    // axi4_lite_xbar_3 as BASE0/BASE1/BASE2 rather than repeating
+    // literals, so the map cannot drift between the two.
+    //
+    //   0x1000_0000 .. 0x1000_0FFF  UART   (axi4_lite_uart)
+    //   0x1000_1000 .. 0x1000_2FFF  CLINT  (clint_timer)
+    //   0x1000_3000 .. 0x1000_3FFF  MSIP   (msip_peri)
+    //
+    // MSIP_PERI_ADDR: a write of bit[0] sets/clears mip.MSIP.
+    // ---------------------------------------------------------------
+    localparam logic [XLEN-1:0] UART_BASE = 32'h1000_0000;
+    localparam logic [XLEN-1:0] UART_SIZE = 32'h0000_1000;
+    localparam logic [XLEN-1:0] MTIMER_BASE = 32'h1000_1000;
+    localparam logic [XLEN-1:0] MTIMER_SIZE = 32'h0000_2000;
+    localparam logic [XLEN-1:0] MSIP_PERI_ADDR = 32'h1000_3000;
+    localparam logic [XLEN-1:0] MSIP_PERI_SIZE = 32'h0000_1000;
+
+    // ---------------------------------------------------------------
+    // Bus address decode. The LSU steers its own accesses on
+    // addr[PERI_ADDR_BIT]: =1 goes out the CPU's peri AXI4-Lite master
+    // (UART / CLINT / MSIP / future GPIO), =0 goes to the native D-mem.
+    // Fetch has its own dedicated native I-mem port (Harvard), so no
+    // crossbar splits memory from peripherals; the only xbar is the
+    // 1->3 peri mux at the board top. Default bit 28 (0x1000_0000+ is
+    // peripheral), a conventional MMIO base.
     // Moveable here so the map lives in one place, not hardcoded in the
-    // xbar or the board top.
+    // LSU or the board top.
+    //
+    // NOTE: the whole 0x1000_0000..0x1FFF_FFFF region routes to the peri
+    // bus, but only the three windows above are mapped. An access to the
+    // gap gets a DECERR (SLVERR) from axi4_lite_xbar_3, not a hang.
     // ---------------------------------------------------------------
     localparam int unsigned PERI_ADDR_BIT = 28;
 
     typedef logic [STRB_WIDTH-1:0] strb_t;
 
     // ---------------------------------------------------------------
-    // Native memory interface — split per DIREZIONE (stile AXI):
-    // ogni bundle e' una sola direzione, cosi' e' legale come packed
-    // struct passata come singola porta. I canali (request / read
-    // response) sono mischiati dentro ciascun bundle.
+    // Native memory interface — split BY DIRECTION (AXI style): each
+    // bundle carries one direction only, which is what makes it legal
+    // as a packed struct passed through a single port. The channels
+    // (request / read response) are mixed inside each bundle.
     //
-    // Handshake richiesta (launch): req.wvalid && rsp.wready.
-    // Handshake read response:       rsp.rvalid && req.rready.
+    // Request launch handshake: req.wvalid && rsp.wready.
+    // Read response handshake:  rsp.rvalid && req.rready.
     // ---------------------------------------------------------------
 
     // master -> bridge  (tutti gli OUTPUT del master)
@@ -55,32 +75,24 @@ package rv32_pkg;
     } mem_rsp_t;
 
     // ---------------------------------------------------------------
-    // Convenience: request-launch predicate (req.wvalid && rsp.wready).
-    // ---------------------------------------------------------------
-    function automatic logic req_handshake(input mem_req_t req, input mem_rsp_t rsp);
-        return req.wvalid && rsp.wready;
-    endfunction
-
-    // ---------------------------------------------------------------
     // Decode: opcodes, ALU/branch/source enums, and the D/E control
-    // struct. Phase 1 decodes RV32I + M + C; the A (LSU), Zicsr (CSR
-    // file) and Zifencei (fence) opcodes are present here so the
-    // decoder can flag them illegal, but they are not executed yet.
+    // struct. RV32I + M + C + Zilx + Zicsr + Zifencei all decode AND
+    // execute; nothing in this list is stubbed out as illegal any more.
     // ---------------------------------------------------------------
 
     // Major opcodes (instr[6:0]).
-    localparam logic [6:0] OPC_LUI      = 7'b0110111;
-    localparam logic [6:0] OPC_AUIPC    = 7'b0010111;
-    localparam logic [6:0] OPC_JAL      = 7'b1101111;
-    localparam logic [6:0] OPC_JALR     = 7'b1100111;
-    localparam logic [6:0] OPC_BRANCH   = 7'b1100011;
-    localparam logic [6:0] OPC_LOAD     = 7'b0000011;
-    localparam logic [6:0] OPC_STORE    = 7'b0100011;
-    localparam logic [6:0] OPC_OP_IMM   = 7'b0010011;
-    localparam logic [6:0] OPC_OP       = 7'b0110011;  // M is OPC_OP with funct7=0000001
-    localparam logic [6:0] OPC_MISC_MEM = 7'b0001111;  // fence / fence.i (Zifencei) -> illegal
-    localparam logic [6:0] OPC_SYSTEM   = 7'b1110011;  // CSR / ecall / ebreak (Zicsr) -> illegal
-    localparam logic [6:0] OPC_AMO      = 7'b0101111;  // A extension (Zam) -> illegal
+    localparam logic [6:0] OPC_LUI = 7'b0110111;
+    localparam logic [6:0] OPC_AUIPC = 7'b0010111;
+    localparam logic [6:0] OPC_JAL = 7'b1101111;
+    localparam logic [6:0] OPC_JALR = 7'b1100111;
+    localparam logic [6:0] OPC_BRANCH = 7'b1100011;
+    localparam logic [6:0] OPC_LOAD = 7'b0000011;
+    localparam logic [6:0] OPC_STORE = 7'b0100011;
+    localparam logic [6:0] OPC_OP_IMM = 7'b0010011;
+    localparam logic [6:0] OPC_OP = 7'b0110011;  // M is OPC_OP with funct7=0000001
+    localparam logic [6:0] OPC_MISC_MEM = 7'b0001111;  // fence / fence.i (Zifencei), retire as nop
+    localparam logic [6:0] OPC_SYSTEM = 7'b1110011;  // CSR (Zicsr) / ecall / ebreak / mret / wfi
+    localparam logic [6:0] OPC_AMO = 7'b0101111;  // Zilx indexed loads
 
     // ALU operation (base RV32I + M extension + Zilx EA). 19 values -> 5 bits.
     typedef enum logic [4:0] {

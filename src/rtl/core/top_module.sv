@@ -138,9 +138,10 @@ module top_module (
     // -----------------------------------------------------------------
     // AXI4-Lite buses (trunk modport).
     //
-    //   axi_bus_peri  : CPU peri master -> peri xbar (1->2, addr[12] decode).
-    //   axi_bus_msip  : xbar mem master  -> MSIP slave  (0x1000_0000, [12]=0).
-    //   axi_bus_timer : xbar peri master -> timer slave (0x1000_1000+, [12]=1).
+    //   axi_bus_peri  : CPU peri master -> peri xbar (1->3, base+size decode).
+    //   axi_bus_uart  : xbar m0 -> UART  slave (UART_BASE      0x1000_0000).
+    //   axi_bus_timer : xbar m1 -> timer slave (MTIMER_BASE    0x1000_1000).
+    //   axi_bus_msip  : xbar m2 -> MSIP  slave (MSIP_PERI_ADDR 0x1000_3000).
     // -----------------------------------------------------------------
     axi4_lite_if axi_bus_peri ();
     axi4_lite_if axi_bus_msip ();
@@ -249,34 +250,34 @@ module top_module (
     );
 
     // -----------------------------------------------------------------
-    // Peripheral bus: 1->2 address-decode mux splitting the peri bus
-    // into the MSIP slave and the CLINT timer slave by addr[12]
-    // (roadmap item 2 — same xbar pattern as the mem/peri split, one
-    // level down). Single-outstanding pass-through (the CPU bridge is
-    // single-outstanding overall). A 3rd slave (UART/GPIO) later needs
-    // a generalized 1->N mux.
-    //   addr[12]=0 -> m_mem_axi  -> MSIP  (0x1000_0000)
-    //   addr[12]=1 -> m_peri_axi -> timer (0x1000_1000+)
+    // Peripheral bus: 1->3 address-decode mux splitting the peri bus into
+    // the UART, the CLINT timer and the MSIP slave by base+size.
+    // Single-outstanding pass-through (the CPU bridge is single-outstanding
+    // overall). An address in the peri region matching no window is completed
+    // with a DECERR by the xbar's terminator, not left to hang.
+    //   m0 UART_BASE      (0x1000_0000, 4 KiB)
+    //   m1 MTIMER_BASE    (0x1000_1000, 8 KiB)
+    //   m2 MSIP_PERI_ADDR (0x1000_3000, 4 KiB)
     // -----------------------------------------------------------------
     axi4_lite_xbar_3 #(
-        .BASE0(32'h1000_0000),
-        .SIZE0(32'h0000_1000),  // uart
-        .BASE1(32'h1000_1000),
-        .SIZE1(32'h0000_2000),  // timer
-        .BASE2(32'h1000_3000),
-        .SIZE2(32'h0000_1000)   // msip
+        .BASE0(UART_BASE),
+        .SIZE0(UART_SIZE),
+        .BASE1(MTIMER_BASE),
+        .SIZE1(MTIMER_SIZE),
+        .BASE2(MSIP_PERI_ADDR),
+        .SIZE2(MSIP_PERI_SIZE)
     ) u_peri_xbar (
         .clk_i (clk_core),
         .rstn_i(rstn_core),
         .s_axi (axi_bus_peri.slave),
-        .m0_axi(axi_bus_uart),
+        .m0_axi(axi_bus_uart.master),
         .m1_axi(axi_bus_timer.master),
         .m2_axi(axi_bus_msip.master)
     );
 
     // -----------------------------------------------------------------
     // MSIP MMIO slave (machine software interrupt). A write of bit[0]
-    // to MSIP_PERI_ADDR (0x1000_0000) sets/clears mip.MSIP; msip_o feeds
+    // to MSIP_PERI_ADDR (0x1000_3000) sets/clears mip.MSIP; msip_o feeds
     // u_cpu.msip_i.
     // -----------------------------------------------------------------
     msip_peri u_msip (

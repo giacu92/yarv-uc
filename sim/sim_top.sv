@@ -35,7 +35,8 @@ module sim_top (
 );
 
     // -----------------------------------------------------------------
-    // AXI4-Lite peripheral bus (trunk modport) + peri 1->3 split.
+    // AXI4-Lite peripheral bus (trunk modport) + peri 1->3 split. Window
+    // bases/sizes come from rv32_pkg, same as the board top.
     // -----------------------------------------------------------------
     axi4_lite_if axi_bus_peri ();
     axi4_lite_if axi_bus_msip ();
@@ -169,14 +170,17 @@ module sim_top (
     //   addr[12]=1 -> m_peri_axi -> u_timer (0x1000_1000+)
     // -----------------------------------------------------------------
     axi4_lite_xbar_3 #(
-        .BASE0(32'h1000_0000), .SIZE0(32'h0000_1000),  // uart
-        .BASE1(32'h1000_1000), .SIZE1(32'h0000_2000),  // timer
-        .BASE2(32'h1000_3000), .SIZE2(32'h0000_1000)   // msip
+        .BASE0(UART_BASE),
+        .SIZE0(UART_SIZE),
+        .BASE1(MTIMER_BASE),
+        .SIZE1(MTIMER_SIZE),
+        .BASE2(MSIP_PERI_ADDR),
+        .SIZE2(MSIP_PERI_SIZE)
     ) u_peri_xbar (
         .clk_i (clk_i),
         .rstn_i(rstn_i),
         .s_axi (axi_bus_peri.slave),
-        .m0_axi(axi_bus_uart),
+        .m0_axi(axi_bus_uart.master),
         .m1_axi(axi_bus_timer.master),
         .m2_axi(axi_bus_msip.master)
     );
