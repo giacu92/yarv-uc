@@ -4,13 +4,16 @@ Functional simulation of the implemented pipeline (fetch + decode +
 execute + LSU + Zicsr CSR file + trap/exception/interrupt unit). The
 **Harvard** build wires the CPU to a native read-only I-mem
 (`native_ram`, `+IINIT`) and a native byte-strobed D-mem (`native_ram`,
-`+DINIT`); the AXI4-Lite peripheral bus carries two MMIO slaves behind a
-1→2 address-decode xbar (`axi4_lite_xbar`, `addr[12]`): `msip_peri`
-(machine software interrupt, `0x1000_0000`) and `clint_timer` (machine
-timer interrupt, `0x1000_1000+`). An `axi4_lite_uart.sv` slave exists on
-disk but is not yet wired in (see the root `README.md` Roadmap). The
-board top's wiring is replicated in `sim_top.sv` so the memories can be
-preloaded and the CPU's per-stage debug taps can be logged.
+`+DINIT`); the AXI4-Lite peripheral bus carries three MMIO slaves behind
+a 1→3 address-decode xbar (`axi4_lite_xbar_3`, base+size windows from
+`rv32_pkg`; unmapped → DECERR): `axi4_lite_uart` (UART, `0x1000_0000` —
+its level IRQ drives `mip.MEIP`), `clint_timer` (machine timer
+interrupt, `0x1000_1000+`), and `msip_peri` (machine software interrupt,
+`0x1000_3000`). The UART's `rxd_i` is tied idle-high in this harness —
+there is no RX stimulus, so `uart_getc()`-blocking programs can't
+advance. The board top's wiring is replicated in `sim_top.sv` so the
+memories can be preloaded and the CPU's per-stage debug taps can be
+logged.
 
 This harness is **not** part of the synthesis file list.
 
@@ -45,16 +48,22 @@ lags the previous by one cycle):
 - an **execute retire + writeback log** — one line per E/M-valid
   retired op: `cycle / ex_pc / ex_instr`, plus a `wb x<n> = 0x...` line
   when the op writes a register (sampled from the internal `wb_en` /
-  `wb_addr` / `wb_data` nets). This makes the RAW interlock and the
-  LSU load-use path verifiable: dependent ops write the correct value,
-  with a one-cycle bubble before each hazard consumer.
+  `wb_addr` / `wb_data` nets). This makes the execute→decode forward path
+  and the LSU load-use path verifiable: dependent ops get the retiring
+  value same-cycle via the bypass (distance-1 RAW, zero bubble), with the
+  load's `EX_MEM_WAIT` holding the consumer in decode until `rvalid`.
 
 The CPU exports no per-stage debug ports; the harness reads the
 internal taps (`fe_*`, `de_*`, `ex_*`, `wb_*`) as flat members of the
 Verilator root object (built `--public-flat-rw`). An exit summary prints
 `retired N instructions in M cycles`, `IPC = N/M`, and a
-`stalled K/M cycles (P%)` breakdown — the RAW-hazard bubble, DIV/REM
-hold, and LSU `EX_MEM_WAIT` costs per run. The run stops early on park
+`stalled K/M cycles (P%)` breakdown — the DIV/REM hold, LSU
+`EX_MEM_WAIT`, and (legacy, now zero) RAW-hazard costs per run. Every
+run also checks the WFI-halt invariant from the internal `wfi_halt_q` /
+`int_pending` taps: prints `WFI-halt check: OK`, or `WFI-HALT FAIL` with
+a nonzero exit if the halt outlives a pending interrupt by more than
+`WFI_STUCK_N` (64) cycles or is held with no wake for more than
+`WFI_HALT_N` (4000). The run stops early on park
 detection (8 consecutive identical retires — the `start.S` `1: j 1b`
 self-loop); a `MAX_CYC` env var (default 4000) bounds programs that
 never park (e.g. `MAX_CYC=20000 make run`). A VCD waveform
@@ -197,15 +206,37 @@ cd sw_timer && make                                   # -> build/imem.hex + buil
 cd .. && make run RUN_ARGS="+IINIT=sw_timer/build/imem.hex +DINIT=sw_timer/build/dmem.hex"
 ```
 
+## WFI-wake arbitration oracle (`sw_wfi_trap/`)
+
+Regression for a WFI-halt deadlock: `wfi_halt_q` must clear on a pending
+enabled interrupt, not on `take_interrupt` (which loses priority to a
+sync trap) — otherwise a faulting instruction behind `wfi` left the halt
+flag set, trap entry cleared `mstatus.MIE`, dropping the pending
+interrupt and freezing the pipe unrecoverably. `wfi_trap_test.S` arms
+`mtimecmp=400`, runs a 32-cycle `div` to fill F/D + skid, then `wfi`
+followed immediately by an illegal encoding. On wake the illegal trap
+wins arbitration first (marker `2` @0x2040, `mepc`+4), then the
+still-pending timer interrupt is taken (marker `7` @0x2044, MTIP
+disarmed); `main` checks both markers and writes `0x600D`/`0xBAD`.
+`gen_hex.py` hand-encodes the program, so the regression runs without the
+riscv32 toolchain:
+
+```
+cd sw_wfi_trap && python3 gen_hex.py
+cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap/build/dmem.hex"
+```
+
 ## Files
 
 - `sim_top.sv`    — sim wrapper (CPU + native I/D-mem +
-  `msip_peri` + `clint_timer` MMIO slaves on the peri bus (behind the
-  peri 1→2 xbar) + `mem_probe` generate block exposing a window of the
-  data RAM to the VCD). Ports only `clk_i`/`rstn_i`/`led_o`; CPU taps
-  stay internal, probed via the Verilator hierarchy.
+  `axi4_lite_uart` + `clint_timer` + `msip_peri` MMIO slaves on the peri
+  bus (behind the peri 1→3 xbar; UART `rxd_i` tied idle-high) +
+  `mem_probe` generate block exposing a window of the data RAM to the
+  VCD). Ports only `clk_i`/`rstn_i`/`led_o`; CPU taps stay internal,
+  probed via the Verilator hierarchy.
 - `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs
-  incl. writeback values, stall breakdown, park/`MAX_CYC` stop).
+  incl. writeback values, stall breakdown, WFI-halt invariant check,
+  park/`MAX_CYC` stop).
 - `imem.hex`/`dmem.hex` — Harvard oracle preload (code / data).
 - `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs).
 - `hw/native_mem_tb/` — native RAM compliance test.
@@ -221,6 +252,9 @@ cd .. && make run RUN_ARGS="+IINIT=sw_timer/build/imem.hex +DINIT=sw_timer/build
   (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
 - `sw_timer/`     — standalone M-mode timer-interrupt program
   (MTIE+MIE, `mtimecmp=100`, WFI wake, self-checking — see "Timer oracle").
+- `sw_wfi_trap/`  — WFI-wake arbitration regression (illegal-trap behind
+  `wfi` + pending MTI; toolchain-free via `gen_hex.py` — see
+  "WFI-wake arbitration oracle").
 
 Build artefacts (`obj_dir/`, `sw/build/`, `cosim/ecall/build/`,
 `cosim/quicksort/*.log`, `*.vcd`, `*.log`) are gitignored.

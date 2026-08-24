@@ -8,13 +8,16 @@ Disclaimer: This project is created by me with the assistance of Claude Code
 > **Status: work in progress.** This is a hobby/learning core, not a
 > production soft-IP. The pipeline, memory system, Zicsr + Zifencei, and
 > machine-mode trap/exception/interrupt machinery are implemented and
-> sim-verified (Verilator + Spike co-sim), but several peripherals and
-> interrupt sources are still missing — see **Roadmap** below. Synthesis
-> + PnR are re-confirmed on the build host (2026-08-22, pre-forwarding):
+> sim-verified (Verilator + Spike co-sim). All three machine interrupt
+> sources are now wired — MSIP, MTIP (CLINT timer), and MEIP (UART IRQ)
+> — behind a 1→3 peripheral mux with a DECERR terminator for unmapped
+> addresses; see **Roadmap** below for what is still missing. Synthesis
+> + PnR are re-confirmed on the build host (2026-08-22, **pre-forwarding**):
 > the core closes **35 MHz** (knife-edge, +0.004 ns slack) with a
 > comfortable **25 MHz** PLL-bypass fallback — see the timing note in
-> **Status** below. The execute→decode forward path is uncommitted WIP
-> (cosim still PASS) and not yet timing-re-verified.
+> **Status** below. The execute→decode forward path is **committed** (cosim
+> still PASS) but its timing impact on that knife-edge path is **not yet
+> re-verified** on the build host.
 
 An RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based
@@ -71,25 +74,36 @@ kept only for peripherals. Implemented so far:
   modes; mepc/mcause/mtval written on entry. A trapping instruction is
   **not** retired (matches the RISC-V spec + Spike). A machine
   **software interrupt** (mcause=0x8000_0003) is injected by an
-  `msip_peri` AXI4-Lite MMIO slave at peri base `0x1000_0000` (write
+  `msip_peri` AXI4-Lite MMIO slave at peri `0x1000_3000` (write
   bit[0] sets/clears mip.MSIP); a machine **timer interrupt**
   (mcause=0x8000_0007) is sourced by a `clint_timer` AXI4-Lite MMIO slave
   at peri `0x1000_1000+` (64-bit free-running `mtime` + 64-bit `mtimecmp`;
   `mtime >= mtimecmp` → `mtip` → `mip.MTIP`, cleared by writing
-  `mtimecmp > mtime`). Both sit behind a reused `axi4_lite_xbar` 1→2
-  peri mux (`addr[12]`: MSIP vs timer). Interrupts are taken at a retire
-  boundary (the suppressed instr re-runs after `mret`) or on a WFI wake
-  (`mepc` = wfi+4). `int_cause` selects MSI > MTI priority (MEI not
-  wired). A combinational `trap_unit` (peer of execute) resolves entry /
-  `mret` / interrupt redirect and drives the CSR trap-write bundle.
+  `mtimecmp > mtime`). A machine **external interrupt**
+  (mcause=0x8000_000B) is sourced today by the UART's level IRQ
+  (`uart_irq` → `meip_i` → `mip.MEIP`; MEIP is a single ORed level with
+  no cause register, so the ISR must poll to find the source). All three
+  sit behind an `axi4_lite_xbar_3` 1→3 peri mux (`UART_BASE` 0x1000_0000
+  / `MTIMER_BASE` 0x1000_1000 / `MSIP_PERI_ADDR` 0x1000_3000, all defined
+  once in `rv32_pkg`); an unmapped peri address is terminated by a local
+  **DECERR** (SLVERR) so the LSU never parks on a missing slave. Priority
+  is MEI > MSI > MTI. Interrupts are taken at a retire boundary (the
+  suppressed instr re-runs after `mret`) or on a WFI wake
+  (`mepc` = wfi+4); the WFI halt clears on a *pending* enabled interrupt,
+  not on `take_interrupt`, so a sync trap in the instruction behind `wfi`
+  can no longer freeze the pipe. A combinational `trap_unit` (peer of
+  execute) resolves entry / `mret` / interrupt redirect and drives the
+  CSR trap-write bundle.
 
 Still deferred: **S/U mode** + delegation (machine mode only, no
 medeleg/mideleg, no PMP), **instruction-access-fault** /
-instruction-address-misaligned traps, and the **external interrupt**
-(`mip.MEIP` — MSIP and MTIP are wired; MEIP has no source yet).
-`fence.i` is a nop (Harvard has no D->I write path — self-modifying code
-unsupported). Synth + PnR of the trap + timer path are **re-confirmed**
-on the build host (2026-08-22), **before the forward path was added**:
+instruction-address-misaligned traps, an **illegal-CSR-access** trap
+(unimplemented CSR addrs still silently read 0 / ignore writes), and a
+**PLIC-style interrupt controller** (MEIP is a single ORed level with no
+cause register — the ISR must poll). `fence.i` is a nop (Harvard has no
+D->I write path — self-modifying code unsupported). Synth + PnR of the
+trap + timer path are **re-confirmed** on the build host (2026-08-22),
+**before the forward path was added**:
 the 64-bit timer compare (two-stage pipelined) + trap redirect mux
 exposed the route-dominated CSR-address fan-out critical path at
 ~37 MHz actual, so the target was lowered 50 → 40 → **35 MHz** (rPLL
@@ -98,44 +112,51 @@ exposed the route-dominated CSR-address fan-out critical path at
 a **knife-edge** closure (essentially zero margin; may not repeat
 run-to-run). The comfortable fallback is the **25 MHz PLL-bypass**
 (`clk_core = clk_i` direct, +2.248 ns slack). The execute→decode forward
-path is **uncommitted WIP** (cosim still PASS) and its timing impact on
-that knife-edge path is **not yet re-verified**. To
+path is **committed** (cosim still PASS) but its timing impact on that
+knife-edge path is **not yet re-verified**. To
 reclaim a safe 40 MHz, the async CSR read must be pipelined into a
 registered 1-cycle read (an invasive Zicsr read-latency change, deferred).
 
 ## Roadmap (what is next)
 
 The peripheral/interrupt story is the current active front. **MSIP**
-(machine software interrupt, `msip_peri` → `mip.MSIP`) and **MTIP**
-(machine timer interrupt, `clint_timer` → `mip.MTIP`) are both wired,
-behind a 1→2 peri mux (`axi4_lite_xbar`, `addr[12]` decode). `mip.MEIP`
-still has no source. The remaining work, in order:
+(machine software interrupt, `msip_peri` → `mip.MSIP`), **MTIP**
+(machine timer interrupt, `clint_timer` → `mip.MTIP`), and **MEIP**
+(machine external interrupt, UART level IRQ → `meip_i` → `mip.MEIP`) are
+all wired, behind a 1→3 peri mux (`axi4_lite_xbar_3`, base+size windows
+from `rv32_pkg`; unmapped → DECERR). The remaining work, in order:
 
-1. **Wire the UART in.** An AXI4-Lite UART slave (`axi4_lite_uart.sv`)
-   already exists — 8N1, single-buffer TX/RX, a 5-register MMIO map
-   (TXDATA/RXDATA/STATUS/CTRL/BAUDDIV), level-sensitive interrupt. It is
-   not yet wired into `top_module.sv` and not yet simulated or
-   synthesized. Needs a generalized 1→N peri mux (the current 1→2 covers
-   MSIP + timer; a 3rd slave needs the wider mux).
+1. **Assign the UART pins in the Gowin project.** The UART is wired into
+   `top_module.sv` and `sim_top.sv` (TXDATA/RXDATA/STATUS/CTRL/BAUDDIV
+   MMIO at `UART_BASE` 0x1000_0000, 8N1 single-buffer, level IRQ → MEIP,
+   `rxd_i` double-flopped off the async pin, baud divisor reset tied to
+   `CLK_CORE_HZ`), but it is **not yet in the `.gprj` file list** and has
+   no pin assignment in `.cst` — currently sim/RTL only, not synthesized.
+   `BAUDDIV` is already a programmable RW register (reset from
+   `CLK_FREQ_HZ/BAUD_RATE`, reprogrammable at runtime, applied only when
+   TX+RX are idle so an in-flight frame is never corrupted).
 2. **GPIO.** Direction / output / input registers, per-pin or global
    interrupt. Same MMIO/AXI4-Lite slave template as UART/MSIP.
-3. **Simple PLIC-style interrupt controller.** Deprioritized: with only
-   MSIP + MTIP + UART, direct `mie`/`mip` routing is still manageable
-   without an arbiter. Revisit once 3+ independent IRQ sources exist
-   (UART + GPIO + timer).
+3. **Simple PLIC-style interrupt controller.** MEIP is a single ORed
+   level with no cause register, so with >1 external source the ISR must
+   poll to find the source. Revisit once 2+ independent external IRQ
+   sources exist (UART + GPIO).
 
 Done (for reference): CLINT-style timer (`clint_timer.sv` — 64-bit
 `mtime`/`mtimecmp`, two-stage pipelined `mtime >= mtimecmp` compare →
-`mtip` → `mip.MTIP`) and the peri-bus 1→2 address-decode mux (reused
-`axi4_lite_xbar`, `addr[12]`: MSIP vs timer). Both sim-verified (standalone
-timer oracle `sim/sw_timer`, MSIP/trap oracle `sim/sw_trap`, Spike cosim
-of an illegal-instruction trap `sim/cosim/ecall`).
+`mtip` → `mip.MTIP`), the `msip_peri` MMIO slave, the UART MMIO slave
+wired as the MEIP source, and the peri-bus 1→3 address-decode mux with
+DECERR terminator. All sim-verified (standalone timer oracle
+`sim/sw_timer`, MSIP/trap oracle `sim/sw_trap`, WFI-wake arbitration
+oracle `sim/sw_wfi_trap`, Spike cosim of an illegal-instruction trap
+`sim/cosim/ecall`).
 
-Also still open: the external interrupt (MEIP source — UART IRQ will be
-the first), a vectored-mode interrupt co-sim (direct mode is covered),
-and a safe 40 MHz re-target (needs the async CSR read pipelined — see
-the timing note above). S/U mode, delegation, PMP, and
-instruction-access-fault traps remain deferred.
+Also still open: RX stimulus in the sim harness (`rxd_i` tied idle-high,
+so `uart_getc()`-blocking programs can't advance), a vectored-mode
+interrupt co-sim (direct mode is covered), and a safe 40 MHz re-target
+(needs the async CSR read pipelined — see the timing note above). S/U
+mode, delegation, PMP, instruction-access-fault, and illegal-CSR-access
+traps remain deferred.
 
 The CPU exposes **three** ports (Harvard): a native `imem` (fetch,
 read-only), a native `dmem` (LSU data, byte-strobed), and an AXI4-Lite
@@ -155,7 +176,8 @@ src/rtl/bus/   AXI4-Lite interface + master bridge + crossbar (peri mux)
 src/rtl/utils/ native_ram.sv (Harvard I/D-mem), axi4_lite_ram.sv (AXI slave, sim),
                msip_peri.sv (MSIP MMIO slave — machine software interrupt),
                clint_timer.sv (CLINT timer MMIO slave — machine timer interrupt),
-               axi4_lite_uart.sv (UART MMIO slave — exists, not yet wired in)
+               axi4_lite_uart.sv (UART MMIO slave — 8N1, level IRQ -> mip.MEIP),
+               axi4_lite_xbar_3.sv (1->3 peri mux, UART/timer/MSIP + DECERR)
 src/phys/      pin assignment (.cst) + timing constraints (.sdc)
 impl/          Gowin EDA project + synthesis/PnR Tcl + reports
 sim/           Verilator functional sim + native & AXI RAM compliance tests
@@ -185,8 +207,9 @@ was 5863 cycles / IPC ~0.37).
 See `sim/README.md` for the logs, VCD/GTKWave, the native-RAM
 (`sim/hw/native_mem_tb/`) and AXI4-Lite RAM (`sim/hw/ram_tb/`) compliance
 tests, the RTL-vs-Spike co-sim (`make cosim` — retire-for-retire match
-against the golden ISA reference), and the trap oracle + illegal-trap
-cosim (`sim/sw_trap/`, `sim/cosim/ecall/`).
+against the golden ISA reference), the trap + timer + WFI-wake oracles
+(`sim/sw_trap/`, `sim/sw_timer/`, `sim/sw_wfi_trap/`), and the
+illegal-trap cosim (`sim/cosim/ecall/`).
 
 ### Synthesize / place & route (Gowin EDA, remote host)
 
