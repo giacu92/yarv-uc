@@ -90,6 +90,8 @@ module csr_regfile (
 
     // Architected reset values (M-mode). misa = RV32 I/M/A/C:
     //   MXL[31:30]=1 (RV32), A=bit0, C=bit2, I=bit8, M=bit13.
+    // mstatus resets with MPP = 2'b11 (M): only M-mode is implemented, so
+    // MPP is effectively read-only 11 (see MSTATUS_RESET in rv32_pkg).
     localparam logic [XLEN-1:0] MISA_RESET = 32'h4000_2105;
 
     always_comb begin
@@ -113,7 +115,9 @@ module csr_regfile (
         if (!rstn_i) begin
             for (int i = 0; i < NCSR; i++) begin
 
-                if (i == 1) begin
+                if (i == 0) begin
+                    regs[i] <= MSTATUS_RESET;  // MPP = 2'b11 (M), MIE = MPIE = 0
+                end else if (i == 1) begin
                     regs[i] <= MISA_RESET;  // misa is read-only WARL, so reset to RV32IMAC
                 end else begin
                     regs[i] <= '0;
@@ -136,10 +140,10 @@ module csr_regfile (
             if (we_mtval_i) regs[7] <= d_mtval_i;
 
             // --- mstatus RMW (only if no trap write). Only M-mode is
-            // implemented, so MPP is forced to 00 on any write; the other
-            // bits are taken raw (M-mode code is trusted). ---
+            // implemented, so MPP is WARL-forced to 2'b11 (M) on any write;
+            // the other bits are taken raw (M-mode code is trusted). ---
             if (!we_mstatus_i && csr_wren_i && (csr_addr_i == CSR_ADDR_MSTATUS))
-                regs[0] <= {csr_data_i[31:13], 2'b00, csr_data_i[10:0]};
+                regs[0] <= {csr_data_i[31:13], MSTATUS_MPP_M, csr_data_i[10:0]};
 
             // --- mtvec RMW: BASE in [31:2] raw; MODE masked to direct /
             // vectored only ({1'b0, bit[0]} — bit[1] cleared, other modes
@@ -195,7 +199,7 @@ module csr_regfile (
     // Sim-only: mirror the reset values at time 0 so waveforms/logs do not
     // show X before the first reset edge. Matches the sync reset above.
     initial begin
-        regs[0]  = '0;
+        regs[0]  = MSTATUS_RESET;
         regs[1]  = MISA_RESET;
         regs[2]  = '0;
         regs[3]  = '0;

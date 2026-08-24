@@ -191,24 +191,22 @@ package rv32_pkg;
     localparam logic [XLEN-1:0] MCAUSE_ECALL_M = 32'h0000_000B;  // env call from M-mode (11)
     localparam logic [XLEN-1:0] MCAUSE_MSI = 32'h8000_0003;  // machine software interrupt
     localparam logic [XLEN-1:0] MCAUSE_MTI = 32'h8000_0007;  // machine timer interrupt
+    localparam logic [XLEN-1:0] MCAUSE_MEI = 32'h8000_000B;  // machine external interrupt
 
     // mstatus machine-mode field bit positions (RV32).
     localparam int MSTATUS_MIE_BIT = 3;  // M-mode global interrupt enable
     localparam int MSTATUS_MPIE_BIT = 7;  // prior MIE (saved on trap entry)
-    localparam int MSTATUS_MPP_LO = 11;  // MPP[1:0] (always 00 = M here)
+    localparam int MSTATUS_MPP_LO = 11;  // MPP[1:0]: 00=U, 01=S, 11=M
     localparam int MSTATUS_MPP_HI = 12;
+    // Only M-mode is implemented, so MPP is effectively read-only 2'b11.
+    localparam logic [1:0] MSTATUS_MPP_M = 2'b11;
+    // mstatus reset value: MPP = M, everything else 0 (MIE=0, MPIE=0).
+    localparam logic [XLEN-1:0] MSTATUS_RESET = 32'h0000_1800;
 
     // mtvec MODE field (mtvec[1:0]).
     localparam logic [1:0] MTVEC_DIRECT = 2'b00;
     localparam logic [1:0] MTVEC_VECTORED = 2'b01;
 
-
-    // Machine timer MMIO registers (CLINT-style). The timer lives in the
-    // peri region at MTIMER_BASE (0x1000_1000), selected by the peri xbar on
-    // addr[12]=1 (msip is at addr[12]=0). mtime is a free-running 64-bit
-    // counter (RO); mtimecmp is the 64-bit compare (RW). mtip = mtime>=mtimecmp.
-    localparam int unsigned MTIME_OFF = 5'h0;  // mtime_lo @ +0, mtime_hi @ +4
-    localparam int unsigned MTIMECMP_OFF = 5'h8;  // mtimecmp_lo @ +8, mtimecmp_hi @ +C
 
     typedef enum logic [11:0] {
         CSR_ADDR_MSTATUS  = 12'h300,

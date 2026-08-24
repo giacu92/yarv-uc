@@ -42,8 +42,12 @@ import rv32_pkg::*;
 *   VECTORED (01) -> interrupts to BASE + 4*code; sync exceptions to BASE.
 *
 * mstatus machine-mode field semantics (RV32, only M-mode implemented):
-*   trap entry (sync OR interrupt): MPIE<=MIE, MIE<=0, MPP<=00.
-*   mret: MIE<=MPIE, MPIE<=1, MPP<=00.
+*   trap entry (sync OR interrupt): MPIE<=MIE, MIE<=0, MPP<=11 (M).
+*   mret: MIE<=MPIE, MPIE<=1, MPP<=11 (M).
+*
+* MPP encoding is 2'b00=U, 2'b01=S, 2'b11=M. Only M-mode exists here, so MPP
+* is effectively read-only 2'b11: a trap from M-mode records M, and mret
+* returns to M.
 *
 * Naming: ports *_i/_o; internals no prefix.
 */
@@ -147,8 +151,8 @@ module trap_unit (
 
     // -----------------------------------------------------------------
     // mstatus field update.
-    //   entry: MPIE<=MIE, MIE<=0, MPP<=00.
-    //   mret : MIE<=MPIE, MPIE<=1, MPP<=00.
+    //   entry: MPIE<=MIE, MIE<=0, MPP<=11 (M).
+    //   mret : MIE<=MPIE, MPIE<=1, MPP<=11 (M).
     // -----------------------------------------------------------------
     logic [XLEN-1:0] mstatus_new;
 
@@ -157,11 +161,11 @@ module trap_unit (
         if (entry) begin
             mstatus_new[MSTATUS_MPIE_BIT]              = mstatus_i[MSTATUS_MIE_BIT];
             mstatus_new[MSTATUS_MIE_BIT]               = 1'b0;
-            mstatus_new[MSTATUS_MPP_HI:MSTATUS_MPP_LO] = 2'b00;  // M
+            mstatus_new[MSTATUS_MPP_HI:MSTATUS_MPP_LO] = MSTATUS_MPP_M;
         end else if (mret_i) begin
             mstatus_new[MSTATUS_MIE_BIT]               = mstatus_i[MSTATUS_MPIE_BIT];
             mstatus_new[MSTATUS_MPIE_BIT]              = 1'b1;
-            mstatus_new[MSTATUS_MPP_HI:MSTATUS_MPP_LO] = 2'b00;  // M
+            mstatus_new[MSTATUS_MPP_HI:MSTATUS_MPP_LO] = MSTATUS_MPP_M;
         end
     end
 
