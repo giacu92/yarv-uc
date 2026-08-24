@@ -605,9 +605,19 @@ module execute_stage (
     assign ex_instr_o = ex_instr_q;
     assign ex_valid_o = ex_valid_q;
 
-    // WFI halt next-state: set when WFI retires, cleared on the interrupt
-    // wake (take_interrupt). wfi_next_pc holds the return PC for the wake.
-    assign wfi_halt_d = wfi_retire | (wfi_halt_q & ~take_interrupt);
+    // WFI halt next-state: set when WFI retires, cleared as soon as an
+    // interrupt is pending+enabled. wfi_next_pc holds the return PC for the
+    // wake.
+    //
+    // The clear condition is int_pending_i, NOT take_interrupt: take_interrupt
+    // loses priority to sync_trap_req / mret_req (see the take_interrupt term
+    // above), so clearing on it would leave wfi_halt_q stuck when the
+    // instruction behind the WFI faults. A stuck wfi_halt_q re-raises
+    // wfi_stall the moment trap entry clears mstatus.MIE (int_pending falls),
+    // freezing the pipe inside the handler with no way to retire the CSR write
+    // that would re-enable interrupts -- an unrecoverable deadlock. Clearing
+    // on int_pending_i releases the halt whichever event actually wins.
+    assign wfi_halt_d = wfi_retire | (wfi_halt_q & ~int_pending_i);
     assign wfi_next_pc_d = wfi_retire ? wfi_next_pc : wfi_next_pc_q;
 
     // =================================================================
