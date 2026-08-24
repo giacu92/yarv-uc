@@ -8,7 +8,8 @@ import rv32_pkg::*;
 * Machine timer peripheral (CLINT-style, AXI4-Lite slave).
 *
 * Two 64-bit registers, exposed as four 32-bit MMIO words at MTIMER_BASE
-* (peri region 0x1000_1000, selected by the peri xbar on addr[12]=1):
+* (peri window 0x1000_1000..0x1000_2FFF, selected by the peri xbar's
+* base+size decode):
 *
 *   +0  mtime_lo     (RO, free-running 64-bit counter, low half)
 *   +4  mtime_hi     (RO, free-running 64-bit counter, high half)
@@ -21,7 +22,13 @@ import rv32_pkg::*;
 * mtime (mip.MTIP is read-only from CSR write, like MSIP).
 *
 * mtime counts every cycle from reset (free-running). mtimecmp resets to
-* all-ones so mtip_o=0 at boot (no spurious interrupt). The 64-bit compare
+* all-ones so mtip_o=0 at boot (no spurious interrupt).
+*
+* WRITE ORDER for mtimecmp: the 64-bit compare is reachable only as two
+* 32-bit words, so an unlucky order transiently arms a value neither the old
+* nor the new one. Use the standard RISC-V sequence -- write mtimecmp_hi =
+* 0xFFFF_FFFF first, then mtimecmp_lo, then the real mtimecmp_hi. Writing lo
+* before hi can fire a spurious timer interrupt in the gap. The 64-bit compare
 * is TWO-STAGE PIPELINED (two registered 32-bit compares + a combine flop)
 * to cut the carry chain off the timing path — see the compare block. The
 * 2-cycle mtip latency is harmless for a level interrupt.
@@ -49,8 +56,8 @@ module clint_timer (
 
     // Register select: addr[3:2] over the 16-byte window.
     //   2'b00 = mtime_lo, 01 = mtime_hi, 10 = mtimecmp_lo, 11 = mtimecmp_hi.
-    localparam logic [1:0] REG_MTIME_LO    = 2'b00;
-    localparam logic [1:0] REG_MTIME_HI    = 2'b01;
+    localparam logic [1:0] REG_MTIME_LO = 2'b00;
+    localparam logic [1:0] REG_MTIME_HI = 2'b01;
     localparam logic [1:0] REG_MTIMECMP_LO = 2'b10;
     localparam logic [1:0] REG_MTIMECMP_HI = 2'b11;
 

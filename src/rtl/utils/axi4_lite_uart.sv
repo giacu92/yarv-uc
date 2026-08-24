@@ -309,11 +309,12 @@ module axi4_lite_uart #(
             txd_q             <= 1'b1;  // idle line high
             tx_baud_cnt_q     <= '0;
         end else begin
-            // Latch a pushed byte if TX is mid-frame right at the push
-            // cycle (tx_push only fires when tx_ready, i.e. TX_IDLE and
-            // nothing pending, so this branch normally starts the frame
-            // the same cycle; kept as an explicit latch for clarity/
-            // future-proofing if tx_push's gating ever changes).
+            // Latch the pushed byte. tx_pending_q is a flop, so the TX_IDLE
+            // arm below sees it the NEXT cycle and starts the frame then --
+            // a push costs one cycle of latency before the start bit. The
+            // explicit pending register (rather than starting the frame
+            // combinationally) keeps the push path off the TX state machine
+            // and stays correct if tx_push's gating ever changes.
             if (tx_push) begin
                 tx_pending_data_q <= wdata_eff[7:0];
                 tx_pending_q      <= 1'b1;

@@ -181,9 +181,11 @@ module execute_stage (
     logic is_mem_op;
     assign is_mem_op = de_i.mem_read | de_i.mem_write;
 
-    // Misaligned access: suppressed (no trap / exception support yet).
-    // LH/LHU needs addr[0]=0; LW/SW needs addr[1:0]=00. A sub-word that
-    // would cross a word boundary needs two beats and is not handled.
+    // Misaligned access: raises a precise sync trap (LAD_MIS / SAD_MIS)
+    // below; the access never launches.
+    // LH/LHU needs addr[0]=0; LW/SW needs addr[1:0]=00. Because every
+    // misaligned case traps here, no access that reaches the LSU can cross a
+    // word boundary, so the single-beat slaves are always sufficient.
     // Byte accesses (LB/LBU/SB) are always within a word. Only mem ops
     // can be misaligned — non-mem ops reuse mem_size as a don't-care
     // decode default (MS_W) and must NOT be suppressed, so gate on

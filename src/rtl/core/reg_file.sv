@@ -16,7 +16,9 @@ import rv32_pkg::*;
  * `(* ram_style = "block" *)`.
  *
  * Why BSRAM and not `distributed_ram`/SSRAM or `registers`: an A/B PnR run
- * measured `clk_core` Actual Fmax at 50.151 MHz on BSRAM vs 50.150 MHz on
+ * (taken back when the target was still 50 MHz — the design now targets
+ * 35 MHz, so treat the absolute numbers as historical and the DELTA as the
+ * result) measured `clk_core` Actual Fmax at 50.151 MHz on BSRAM vs 50.150 MHz on
  * `syn_ramstyle = "registers"` (FF + LUT-mux async read) — identical within
  * PnR noise, so the regfile primitive is NOT the Fmax limiter (the real
  * critical path is route-dominated and lies elsewhere). `distributed_ram`

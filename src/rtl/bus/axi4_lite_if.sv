@@ -1,3 +1,7 @@
+`resetall
+`timescale 1ns / 1ps
+`default_nettype none
+
 interface axi4_lite_if #(
     parameter int ADDR_WIDTH = 32,
     parameter int DATA_WIDTH = 32
@@ -118,3 +122,5 @@ interface axi4_lite_if #(
     );
 
 endinterface
+
+`resetall

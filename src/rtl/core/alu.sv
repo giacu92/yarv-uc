@@ -5,19 +5,19 @@
 import rv32_pkg::*;
 
 // ---------------------------------------------------------------
-// ALU combinazionale (RV32I) + estensione M + Zilx EA.
+// Combinational ALU (RV32I) + M extension + Zilx EA.
 //
-// Base RV32I: risultato pronto nello stesso ciclo (result_valid=1
-// sempre per queste op). MUL è single-cycle (synth inferisce DSP
-// sulla GoWin con l'operatore '*'). DIV/REM sono multi-ciclo
-// (restoring division, 32 iterazioni) con handshake start/done,
-// stesso stile di mem_req_t/mem_rsp_t: master lancia con
-// div_start, bridge risponde con div_done.
+// Base RV32I: result ready in the same cycle (result_valid=1 always for
+// these ops). MUL is single-cycle (GowinSynthesis infers a DSP from the
+// '*' operator). DIV/REM are multi-cycle (restoring division, 32
+// iterations) behind a start/done handshake, in the same style as
+// mem_req_t/mem_rsp_t: the master launches with start_i, the unit answers
+// with result_valid_o.
 //
-// Zilx: l'ALU calcola solo l'effective address dell'indexed load:
+// Zilx: the ALU only computes the indexed load's effective address:
 //   EA = base + (index << shamt)   (ALU_LX)
-// operand_a = rs2_data (base), operand_b = rs1_data (index), shamt
-// arriva da shamt_i (de_t.mem_shamt: 0 unscaled, log2(size) scaled).
+// operand_a = rs2_data (base), operand_b = rs1_data (index); shamt comes
+// from shamt_i (de_t.mem_shamt: 0 unscaled, log2(size) scaled).
 // La load vera (mem_read + sign/zero-extend) è lavoro del LSU, non
 // dell'ALU; wb_src=WB_MEM seleziona il dato caricato a writeback.
 // ---------------------------------------------------------------
@@ -38,13 +38,13 @@ module alu (
     // assign-driven helpers stay wire (EX3094: under `default_nettype none`
     // every net needs an explicit net type, and `logic` is a variable kind,
     // not a net — so ports must be `wire`, matching the rest of the project).
-    input  wire             start_i,         // impulso: lancia l'op (serve solo per DIV/REM)
+    input  wire             start_i,         // pulse: launch the op (DIV/REM only)
     output logic            result_valid_o,
     output logic [XLEN-1:0] result_o
 );
 
     // -----------------------------------------------------------
-    // Base RV32I — combinazionale
+    // Base RV32I — combinational
     // -----------------------------------------------------------
     logic [XLEN-1:0] base_result;
     logic [     4:0] shamt_rb;  // shift amount from operand_b (SLL/SRL/SRA)
@@ -94,11 +94,16 @@ module alu (
         (alu_op_i == ALU_MULHSU) || (alu_op_i == ALU_MULHU);
 
     // -----------------------------------------------------------
-    // DIV/REM — multi-ciclo, restoring division, 32 iterazioni.
-    // Div-by-zero e' rilevato sul divisore memorizzato (div_divisor_q);
-    // i risultati RISC-V (all-ones per DIV/DIVU, dividendo per REM/REMU)
-    // sono codificati nel mux div_result qui sotto.
-    // TODO: overflow (INT_MIN / -1) non ancora gestito.
+    // DIV/REM — multi-cycle, restoring division, 32 iterations.
+    // Div-by-zero is detected on the stored divisor (div_divisor_q); the
+    // RISC-V results (all-ones for DIV/DIVU, the dividend for REM/REMU) are
+    // encoded in the div_result mux below.
+    //
+    // Signed overflow (INT_MIN / -1) needs no special case: abs(INT_MIN)
+    // is INT_MIN again in two's complement, so the unsigned core computes
+    // 2^31 / 1 = 0x8000_0000 and 2^31 % 1 = 0, and the sign re-application
+    // is a no-op for DIV (sign_a ^ sign_b = 0) and negates 0 for REM. That
+    // is exactly the spec's required DIV = INT_MIN, REM = 0.
     // -----------------------------------------------------------
     logic is_div_op;
     assign is_div_op = (alu_op_i == ALU_DIV) || (alu_op_i == ALU_DIVU) || (alu_op_i == ALU_REM) ||
@@ -117,8 +122,8 @@ module alu (
     logic [2*XLEN-1:0] div_rem_q, div_rem_d;  // {remainder, quotient} shift register
     logic [XLEN-1:0] div_divisor_q;
 
-    // operandi unsigned per il core della divisione; il segno si
-    // riapplica in uscita per DIV/REM (non per DIVU/REMU)
+    // Unsigned operands for the division core; the sign is re-applied on
+    // the output for DIV/REM (not for DIVU/REMU).
     logic [XLEN-1:0] div_a_abs, div_b_abs;
     assign div_a_abs = (alu_op_i inside {ALU_DIV, ALU_REM}) && operand_a_i[XLEN-1] ? -operand_a_i :
         operand_a_i;
@@ -203,7 +208,8 @@ module alu (
         // 0 iff operand_b==0). Previously this used div_b_q, a register
         // that was never written, so the check was stuck at true and every
         // DIV/REM wrongly took the div-by-zero path.
-        // TODO: overflow (INT_MIN / -1) is still not handled.
+        // Signed overflow (INT_MIN / -1) falls out correctly without a
+        // special case -- see the note on the DIV/REM block above.
         unique case (alu_op_i)
             ALU_DIV:
             div_result = (div_divisor_q == 0) ?

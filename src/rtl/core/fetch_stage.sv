@@ -9,10 +9,11 @@ import rv32_pkg::*;
  *
  * Owns the PC and exposes a small native interface for instruction
  * memory access. The stage does NOT drive any bus protocol — it just
- * publishes a request when it needs an instruction; the on-die
- * axi4_lite_master_bridge turns it into AXI4-Lite.
+ * publishes a request when it needs an instruction. In the Harvard build
+ * that request goes straight to a dedicated read-only native_ram I-mem;
+ * no AXI bridge sits in the fetch path.
  *
- * Native interface (valid/ready su entrambi i lati, vedi rv32_pkg):
+ * Native interface (valid/ready on both sides, see rv32_pkg):
  *   - Request launch:  imem_req_o.wvalid && imem_rsp_i.wready.
  *   - Read response:   imem_rsp_i.rvalid && imem_req_o.rready.
  *
@@ -25,16 +26,16 @@ import rv32_pkg::*;
  *     if it is empty, otherwise in a 1-entry skid buffer (skid_*_q).
  *     Decode drains the FIFO in order: F/D (head) first, then skid
  *     (tail) promotes to F/D when decode frees it.
- *   - The skid is what keeps the shared imem bus drainable. Without it,
- *     a run-ahead fetch response that arrives while F/D is full would
- *     sit on the single-outstanding bus with rready=0, blocking a
- *     pending LSU access; the LSU stall then stalls decode, which
- *     keeps F/D full, so the response never drains — deadlock. With
- *     the skid, that response is captured into the free skid slot
- *     (rready=1), the bus frees immediately, and the LSU can get
- *     through. rready depends only on whether the 2-deep FIFO has a
- *     free slot (fe_valid_q / skid_valid_q) — both registers — so there
- *     is no combinational loop through the bridge's rready forwarding.
+ *   - The skid buys overlap: a run-ahead response that lands while F/D
+ *     is still held by a stalled decode is captured (rready=1) instead
+ *     of sitting on the port, so the next fetch can issue as soon as
+ *     decode frees F/D. rready depends only on whether the 2-deep FIFO
+ *     has a free slot (fe_valid_q / skid_valid_q) — both registers — so
+ *     there is no combinational loop through the slave's rvalid.
+ *     (Historically the skid also prevented a starvation deadlock on the
+ *     von-Neumann shared bus, where an undrainable fetch response blocked
+ *     a pending LSU access. Harvard gives fetch its own I-mem port, so
+ *     that failure mode is gone; the overlap win remains.)
  *   - When the FIFO is full (F/D + skid both valid, 2 words) fetch
  *     stops issuing: the bus is idle and fully available to the LSU.
  *   - Steady-state throughput ~2 cycles/instruction (the bridge
@@ -112,7 +113,8 @@ module fetch_stage (
     // Reset vector boot address
     input wire [XLEN-1:0] boot_addr_i,
 
-    // Forward-compat (currently tied off in CPU top)
+    // Downstream back-pressure and the execute-resolved redirect
+    // (branch / jump / trap entry / mret), both wired at the CPU top.
     input wire            stall_i,
     input wire            branch_valid_i,
     input wire [XLEN-1:0] branch_addr_i,
@@ -322,3 +324,5 @@ module fetch_stage (
     assign fe_valid_o = fe_valid_q;
 
 endmodule
+
+`resetall

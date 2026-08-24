@@ -15,18 +15,21 @@ import rv32_pkg::*;
  *      v                      v                              v
  *   native_ram (u_imem)   native_ram (u_dmem)         axi_bus_peri
  *   (instr)                (data + .rodata + stack)      |
- *                                                        +-- axi4_lite_xbar
- *                                                        |     (peri 1->2,
- *                                                        |      addr[12])
+ *                                                        +-- axi4_lite_xbar_3
+ *                                                        |     (peri 1->3,
+ *                                                        |      base+size)
  *                                                        |
- *                                       addr[12]=0 -----+--> u_msip  (0x1000_0000)
- *                                       addr[12]=1 -----+--> u_timer (0x1000_1000+)
+ *                            0x1000_0000..0FFF ----------+--> uart_i  (UART)
+ *                            0x1000_1000..2FFF ----------+--> u_timer (CLINT)
+ *                            0x1000_3000..3FFF ----------+--> u_msip  (MSIP)
  *
  *   Fetch and the LSU no longer contend: each has a dedicated native
  *   BSRAM port. AXI survives only for peripherals (the peri bridge is
  *   inside the CPU). The board top is pure point-to-point wires — the
  *   LSU steers addr[PERI_ADDR_BIT] internally, and the peri xbar here
- *   splits the peri bus into MSIP vs CLINT timer by addr[12].
+ *   splits the peri bus into UART / CLINT timer / MSIP by base+size.
+ *   The window bases come from rv32_pkg (UART_BASE / MTIMER_BASE /
+ *   MSIP_PERI_ADDR) so the map is defined in exactly one place.
  *
  * Pin assignments are in impl/pnr/rv32imac_Zicsr_Zifencei.cst.
  *
@@ -45,7 +48,7 @@ module top_module (
     input  wire uart_rxd_i,
     output wire uart_txd_o,
 
-    // Debug LEDs: low 4 bits of the fetch PC.
+    // Debug LEDs: led_o[0] = stall indicator, led_o[3:1] = alive counter.
     output wire [3:0] led_o
 );
 

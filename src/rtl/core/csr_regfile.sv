@@ -12,18 +12,19 @@ import rv32_pkg::*;
 * CSR RMW result (csr_wdata / csr_wren).
 *
 * Implemented CSRs (machine mode): mstatus, misa, mie, mtvec, mscratch,
-* mepc, mcause, mtval, mip. Unimplemented CSR addresses read as 0 and
-* ignore writes (no illegal-instruction trap yet, so a read of an
-* unimplemented CSR returns 0 rather than trapping).
+* mepc, mcause, mtval, mip, mcycle, minstret (11 entries, NCSR).
+* Unimplemented CSR addresses read as 0 and ignore writes (no
+* illegal-instruction trap yet, so a read of an unimplemented CSR returns 0
+* rather than trapping).
 *
 * Storage is FF + LUT mux, NOT a BSRAM: the implemented CSRs occupy a
 * sparse, small slice of the 12-bit CSR address space (0x300..0x344), so
 * they are selected by a case statement on csr_addr_i, not by direct array
 * indexing. A BSRAM async read needs a contiguous index, which the sparse
 * CSR map does not provide, so `(* ram_style = "block" *)` would be ignored
-* anyway (and was misleading). 9 registers is cheap as flops. Unlike the
+* anyway (and was misleading). 11 registers is cheap as flops. Unlike the
 * GPR file, these CSRs ARE reset: machine-mode CSRs have architected reset
-* values, and with only 9 entries a sync reset loop is trivial (no BSRAM
+* values, and with only 11 entries a sync reset loop is trivial (no BSRAM
 * single-write-port constraint, no DO->DI timing issue).
 *
 * Naming: ports *_i/_o; internal signals no prefix. The storage array is
