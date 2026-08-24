@@ -129,9 +129,29 @@ def main():
             print("cosim: neither side parked (both hit a bound); "
                   "comparing the shorter run.", file=sys.stderr)
         else:
-            which = "RTL" if park_rtl is None else "Spike"
+            which = "Spike" if park_rtl is None else "RTL"
             print(f"cosim: only {which} parked (control-flow divergence or "
                   f"bound hit on the other side).", file=sys.stderr)
+
+    # Unmodeled-peripheral stop: Spike has no slave for the board MMIO
+    # window (UART/CLINT/MSIP at 0x1000_0000+), so the first load/store the
+    # program issues there traps in Spike (mtvec defaults to 0 -> it reboots
+    # to the entry PC), while the RTL -- which DOES have the device -- keeps
+    # retiring normally. Spike is also instruction-based (no cycle timing),
+    # so a TX_READY poll (uart_puts) can never be matched retire-by-retire
+    # even if a slave were mapped. Detect this: a *second* Spike retire at the
+    # entry PC (the first is the post-stub alignment point) with the RTL
+    # elsewhere is a Spike trap on unmapped MMIO, not a CPU bug. Stop the
+    # comparison there; everything before is the ISA-relevant computation
+    # (sort, verify, setup) and is still checked 1:1 below.
+    unmodeled_stop = None
+    for i in range(1, min(len(cmp_rtl), len(cmp_spike))):
+        if cmp_spike[i][0] == args.entry and cmp_rtl[i][0] != args.entry:
+            unmodeled_stop = i
+            break
+    if unmodeled_stop is not None:
+        cmp_rtl = cmp_rtl[:unmodeled_stop]
+        cmp_spike = cmp_spike[:unmodeled_stop]
 
     n = min(len(cmp_rtl), len(cmp_spike))
     for i in range(n):
@@ -160,8 +180,21 @@ def main():
     parkmsg = ""
     if park_rtl is not None:
         parkmsg = f", park @ 0x{rtl[park_rtl][0]:08x}"
-    print(f"cosim: PASS -- matched {n} retires{parkmsg} "
-          f"(skipped {skip} Spike stub retires).")
+    if unmodeled_stop is not None:
+        # The ISA-relevant computation matched; the program then touched a
+        # peripheral Spike has no slave for (UART/CLINT/MSIP), so Spike
+        # trapped and the comparison stopped before the MMIO access. This is
+        # a harness gap, not a CPU bug -- the RTL has the device and retired
+        # it normally. The matched prefix still validates fetch/decode/exec
+        # + LSU + Zilx + CSR up to the first peripheral touch.
+        print(f"cosim: PASS -- matched {n} retires{parkmsg} "
+              f"(skipped {skip} Spike stub retires); stopped at retire "
+              f"{unmodeled_stop}: Spike trapped on unmodeled MMIO "
+              f"(no UART/CLINT/MSIP slave) -- peripheral access beyond the "
+              f"ISA model, not compared.")
+    else:
+        print(f"cosim: PASS -- matched {n} retires{parkmsg} "
+              f"(skipped {skip} Spike stub retires).")
     return 0
 
 

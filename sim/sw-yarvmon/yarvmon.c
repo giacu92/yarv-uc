@@ -84,7 +84,7 @@ static void print_addr_prefix(uint32_t addr)
 
 void yarvmon(void)
 {
-    uart_puts("\r\nRV32 YarvMon\r\n");
+    uart_puts("\r\nRV32 YARV-Mon\r\n");
 
     for (;;) {
         uart_putc('\\');

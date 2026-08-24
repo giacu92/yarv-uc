@@ -17,6 +17,7 @@ RTL := \
 	../src/rtl/bus/axi4_lite_if.sv \
 	../src/rtl/bus/axi4_lite_master_bridge.sv \
 	../src/rtl/bus/axi4_lite_xbar.sv \
+	../src/rtl/bus/axi4_lite_xbar_3.sv \
 	../src/rtl/core/fetch_stage.sv \
 	../src/rtl/core/reg_file.sv \
 	../src/rtl/core/csr_regfile.sv \
@@ -28,6 +29,7 @@ RTL := \
 	../src/rtl/utils/native_ram.sv \
 	../src/rtl/utils/msip_peri.sv \
 	../src/rtl/utils/clint_timer.sv \
+	../src/rtl/utils/axi4_lite_uart.sv \
 	sim_top.sv
 
 # Harvard topology: native u_imem (read-only) + u_dmem (byte-strobed) on

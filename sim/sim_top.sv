@@ -203,7 +203,7 @@ module sim_top (
 
     axi4_lite_uart #(
         .CLK_FREQ_HZ(50_000_000),  // sim clock is a free-running C++ tick, not board-accurate
-        .BAUD_RATE  (115200)
+        .BAUD_RATE  (10_000_000)
     ) u_uart (
         .clk_i     (clk_i),
         .rstn_i    (rstn_i),
