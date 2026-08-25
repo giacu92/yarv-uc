@@ -16,11 +16,39 @@ static char uart_getc(void)
     return (char)(UART_RXDATA & 0xFF);
 }
 
+/* UART_TX_PACED: send with a software delay instead of the TX_READY poll,
+ * long enough that only one byte is ever in flight, so the TX FIFO never
+ * becomes full and the poll loop is never entered.
+ *
+ * This exists as a board diagnostic. On silicon both the monitor and the
+ * bring-up program stop producing output exactly when the TX FIFO first
+ * fills -- 16 bytes into an uninterrupted burst -- while simulation, which
+ * fills the same FIFO at the same baud, runs to completion. Paced output
+ * removes both suspects at once: no full FIFO, and no polling. If the
+ * output then completes, the fault is in the full/pop path of the
+ * peripheral; if it still stops, the FIFO is exonerated and the bus or the
+ * engine is the place to look.
+ *
+ * UART_TX_DELAY is in loop iterations, a few cycles each. The default is
+ * comfortably longer than one 115200 frame at 25 MHz (2170 cycles). */
+#ifndef UART_TX_PACED
+#define UART_TX_PACED 0
+#endif
+#ifndef UART_TX_DELAY
+#define UART_TX_DELAY 3000
+#endif
+
 static void uart_putc(char c)
 {
+#if UART_TX_PACED
+    for (volatile int d = 0; d < UART_TX_DELAY; ++d)
+        ;
+    UART_TXDATA = (unsigned int)(unsigned char)c;
+#else
     while (!(UART_STATUS & UART_TX_READY_BIT))
         ;
     UART_TXDATA = (unsigned int)(unsigned char)c;
+#endif
 }
 
 static void uart_puts(const char *s)

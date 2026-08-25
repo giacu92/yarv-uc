@@ -46,6 +46,11 @@ CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
 # flat MEMORY layout does not cover ("PHDR segment not covered by LOAD
 # segment"); -no-pie plus -N (omagic, single writable non-demand-paged
 # LOAD) drops it. Harmless on a bare-metal toolchain.
+# UART_TX_PACED=1 replaces the TX_READY poll with a software delay (see
+# sim/sw/uart.h): a board diagnostic for output that stops when the TX FIFO
+# first fills.
+UART_TX_PACED ?= 0
+CFLAGS += -DUART_TX_PACED=$(UART_TX_PACED)
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
            -T link.ld -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
 
@@ -87,8 +92,22 @@ $(IMEM_BIN): $(ELF)
 $(DMEM_BIN): $(ELF)
 	$(OBJCOPY) -O binary -j .rodata -j .data $< $@
 
+# Padded to IMEM_PAD_WORDS so the inferred ROM is built that deep: Gowin
+# sizes it from the $readmemh content, and an image-sized ROM makes every
+# fetch above the image alias back into real instructions instead of
+# faulting -- a wrong redirect then runs silently.
+#
+# The filler is ebreak, not zero. Zero traps too, but a run of zero words
+# is indistinguishable from "no initial value", so a synthesiser may drop
+# it and shrink the ROM back to the image. ebreak is a real instruction
+# word that has to be stored, and breakpoint (mcause=3) identifies a
+# wander into the padding, as opposed to illegal-instruction (mcause=2)
+# from genuine garbage.
+IMEM_PAD_WORDS ?= 4096   # 16 KiB, the full declared I-mem depth
+IMEM_PAD_VALUE ?= 0x00100073
+
 $(IMEM_HEX): $(IMEM_BIN) bin2hex.py
-	python3 bin2hex.py $< $@
+	python3 bin2hex.py --pad-words $(IMEM_PAD_WORDS) --pad-value $(IMEM_PAD_VALUE) $< $@
 
 $(DMEM_HEX): $(DMEM_BIN) bin2hex.py
 	python3 bin2hex.py --base 0x2000 $< $@

@@ -32,17 +32,25 @@ RTL_LOG    := $(SCRIPT_DIR)rtl.trace
 # though spike.log is complete. `--instructions` makes the cap reliable on
 # its own; `|| true` covers a spike crash. The program is a few thousand
 # retires; the rest is the spinning `j`, park-truncated by the diff driver.
-SPIKE_MAXINSTR ?= 50000
+# The array is 256 words now, so the sort is roughly 30k instructions: the
+# cap has to clear that plus Spike's boot stub, and the RTL bound has to
+# clear the same work at IPC ~0.5.
+SPIKE_MAXINSTR ?= 80000
 
 # zicsr/zifencei: needed only for Spike's boot-ROM stub (csrr mhartid). The
 # program emits no csr/fence; the RTL defers them (illegal=1) but never sees
 # them because the stub is skipped by the diff driver. zilx: the indexed
 # loads (same encoding as this core).
 SPIKE_ISA := rv32imac_zicsr_zifencei_zilx
-# Memory: 4 KiB at 0x0 (code + .data, below the 0x1000 boot ROM) + 56 KiB at
-# 0x2000 (stack; sp=0x10000 grows down). The 0x1000 boot-ROM gap avoids any
-# overlap between DRAM and the boot-ROM device.
-SPIKE_MEM := 0x0:0x1000,0x2000:0xE000
+# Memory: 4 KiB at 0x0 (code + .data, below the 0x1000 boot ROM) + 8 KiB at
+# 0x2000 (.rodata/.data/.bss + stack; sp=0x4000 grows down). The 0x1000
+# boot-ROM gap avoids any overlap between DRAM and the boot-ROM device.
+#
+# The 8 KiB matches the real D-mem (native_ram ADDR_W=14 spanning
+# 0x0000-0x3FFF, with the data image at 0x2000), so an access the hardware
+# would silently alias makes Spike trap here instead of quietly succeeding
+# and hiding the divergence.
+SPIKE_MEM := 0x0:0x1000,0x2000:0x2000
 
 .PHONY: cosim spike-build spike-run rtl-run diff clean
 
@@ -51,9 +59,25 @@ cosim: diff
 spike-build:
 	@bash $(SCRIPT_DIR)../build_spike.sh
 
-# Build the C program (ELF for Spike, imem/dmem hex for the RTL) if missing.
-$(ELF) $(IMEM_HEX) $(DMEM_HEX):
-	@$(MAKE) -C $(SCRIPT_DIR)../../.. sw
+# Build the C program (ELF for Spike, imem/dmem hex for the RTL).
+#
+# PRINT_ARRAY=0: the program prints the array before and after sorting on
+# the board, but the first UART access is where Spike stops being
+# comparable (no UART slave there), so a printing build would end the diff
+# before the sort. Built unconditionally rather than only-if-missing,
+# because the artefacts are shared with `make sw` -- which builds the
+# printing variant.
+# RISCV_PREFIX is forwarded when given, so `make cosim RISCV_PREFIX=...`
+# works: sim/sw defaults to a toolchain path that does not exist on every
+# machine, and without this the firmware build fails inside the co-sim.
+TC_ARGS := $(if $(RISCV_PREFIX),RISCV_PREFIX=$(RISCV_PREFIX))
+
+.PHONY: sw-cosim-build
+sw-cosim-build:
+	@$(MAKE) -C $(SCRIPT_DIR)../../sw clean
+	@$(MAKE) -C $(SCRIPT_DIR)../../sw PRINT_ARRAY=0 $(TC_ARGS)
+
+$(ELF) $(IMEM_HEX) $(DMEM_HEX): sw-cosim-build
 
 spike-run: $(ELF) spike-build
 	@echo "== running Spike (golden) =="
@@ -66,7 +90,7 @@ spike-run: $(ELF) spike-build
 rtl-run: $(IMEM_HEX) $(DMEM_HEX)
 	@echo "== running RTL sim (RTL_TRACE=$(RTL_LOG)) =="
 	@rm -f $(RTL_LOG)
-	@RTL_TRACE=$(RTL_LOG) MAX_CYC=20000 \
+	@RTL_TRACE=$(RTL_LOG) MAX_CYC=200000 \
 	  $(MAKE) -C $(SCRIPT_DIR)../.. run \
 	    RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex" \
 	  >/dev/null

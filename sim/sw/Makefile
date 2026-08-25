@@ -47,6 +47,16 @@ CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
 # flat MEMORY layout does not cover ("PHDR segment not covered by LOAD
 # segment"); -no-pie plus -N (omagic) drops it. Harmless on a bare-metal
 # toolchain.
+
+# PRINT_ARRAY=0 compiles out the array printing (see main.c): the co-sim
+# needs a build that makes no UART access before the sort.
+# UART_TX_PACED=1 replaces the TX_READY poll with a software delay (see
+# sim/sw/uart.h): a board diagnostic for output that stops when the TX FIFO
+# first fills.
+UART_TX_PACED ?= 0
+CFLAGS += -DUART_TX_PACED=$(UART_TX_PACED)
+PRINT_ARRAY ?= 1
+CFLAGS += -DPRINT_ARRAY=$(PRINT_ARRAY)
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
            -T link.ld -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
 

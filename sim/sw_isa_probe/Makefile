@@ -1,7 +1,10 @@
-# Build a C program into a pair of $readmemh images for the Harvard
-# Verilator sim, using the prebuilt bare-metal RISC-V toolchain
-# (riscv32-esp-elf-gcc, found under the PlatformIO/esphome cache -- no
-# install needed).
+# ISA probe: builds isa_probe.c into a
+# pair of $readmemh images for the Harvard Verilator sim.
+#
+# Doubles as the hardware bring-up program: it is deliberately smaller and
+# dumber than YarvMon, so if a board shows no echo this tells you whether
+# bytes reach the CPU at all, and whether they do so by polling, by
+# interrupt, or not at all.
 #
 #   make          build build/imem.hex + build/dmem.hex (.elf/.bin/.objdump)
 #   make show     disassemble build/program.elf
@@ -22,14 +25,10 @@ CC      := $(RISCV_PREFIX)-gcc
 OBJCOPY := $(RISCV_PREFIX)-objcopy
 OBJDUMP := $(RISCV_PREFIX)-objdump
 
-# rv32imac = the core's implemented integer subset (I + M + A + C). The
-# core also implements Zicsr + Zifencei + machine-mode traps, but plain C
-# (-march=rv32imac, no zicsr in the arch string) emits only integer code
-# (no CSR / fence / atomics); the trap oracle (sim/sw_trap) builds with
-# rv32imac_zicsr_zifencei when it needs those. Zilx indexed loads are
-# implemented (retire via the LSU) but have no assembler mnemonics, so
-# yarvmon.c hand-encodes them with .insn.
-ARCH := rv32imac
+# This oracle needs Zicsr: it programs mtvec/mie/mstatus and runs an
+# interrupt handler, so the arch string carries zicsr_zifencei (unlike the
+# plain-integer programs under sw/ and sw-yarvmon/).
+ARCH := rv32imac_zicsr_zifencei
 ABI  := ilp32
 
 # -fno-pie: a linux/glibc toolchain (riscv32-buildroot-linux-gnu) defaults
@@ -47,6 +46,11 @@ CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
 # flat MEMORY layout does not cover ("PHDR segment not covered by LOAD
 # segment"); -no-pie plus -N (omagic, single writable non-demand-paged
 # LOAD) drops it. Harmless on a bare-metal toolchain.
+# UART_TX_PACED=1 replaces the TX_READY poll with a software delay (see
+# sim/sw/uart.h): a board diagnostic for output that stops when the TX FIFO
+# first fills.
+UART_TX_PACED ?= 0
+CFLAGS += -DUART_TX_PACED=$(UART_TX_PACED)
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
            -T link.ld -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
 
@@ -59,7 +63,7 @@ DMEM_HEX := $(BUILD)/dmem.hex
 OBJD    := $(BUILD)/program.elf.objdump
 
 # start.o first so _start (.text.init) is the first thing linked -> IMEM 0x0.
-OBJS := $(BUILD)/start.o $(BUILD)/yarvmon.o
+OBJS := $(BUILD)/start.o $(BUILD)/isa_probe.o
 
 .PHONY: all clean show
 all: $(IMEM_HEX) $(DMEM_HEX) $(OBJD)
@@ -70,7 +74,7 @@ $(BUILD):
 $(BUILD)/start.o: start.S | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/yarvmon.o: yarvmon.c | $(BUILD)
+$(BUILD)/isa_probe.o: isa_probe.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(ELF): $(OBJS) link.ld
@@ -88,17 +92,17 @@ $(IMEM_BIN): $(ELF)
 $(DMEM_BIN): $(ELF)
 	$(OBJCOPY) -O binary -j .rodata -j .data $< $@
 
-# Padded to IMEM_PAD_WORDS so the inferred ROM is built that deep:
-# GowinSynthesis sizes a read-only array from its $readmemh content, not from
-# the declared depth, so an image-sized ROM lets every fetch above the image
-# alias back into real instructions -- a wrong redirect then runs silently
-# instead of faulting. This is the board's default firmware, so it matters
-# here as much as in the bring-up programs.
+# Padded to IMEM_PAD_WORDS so the inferred ROM is built that deep: Gowin
+# sizes it from the $readmemh content, and an image-sized ROM makes every
+# fetch above the image alias back into real instructions instead of
+# faulting -- a wrong redirect then runs silently.
 #
-# The filler is ebreak, not zero: zero traps too, but a run of zero words is
-# indistinguishable from "no initial value" and may be dropped again, and
-# breakpoint (mcause=3) identifies a wander into the padding as opposed to
-# illegal-instruction (mcause=2) from genuine garbage.
+# The filler is ebreak, not zero. Zero traps too, but a run of zero words
+# is indistinguishable from "no initial value", so a synthesiser may drop
+# it and shrink the ROM back to the image. ebreak is a real instruction
+# word that has to be stored, and breakpoint (mcause=3) identifies a
+# wander into the padding, as opposed to illegal-instruction (mcause=2)
+# from genuine garbage.
 IMEM_PAD_WORDS ?= 4096   # 16 KiB, the full declared I-mem depth
 IMEM_PAD_VALUE ?= 0x00100073
 

@@ -195,6 +195,40 @@ and dumber than YarvMon, so on a board that shows no echo, phase 1 tells
 you whether bytes reach the CPU at all and phase 2 whether the interrupt
 path works.
 
+## ISA / memory probe (`sw_isa_probe/`)
+
+A board bring-up probe for the case where the *reporting* is what lies.
+It reports through fixed strings (`name OK` / `name BAD`) and dumps values
+in binary using only register-register `AND` and mask doubling by addition
+— never the hex printer, and never an instruction under test.
+
+It checks, one verdict per line: `c.andi` with immediates 15/7/3/1 (hand
+encoded halfwords, so the encoding is exactly the one named) against the
+32-bit `andi`; the shifts; register-register `AND`/`OR`; a byte load at
+each lane; and a memory matrix on one word in `.rodata` and one in
+`.data` — `lw`, `lbu` at a constant offset, `lbu` at a **computed**
+address, `lhu`, and byte stores read back.
+
+That last split is the point. A `const` read at a constant index gets
+folded at compile time and proves nothing about the memory; only a
+computed index produces a real load. It is what isolated the load
+byte-select bug, where a load whose address came from a distance-1
+forward read the right word but the wrong byte, on silicon only.
+
+```
+cd sw_isa_probe && make UART_TX_PACED=1
+cd .. && UART_BIT_CYCLES=217 make run \
+  RUN_ARGS="+IINIT=sw_isa_probe/build/imem.hex +DINIT=sw_isa_probe/build/dmem.hex"
+# every line OK, "rodata2 0123456789ABCDEF", "PROBE END"
+```
+
+`UART_TX_PACED=1` (in `sw/uart.h`, honoured by `sw/Makefile` and
+`sw_uart_echo/Makefile`) replaces the `TX_READY` poll with a software
+delay longer than one frame, so a single byte is in flight at a time and
+the TX FIFO never fills. It is a diagnostic, not a shipping setting: it
+separates "the FIFO filled" from "the poll never returned" when a board
+goes quiet in the middle of a line.
+
 ## Native RAM compliance test (`hw/native_mem_tb/`)
 
 A second, independent harness that does **not** use the CPU — it
@@ -239,13 +273,23 @@ Harvard co-sim needs `.data` at a non-zero VMA: Spike is a single
 unified address space, so `.text`@0 and `.data`@0 would clobber each
 other (the second LOAD segment overwrites the first at vaddr 0). The
 linker places `.data` at DMEM 0x2000 (`sim/sw/link.ld`), and the cosim
-`SPIKE_MEM` (`0x0:0x1000` for code, `0x2000:0xE000` for data+stack)
+`SPIKE_MEM` (`0x0:0x1000` for code, `0x2000:0x2000` for data+stack — the
+real 8 KiB D-mem, so an access the hardware would silently alias makes
+Spike trap here instead of quietly succeeding)
 matches that split — so Spike's unified space and the RTL's split
 I-mem/D-mem spaces both see the same absolute addresses.
 
 ```
 make cosim     # build sw + Spike, run both, diff -> "PASS -- matched N retires"
 ```
+
+The firmware is rebuilt with `PRINT_ARRAY=0` every time (the artefacts are
+shared with `make sw`, which builds the printing variant): the first UART
+access is where Spike stops being comparable, so a printing build would end
+the diff before the sort it is meant to check. Pass `RISCV_PREFIX=...` to
+`make cosim` and it is forwarded to the firmware build. Current result:
+**PASS, 29625 retires matched** (256-element sort + verify + setup), then a
+clean stop at the first UART MMIO access — a harness limit, not a CPU bug.
 
 The Spike source tree, build, install, and per-run logs are gitignored;
 only the harness is committed: `cosim_diff.py` + `build_spike.sh` at
@@ -346,6 +390,9 @@ cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
 - `sw_trap/`      — standalone M-mode trap-exercise program
   (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
+- `sw_isa_probe/` — instruction/memory probe that reports without using
+  the hex printer or any instruction under test (see "ISA / memory
+  probe").
 - `sw_timer/`     — standalone M-mode timer-interrupt program
   (MTIE+MIE, `mtimecmp=100`, WFI wake, self-checking — see "Timer oracle").
 - `sw_wfi_trap/`  — WFI-wake arbitration regression (illegal-trap behind

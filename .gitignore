@@ -59,5 +59,8 @@ sim/cosim/ecall/__pycache__/
 sim/sw_rvc_scramble/build/
 sim/sw_uart_echo/build/
 
+# ISA probe build artefacts (regenerable)
+sim/sw_isa_probe/build/
+
 # UART TX capture written by the sim harness (sim_top's tx monitor).
 sim/sim_uart_tx.txt

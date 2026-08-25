@@ -20,20 +20,69 @@
  * variant; this program only stresses lxs.w.
  *
  * .bss is NOT zeroed at runtime (start.S does not clear it), so keep
- * state in an initialized .data array, not uninitialized globals.
+ * state in a .data array, not uninitialized globals.
+ *
+ * The array is 256 words, filled by a deterministic LCG and printed before
+ * and after the sort (PRINT_ARRAY=0 compiles the printing out for the
+ * co-simulation, which cannot follow a UART access).
  */
 
-#define N 32
+#define N 256
 
 #include "uart.h"
 
-/* Initialized .data array (part of the RAM image, so it lands in memory
- * without needing .bss zeroing). volatile forces a real load/store per
- * access and stops -O2 from constant-folding the whole sort. */
-static volatile int arr[N] = {
-    10, -8, 3, -15, 12, -1, 6, -13, 0, 9, -4, 14, -7, 11, -2, 5,
-    -16, 7, -12, 4, -9, 15, -6, 13, -10, 2, -11, 8, -5, 1, -14, -3
-};
+/* Printing the array is a board-side aid, not part of the sort. It is
+ * compiled out for the co-simulation: the first UART access is where Spike
+ * and the RTL stop being comparable (Spike has no UART slave), so printing
+ * before the sort would end the retire-by-retire diff before it ever saw
+ * the algorithm. Build with -DPRINT_ARRAY=0 for that case. */
+#ifndef PRINT_ARRAY
+#define PRINT_ARRAY 1
+#endif
+
+/* Forced into .data rather than left to .bss: nothing zeroes .bss here
+ * (start.S does not, and .bss is NOBITS so it is not in the loaded image
+ * either), so a .bss array holds whatever the BSRAM powered up with. In
+ * .data it is part of the image and starts as zeros, which the fill below
+ * then overwrites. volatile forces a real load/store per access and stops
+ * -O2 from constant-folding the whole sort away.
+ *
+ * 256 words = 1 KiB of the 8 KiB D-mem, which spans 0x2000-0x3FFF with the
+ * stack growing down from 0x4000. */
+static volatile int arr[N] __attribute__((section(".data")));
+
+/* Deterministic pseudo-random fill: the same sequence on Spike and on the
+ * RTL, so the co-sim still compares like for like, and unsorted enough that
+ * quicksort's recursion stays near log2(N) deep instead of degenerating to
+ * N frames the way an already-sorted input would. A plain 32-bit LCG
+ * (Numerical Recipes constants), taking the high bits because the low ones
+ * of an LCG are barely random, mapped to a small signed range so the
+ * printout stays readable. */
+static void fill_array(void)
+{
+    unsigned int state = 0x12345678u;
+    for (int i = 0; i < N; i++) {
+        state  = state * 1664525u + 1013904223u;
+        arr[i] = (int)((state >> 16) & 0x1FFu) - 256;
+    }
+}
+
+#if PRINT_ARRAY
+/* One line per 8 entries, hex so no division is needed (this build has no
+ * libc, and a software divide per digit would dominate the run). */
+static void print_array(const char *label)
+{
+    uart_puts(label);
+    for (int i = 0; i < N; i++) {
+        if ((i % 8) == 0) uart_puts("\r\n");
+        uart_put_hex32((unsigned int)arr[i]);
+        uart_putc(' ');
+    }
+    uart_puts("\r\n");
+}
+#else
+#define print_array(label) ((void)0)
+#endif
 
 /* Zilx (draft) scaled indexed word load: val = *(base + (idx << 2)).
  * Hand-encoded via .insn since -march=rv32imac's assembler has no
@@ -86,7 +135,12 @@ static void quicksort(int lo, int hi)
 
 int main(void)
 {
+    fill_array();
+    print_array("before:");
+
     quicksort(0, N - 1);
+
+    print_array("after:");
 
     /* Verify ascending order; return a recognizable marker in a0.
      * 0x600D == sorted, 0x00000BAD == still unsorted (sort broken). */

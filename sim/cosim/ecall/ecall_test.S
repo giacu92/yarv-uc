@@ -20,7 +20,7 @@
     .section .text.init, "ax"
     .global _start
 _start:
-    li      sp, 0x10000
+    li      sp, 0x4000
     la      t0, trap_handler
     csrw    mtvec, t0
     .word   0x0000007f          /* illegal (opcode 0x7f) -> trap, not retired */

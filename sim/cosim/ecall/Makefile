@@ -17,10 +17,19 @@ OBJDUMP := $(RISCV_PREFIX)-objdump
 
 ARCH := rv32imac_zicsr_zifencei
 ABI  := ilp32
+# -fno-pie / -no-pie / -Wl,-N: needed when RISCV_PREFIX points at a linux
+# (glibc) toolchain such as riscv32-buildroot-linux-gnu rather than a
+# bare-metal one. That ld emits a PT_PHDR segment which this flat MEMORY
+# layout does not cover ("PHDR segment not covered by LOAD segment"), and
+# the compiler defaults to PIE, which turns `la sym` into a GOT load and
+# data addressing into PC-relative -- both wrong for a Harvard split that
+# needs medlow absolute addressing. Harmless on a bare-metal toolchain.
+# The other firmware Makefiles already carry these; this one was missed,
+# so the co-sim could not build here at all.
 CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-          -fno-builtin -fomit-frame-pointer -O2 -g
+          -fno-builtin -fomit-frame-pointer -O2 -g -fno-pie
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-           -T link.ld -Wl,--no-relax -Wl,--no-check-sections
+           -T link.ld -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
 
 BUILD    := build
 ELF      := $(BUILD)/program.elf

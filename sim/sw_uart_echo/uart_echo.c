@@ -66,6 +66,7 @@ static volatile uint32_t IN_DATA irq_chars = 0;   /* bytes echoed by the handler
 static volatile uint32_t IN_DATA sync_traps = 0;  /* ecall traps taken */
 static volatile uint32_t IN_DATA msi_count = 0;    /* software interrupts taken */
 static volatile uint32_t IN_DATA bad_cause = 0;   /* unexpected mcause, if any */
+static volatile uint32_t IN_DATA bad_traps = 0;   /* unexpected traps taken */
 
 static volatile uint32_t *const result = (volatile uint32_t *)0x3000;
 
@@ -131,11 +132,22 @@ __attribute__((interrupt("machine"), aligned(4))) void trap_handler(void)
      * somewhere that is not this function. */
     uart_putc('H');
 
+    /* Entry state, printed before any branch on it. mepc is the value mret
+     * will jump to, so a bogus one here explains a core that goes quiet
+     * without stalling: it returns into whatever that address holds, and a
+     * tight non-memory loop there (start.S's `j 1b`, say) burns cycles
+     * silently with dbg_stall_o low. Format: H<mcause>@<mepc>. */
+    uart_put_hex32(cause);
+    uart_putc('@');
+    uart_put_hex32(read_mepc());
+    uart_putc(' ');
+
     if (cause == MCAUSE_MSI) {
         /* MSIP is a level, held by the peripheral until software clears
          * it -- not clearing it here would re-enter forever. */
         MSIP_REG  = 0;
         msi_count = msi_count + 1;
+        uart_putc('X');
         return;
     }
 
@@ -147,14 +159,30 @@ __attribute__((interrupt("machine"), aligned(4))) void trap_handler(void)
         __asm__ volatile("csrr %0, mepc" : "=r"(epc));
         __asm__ volatile("csrw mepc, %0" ::"r"(epc + 4));
         sync_traps = sync_traps + 1;
+        uart_putc('X');
         return;
     }
 
     if (cause != MCAUSE_MEI) {
-        /* Not the external interrupt: record it and mask everything so we
-         * cannot spin in a trap storm. */
+        /* Not the external interrupt. Masking mstatus.MIE stops an
+         * interrupt storm but not a synchronous one: an illegal
+         * instruction re-faults the moment mret returns into it, whatever
+         * MIE says. That is the case worth catching here -- with the ROM
+         * built only as deep as its image, a stray fetch reads zero, which
+         * is a defined illegal encoding, so a wrong redirect shows up as
+         * exactly this trap with mepc naming the address it wandered to.
+         *
+         * The entry line above has already printed the cause and mepc, so
+         * park after a few repeats rather than flooding the line: the
+         * first lines carry the whole diagnosis. */
         bad_cause = cause;
         __asm__ volatile("csrci mstatus, %0" ::"i"(MSTATUS_MIE));
+        bad_traps = bad_traps + 1;
+        if (bad_traps >= 4) {
+            uart_puts("PARK\r\n");
+            for (;;) { /* park with the diagnosis printed */ }
+        }
+        uart_putc('X');
         return;
     }
 
@@ -165,11 +193,58 @@ __attribute__((interrupt("machine"), aligned(4))) void trap_handler(void)
         uart_putc(c);
         irq_chars = irq_chars + 1;
     }
+    uart_putc('X');
+}
+
+
+/* Write a value to a CSR and read it straight back. Any bit that does not
+ * survive is a bit the CSR file does not really have on this device --
+ * which is a different fault from a value being computed wrong, and the
+ * only way to tell them apart is to control what goes in. mscratch,
+ * mcause, mepc and mtval are safe to scribble on here: no trap has been
+ * armed yet, and mtvec / mie / mstatus (the ones the test needs) are left
+ * alone. */
+#define CSR_WALK(name, val)                                             \
+    do {                                                                \
+        uint32_t rb;                                                    \
+        __asm__ volatile("csrw " name ", %1\n\tcsrr %0, " name          \
+                         : "=r"(rb)                                     \
+                         : "r"((uint32_t)(val)));                       \
+        uart_puts(" " name "=");                                        \
+        uart_put_hex32(rb);                                             \
+    } while (0)
+
+static void csr_bit_walk(uint32_t pattern)
+{
+    uart_puts("CSRW ");
+    uart_put_hex32(pattern);
+    CSR_WALK("mscratch", pattern);
+    CSR_WALK("mcause", pattern);
+    CSR_WALK("mepc", pattern);
+    CSR_WALK("mtval", pattern);
+    uart_puts("\r\n");
 }
 
 int main(void)
 {
     uart_puts("\r\nECHO\r\n");
+
+    /* Print-path sanity first: two literals with every nibble distinct.
+     * The hex printer indexes a .rodata table with a byte load, so a
+     * broken sub-word load would corrupt every value printed anywhere --
+     * including the CSR values below -- and would look exactly like a CSR
+     * losing bits. If these two lines are right, the printer is right and
+     * anything wrong afterwards is real. */
+    uart_puts("PAT ");
+    uart_put_hex32(0x0123ABCDu);
+    uart_putc(' ');
+    uart_put_hex32(0xFEDC5432u);
+    uart_puts("\r\n");
+
+    /* Then walk the CSR bits with controlled patterns. */
+    csr_bit_walk(0xFFFFFFFFu);
+    csr_bit_walk(0xAAAAAAAAu);
+    csr_bit_walk(0x55555555u);
 
     /* ---- Phase 1: polling ---- */
     for (int i = 0; i < PHASE_CHARS; ++i) uart_putc(uart_getc());

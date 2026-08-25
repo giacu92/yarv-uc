@@ -54,16 +54,32 @@ data images (defaults `imem.hex` / `dmem.hex`); see `sim/README.md`.
 ## Files
 
 - `start.S`    — freestanding entry `_start` at I-mem 0x0: set `sp`
-  (`0x10000`, top of the 64 KiB D-mem — stack grows down), `call main`,
-  halt loop.
-- `main.c`     — recursive quicksort over an initialized `.data` array
+  (`0x4000`, top of the 16 KiB D-mem — stack grows down), `call main`,
+  halt loop. `sp` has to be a real address: the D-mem decodes only
+  `ADDR_W` bits, so a pointer above the top aliases silently back into
+  the data it is meant to sit clear of.
+- `main.c`     — recursive quicksort over a 256-word `.data` array
   (Lomuto partition, `volatile` to defeat constant-folding); verifies
   ascending order and returns `0x600D` in `a0` (sorted) or `0x00000BAD`
   (broken). `partition()` hand-encodes a Zilx scaled indexed word load
   (`lxs.w`) via `.insn`, since `-march=rv32imac` has no Zilx mnemonics.
+  The array is filled by a deterministic LCG rather than a literal
+  initialiser: the same sequence on Spike and on the RTL keeps the
+  co-sim comparing like for like, and pseudo-random input keeps the
+  recursion near log2(N) deep instead of the N frames an already-sorted
+  input would cost. It is printed before and after the sort;
+  `make PRINT_ARRAY=0` compiles the printing out, which the co-sim needs
+  because the first UART access is where Spike stops being comparable.
 - `link.ld`    — Harvard link script: two `MEMORY` regions —
   `IMEM (rx) ORIGIN = 0` (code) and `DMEM (rwx) ORIGIN = 0x2000` (data),
-  64 KiB and 56 KiB. `.text.init`/`.text` go to `IMEM` (fetch port,
+  16 KiB and 8 KiB — what the device actually holds (46 BSRAM blocks =
+  828 Kb, so two 64 KiB memories could not both exist). Small-data
+  sections are collected into the same output sections
+  (`.srodata*`/`.sdata*`/`.sbss*`): RISC-V gcc puts anything up to
+  `-msmall-data-limit` (8 bytes) there, and since the image is extracted
+  with `objcopy -j .rodata -j .data`, an uncollected `.srodata` never
+  reaches the D-mem hex — a 4-byte `const` then reads 0 at runtime while
+  the same constant folded at compile time reads correctly. `.text.init`/`.text` go to `IMEM` (fetch port,
   read-only); `.rodata`/`.data`/`.bss` go to `DMEM` (LSU port; `.bss`
   last so the objcopy image is contiguous with no NOBITS gap). `.data`
   sits at DMEM 0x2000 (not 0) so the co-sim golden model (Spike, a

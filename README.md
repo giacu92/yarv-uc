@@ -228,10 +228,12 @@ make sw-run     # build the C program + run the sim loading it (Harvard)
 ```
 
 Each run prints a retire/IPC/stall summary. On the Harvard build the
-recursive quicksort (`make sw-run`) retires 2172 instructions in 4711
-cycles -> **IPC ~0.46** (9.5% of cycles stalled); the dedicated I-mem
-removes fetch/LSU bus contention (the dropped legacy von-Neumann build
-was 5863 cycles / IPC ~0.37).
+recursive quicksort retires at **IPC ~0.5** (~20% of cycles stalled, the
+bulk of it waiting on the LSU); the dedicated I-mem removes fetch/LSU bus
+contention (measured on the earlier 32-element array: 4711 cycles / IPC
+~0.46 Harvard against 5863 / ~0.37 for the dropped von-Neumann build). The
+program now sorts 256 words and prints the array before and after, so the
+run is longer; `make sw-run PRINT_ARRAY=0` gives the print-free variant.
 
 See `sim/README.md` for the logs, VCD/GTKWave, the native-RAM
 (`sim/hw/native_mem_tb/`) and AXI4-Lite RAM (`sim/hw/ram_tb/`) compliance
