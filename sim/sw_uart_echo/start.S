@@ -22,5 +22,25 @@
     .global _start
 _start:
     li      sp, 0x4000           /* top of the 16 KiB D-mem; stack grows down */
+
+    /* Zero .bss. Nothing else does: the section is NOBITS, so it is not
+     * part of the image the loader writes into the memories, and on
+     * hardware its words come up holding whatever the BSRAM powered up
+     * with. In simulation they read as zero, which is exactly what makes
+     * this class of bug invisible until it reaches silicon -- an
+     * uninitialised counter that happened to be non-zero once made a trap
+     * probe report success without any trap having been taken.
+     *
+     * link.ld word-aligns both ends, so this stores words. It also emits
+     * __bss_start == __bss_end when there is no .bss, and then the loop
+     * body never runs. */
+    la      t0, __bss_start
+    la      t1, __bss_end
+1:  bgeu    t0, t1, 2f
+    sw      zero, 0(t0)
+    addi    t0, t0, 4
+    j       1b
+2:
+
     call    main
 1:  j       1b                   /* main returns here; loop forever */

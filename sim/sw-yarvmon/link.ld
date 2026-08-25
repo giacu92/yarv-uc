@@ -71,7 +71,16 @@ SECTIONS
      * reads correctly is exactly as confusing as it sounds. */
     .rodata : { *(.rodata*) *(.srodata*) } > DMEM
     .data   : { *(.data*) *(.sdata*) }     > DMEM
+    /* start.S zeroes this range at boot, so the symbols have to be here and
+     * the section has to be word-aligned at both ends: the clear loop
+     * stores words. Nothing else can do the job -- .bss is NOBITS, so it is
+     * not in the image objcopy extracts, and on hardware those addresses
+     * come up holding whatever the BSRAM powered up with. */
+    . = ALIGN(4);
+    __bss_start = .;
     .bss    : { *(.bss*) *(.sbss*) *(COMMON) } > DMEM
+    . = ALIGN(4);
+    __bss_end = .;
 
     /* Drop metadata that has no place in a flat image. */
     /DISCARD/ : {
