@@ -396,13 +396,56 @@ module execute_stage (
     // Writeback (ALU / PC4 / MEM). A load retires via WB_MEM with sub-word
     // extract + sign/zero extension; stores have reg_write=0 (no wb).
     // =================================================================
-    // Load alignment: the peri RAM returns the containing word; shift the
+    // Load alignment: the memory returns the containing word; shift the
     // addressed bytes down to bit 0, then sign/zero-extend per mem_size
     // and mem_unsigned. The result is sampled the cycle mem_done (rvalid)
     // pulses, when rdata is valid.
+    //
+    // The byte offset comes from a copy of the effective address latched at
+    // launch, NOT from the live alu_result. alu_result is combinational out
+    // of the D/E operands, and those operands can be fed by the
+    // execute->decode forward path, so reading it a cycle (or several)
+    // later means the byte select depends on the whole
+    // regfile -> forward mux -> adder chain still being settled and
+    // unchanged at response time. That is the design's critical path, and
+    // on hardware it was not settled: a load whose address came from a
+    // distance-1 forward (an `add` immediately followed by `lbu`, which is
+    // what indexing a table with a computed index compiles to) selected
+    // byte 0 instead of the addressed byte, while the same load with the
+    // address already committed in the regfile was correct. It read the
+    // right word every time -- only the byte select was wrong -- so
+    // hex[(v >> i) & 0xF] returned hex[i & ~3] and every hex value printed
+    // on the board came out with the low two bits of each nibble cleared.
+    // Simulation could not show it: there the chain settles inside the
+    // cycle regardless of its depth.
+    //
+    // Latching also shortens the response-cycle path to a flop output.
+    logic [1:0] mem_addr_lo_q;
+
+    // Latched on the accept handshake, not on the request being asserted:
+    // the request can be held for several cycles while the slave is busy,
+    // and the accept edge is the one the memory samples the address on.
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) mem_addr_lo_q <= 2'b00;
+        else if (mem_launch_hs) mem_addr_lo_q <= alu_result[1:0];
+    end
+
+`ifdef VERILATOR
+    // The flop is only correct because a read response never arrives in the
+    // same cycle as the accept: every slave in the tree registers rdata, so
+    // rvalid is at least one cycle later. Check it rather than trust it.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && mem_launch_hs && de_i.mem_read) begin
+            assert (!lsu_rsp.rvalid)
+            else
+                $fatal(1, "load response in the accept cycle: latched byte offset is stale");
+        end
+    end
+`endif
+
     logic [XLEN-1:0] load_shifted;
     logic [XLEN-1:0] load_data;
-    assign load_shifted = lsu_rsp.rdata >> {alu_result[1:0], 3'b000};
+    assign load_shifted = lsu_rsp.rdata >> {mem_addr_lo_q, 3'b000};
     always_comb begin
         unique case (de_i.mem_size)
             MS_B:
