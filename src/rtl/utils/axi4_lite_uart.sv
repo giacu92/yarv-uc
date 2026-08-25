@@ -111,6 +111,7 @@ module axi4_lite_uart #(
 );
 
     localparam int DATA_W = axi.DATA_WIDTH;
+    localparam int STRB_W = DATA_W / 8;  // byte strobes, one per lane
     localparam logic [15:0] BAUD_DIV_RESET = 16'((CLK_FREQ_HZ / BAUD_RATE) - 1);
 
     // Word offsets (byte addr[4:2], word-aligned; addr[1:0] ignored like
@@ -227,6 +228,7 @@ module axi4_lite_uart #(
     logic              aw_seen_q;
     logic              w_seen_q;
     logic [DATA_W-1:0] wdata_q;
+    logic [STRB_W-1:0] wstrb_q;
     logic [       2:0] awaddr_word_q;
     logic              bvalid_q;
 
@@ -259,6 +261,15 @@ module axi4_lite_uart #(
 
     wire [       2:0] waddr_eff = aw_hs ? axi.awaddr[4:2] : awaddr_word_q;
     wire [DATA_W-1:0] wdata_eff = w_hs ? axi.wdata : wdata_q;
+    wire [STRB_W-1:0] wstrb_eff = w_hs ? axi.wstrb : wstrb_q;
+
+    // Every register here lives in the low byte of its word (BAUDDIV in the
+    // low half), so a write that does not strobe byte 0 addresses no field
+    // and must do nothing. Ignoring the strobes made a byte store to
+    // TXDATA+1..+3 push wdata[7:0], which for such a store is zero: the
+    // monitor's "10000000: 41 42 43" (it increments the address per byte)
+    // sent 'A' and then two NULs instead of being harmless.
+    wire              wr_low_byte = wstrb_eff[0];
 
     assign axi.bvalid = bvalid_q;
     assign axi.bresp  = 2'b00;  // OKAY
@@ -285,13 +296,14 @@ module axi4_lite_uart #(
 
     wire do_write = aw_present && w_present && !bvalid_q && !tx_write_hold;
 
-    wire tx_push = do_write && tx_addr_sel;
+    wire tx_push = do_write && tx_addr_sel && wr_low_byte;
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
             aw_seen_q           <= 1'b0;
             w_seen_q            <= 1'b0;
             wdata_q             <= '0;
+            wstrb_q             <= '0;
             awaddr_word_q       <= '0;
             bvalid_q            <= 1'b0;
             tx_ie_q             <= 1'b0;
@@ -306,6 +318,7 @@ module axi4_lite_uart #(
             if (w_hs) begin
                 w_seen_q <= 1'b1;
                 wdata_q  <= axi.wdata;
+                wstrb_q  <= axi.wstrb;
             end
 
             if (do_write) begin
@@ -314,11 +327,13 @@ module axi4_lite_uart #(
                 bvalid_q  <= 1'b1;
 
                 unique case (waddr_eff)
-                    REG_CTRL: begin
+                    REG_CTRL:
+                    if (wr_low_byte) begin
                         tx_ie_q <= wdata_eff[0];
                         rx_ie_q <= wdata_eff[1];
                     end
-                    REG_BAUDDIV: begin
+                    REG_BAUDDIV:
+                    if (wr_low_byte) begin
                         // Latched; applied by the divisor-update block
                         // below only once TX and RX are both idle, so an
                         // in-flight frame is never corrupted.
