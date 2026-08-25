@@ -226,6 +226,25 @@ turned a board that went silent into a board that says where it is:
 never fills — that is what separates "the FIFO filled" from "the poll
 never returned".
 
+## Instruction-access-fault oracle (`sw_ifault/`)
+
+`ifault_test.S` jumps to 0x100000 — far outside the 16 KiB I-mem — and
+checks that exactly one trap arrived, with `mcause` = 1 (instruction access
+fault) and `mtval` equal to the address jumped to. It writes `0x600D` to
+D-mem 0x2000 on pass, `0xBAD` on failure, and needs nothing but the
+assembler.
+
+The handler deliberately does **not** `mret` to `mepc`: the faulting
+address is still unfetchable, so returning there would fault again
+forever. It rewrites `mepc` to a known label instead, which is what a real
+handler has to do with this trap.
+
+```
+cd sw_ifault && make
+cd .. && make run \
+  RUN_ARGS="+IINIT=sw_ifault/build/imem.hex +DINIT=sw_ifault/build/dmem.hex"
+```
+
 ## ISA / memory probe (`sw_isa_probe/`)
 
 A board bring-up probe for the case where the *reporting* is what lies.
@@ -421,6 +440,8 @@ cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
 - `sw_trap/`      — standalone M-mode trap-exercise program
   (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
+- `sw_ifault/`    — instruction-access-fault oracle (jump outside the
+  I-mem, check cause and mtval — see "Instruction-access-fault oracle").
 - `sw_isa_probe/` — instruction/memory probe that reports without using
   the hex printer or any instruction under test (see "ISA / memory
   probe").

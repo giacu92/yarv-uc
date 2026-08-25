@@ -57,7 +57,11 @@ data images (defaults `imem.hex` / `dmem.hex`); see `sim/README.md`.
 
 ## Files
 
-- `start.S`    — freestanding entry `_start` at I-mem 0x0: set `sp`
+- `start.S`    — freestanding entry `_start` at I-mem 0x0: zero `.bss`
+  from `__bss_start`/`__bss_end` (nothing else does — the section is NOBITS,
+  so it is not in the loaded image, and on hardware its words come up
+  holding power-up BSRAM contents while simulation reads them as zero), set
+  `sp`
   (`0x4000`, top of the 16 KiB D-mem — stack grows down), `call main`,
   halt loop. `sp` has to be a real address: the D-mem decodes only
   `ADDR_W` bits, so a pointer above the top aliases silently back into
@@ -114,10 +118,14 @@ interlock covers register and load-use hazards, so a memory-heavy
 program like quicksort is a real correctness check: it exercises
 fetch / decode / execute AND the data path (array loads/stores, stack
 spill/fill from recursion, branches on loaded values). The
-retire+writeback log (`a0` at exit) is the observable result. `.bss`
-is **not** zeroed at runtime (`start.S` does not clear it), so state
-that needs a known value lives in an initialized `.data` array, not in
-uninitialized `.bss` globals.
+retire+writeback log (`a0` at exit) is the observable result. `.bss` **is** zeroed
+at runtime as of 2026-08-25 — `start.S` clears it from `__bss_start` to
+`__bss_end` before calling `main`. Until then nothing did, and since the
+section is NOBITS it is not in the loaded image either, so on hardware
+uninitialised globals came up holding power-up BSRAM contents while
+simulation read them as zero. Programs written before that put state in an
+initialised `.data` array to work around it, which is still the more
+explicit choice for anything a test depends on.
 
 `-march=rv32imac` does not emit Zilx indexed loads, so `partition()`
 hand-encodes `lxs.w` via `.insn`; the hand-crafted `sim/imem.hex` /

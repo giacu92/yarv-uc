@@ -96,6 +96,14 @@ kept only for peripherals. Implemented so far:
   execute) resolves entry / `mret` / interrupt redirect and drives the
   CSR trap-write bundle.
 
+Implemented since: an **instruction access fault** (mcause=1, mtval = the
+unfetchable PC) for a fetch outside the implemented I-mem — before it, the
+memory decoded only its own address bits and the read aliased back into the
+image, so a runaway redirect kept executing plausible code in silence.
+Instruction-address-misaligned stays absent by design: with the C extension
+IALIGN is 16, `jalr` clears bit 0 by definition and branch offsets are
+even, so an odd instruction address cannot occur.
+
 Still deferred: **S/U mode** + delegation (machine mode only, no
 medeleg/mideleg, no PMP), **instruction-access-fault** /
 instruction-address-misaligned traps, an **illegal-CSR-access** trap
@@ -204,7 +212,8 @@ entry, including the `wfi` wake on an external interrupt.
 
 Also still open: a vectored-mode interrupt co-sim (direct mode is
 covered). S/U mode, delegation, PMP, instruction-access-fault, and
-illegal-CSR-access traps remain deferred. The 40 MHz re-target that used
+illegal-CSR-access traps remain deferred (the access fault is now
+implemented — see Status). The 40 MHz re-target that used
 to sit on this list is **done** (see the timing note above).
 
 Silicon bring-up (2026-08-25) turned up five defects worth recording,
@@ -224,6 +233,13 @@ because four of them simulation structurally could not show:
   the link scripts, so any constant up to 8 bytes read as 0 at runtime
   while the same constant folded at compile time read correctly;
 - the UART's dropped write described above.
+
+Two of those are now fixed at the root rather than worked around: `.bss` is
+zeroed by `start.S` from linker symbols (it used to hold power-up BSRAM
+contents on hardware while reading as zero in simulation, which is how a
+trap probe once reported success without any trap), and a fetch outside the
+I-mem raises a real trap instead of relying on the ROM being padded with
+`ebreak`.
 
 The pattern they shared: when hardware and simulation disagree, suspect a
 value whose *lifetime* differs between the two, and instrument so that the
