@@ -271,9 +271,9 @@ module decode_stage (
                         end
                     end
                     3'b001: begin  // c.jal (RV32) -> jal x1, offset
-                        // CJ offset scramble (verified vs c.j 16 = 0xA805):
+                        // CJ offset scramble (verified vs c.j 16 = 0xA801):
                         // imm[11]=c[12] imm[10]=c[8] imm[9]=c[10] imm[8]=c[9]
-                        // imm[7]=c[2]  imm[6]=c[7] imm[5]=c[6] imm[4]=c[11]
+                        // imm[7]=c[6]  imm[6]=c[7] imm[5]=c[2] imm[4]=c[11]
                         // imm[3]=c[5]  imm[2]=c[4] imm[1]=c[3]  imm[0]=0.
                         logic [11:0] joff;
                         joff = {
@@ -281,9 +281,9 @@ module decode_stage (
                             c[8],
                             c[10],
                             c[9],
-                            c[2],
-                            c[7],
                             c[6],
+                            c[7],
+                            c[2],
                             c[11],
                             c[5],
                             c[4],
@@ -304,9 +304,10 @@ module decode_stage (
                     3'b011: begin  // c.addi16sp (rd==x2) / c.lui (else)
                         if (rd5 == 5'd2) begin
                             // nzimm[9]=c[12], [8:7]=c[4:3], [6]=c[5],
-                            // [5]=c[2], [4:0]=0 (mult of 16). Illegal if 0.
+                            // [5]=c[2], [4]=c[6], [3:0]=0 (mult of 16).
+                            // Illegal if 0.
                             logic [9:0] nz;
-                            nz = {c[12], c[4:3], c[5], c[2], 5'b0};
+                            nz = {c[12], c[4:3], c[5], c[2], c[6], 4'b0};
                             if (nz != 10'd0) begin
                                 off = {{22{nz[9]}}, nz};
                                 res = mk_i(OPC_OP_IMM, 5'd2, 5'd2, 3'b000, off);
@@ -367,15 +368,16 @@ module decode_stage (
                         endcase
                     end
                     3'b101: begin  // c.j -> jal x0, offset
+                        // CJ offset scramble (see c.jal above).
                         logic [11:0] joff;
                         joff = {
                             c[12],
                             c[8],
                             c[10],
                             c[9],
-                            c[2],
-                            c[7],
                             c[6],
+                            c[7],
+                            c[2],
                             c[11],
                             c[5],
                             c[4],
