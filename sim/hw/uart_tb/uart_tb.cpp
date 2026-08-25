@@ -9,7 +9,8 @@
 //   - TX FIFO: N writes with no polling in between ship N frames, in
 //     order, back-to-back.
 //   - TX_READY drops when the TX FIFO is full, and a write to a full FIFO
-//     is dropped (still OKAY on the bus, per the register-map contract).
+//     is held until room appears rather than dropped: it takes far longer
+//     than an ordinary write and the byte still ships, in order.
 //   - RX FIFO: N frames arriving back-to-back with no software read are
 //     all retained, in order, with RX_OVERRUN clear.
 //   - RX overrun: the frame that arrives with the FIFO full is dropped and
@@ -128,7 +129,9 @@ static void idle() {
 }
 
 // Single-beat AXI4-Lite write, AW and W together, B consumed.
-static void axi_write(uint32_t addr, uint32_t data) {
+// Returns the number of cycles the transaction took, so a test can tell a
+// write that completed immediately from one the peripheral held.
+static int axi_write_timed(uint32_t addr, uint32_t data, int guard_cycles) {
     top->awaddr  = addr;
     top->awvalid = 1;
     top->wdata   = data;
@@ -136,17 +139,24 @@ static void axi_write(uint32_t addr, uint32_t data) {
     top->wvalid  = 1;
     top->bready  = 1;
     bool aw = false, w = false, b = false;
-    for (int guard = 0; guard < 32 && !(aw && w && b); ++guard) {
+    int cycles = 0;
+    for (int guard = 0; guard < guard_cycles && !(aw && w && b); ++guard) {
         top->eval();
         if (top->awvalid && top->awready) aw = true;
         if (top->wvalid && top->wready) w = true;
         if (top->bvalid && top->bready) b = true;
         tick();
+        ++cycles;
         if (aw) top->awvalid = 0;
         if (w) top->wvalid = 0;
     }
     CHECK(aw && w && b, "axi_write did not complete");
     idle();
+    return cycles;
+}
+
+static void axi_write(uint32_t addr, uint32_t data) {
+    axi_write_timed(addr, data, 32);
 }
 
 // Single-beat AXI4-Lite read.
@@ -243,17 +253,21 @@ int main(int argc, char** argv) {
     st = axi_read(REG_STATUS);
     CHECK_EQ(st & ST_TX_READY, 0, "TX_READY clear once the TX FIFO is full");
     CHECK(queued.size() >= (size_t)FIFO_DEPTH, "at least DEPTH bytes accepted");
-    // A write to a full FIFO must still complete on the bus, and be dropped.
-    axi_write(REG_TXDATA, 0xFF);
-    // Drain: every accepted byte ships, in order, and never the 0xFF.
+    // A write to a full FIFO is held, not dropped: it completes only after
+    // the engine ships a byte and frees a slot, so it takes far longer than
+    // an ordinary write (a handful of cycles) and the byte survives.
+    int held = axi_write_timed(REG_TXDATA, 0xFF, 40 * BIT_CYCLES);
+    CHECK(held > 8, "write to a full TX FIFO is held until room appears");
+    queued.push_back(0xFF);
+    // Drain: every byte ships, in order, including the held one.
     for (size_t i = 0; i < queued.size(); ++i) {
         int got = tx_frame();
-        CHECK_EQ(got, queued[i], "TX FIFO drains in order, dropped byte absent");
+        CHECK_EQ(got, queued[i], "TX FIFO drains in order, held byte included");
     }
     st = axi_read(REG_STATUS);
     CHECK_EQ(st & ST_TX_READY, ST_TX_READY, "TX_READY back after the drain");
     for (int i = 0; i < 2 * BIT_CYCLES; ++i) tick();  // room for a stray frame
-    CHECK_EQ(tx_backlog(), 0, "no extra frame shipped (0xFF really dropped)");
+    CHECK_EQ(tx_backlog(), 0, "no extra frame beyond the queued bytes");
 
     // ---- 4. RX FIFO: burst with no reads -------------------------------
     // The regression case: 8 frames back-to-back, software asleep.

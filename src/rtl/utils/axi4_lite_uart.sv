@@ -21,8 +21,12 @@ import rv32_pkg::*;
 * the LSU/bridge only ever issues single-beat, word-aligned accesses):
 *
 *   0x00 TXDATA  (W)  : write byte[7:0] -> pushes into the TX FIFO.
-*                        Ignored (no effect, no error) if the TX FIFO is
-*                        full — poll STATUS.TX_READY first. Read returns 0.
+*                        If the FIFO is full the write is HELD, not
+*                        dropped: AW/W are taken but B is withheld until a
+*                        byte ships and room appears (at most one frame
+*                        time). Software that polls STATUS.TX_READY first
+*                        never sees the stall; software that does not still
+*                        loses no data, it only waits. Read returns 0.
 *   0x04 RXDATA  (R)  : read byte[7:0] at the head of the RX FIFO and POP
 *                        it (read-to-consume, standard UART RX semantics).
 *                        Read when RX_READY=0 pops nothing and returns the
@@ -226,7 +230,25 @@ module axi4_lite_uart #(
     logic [       2:0] awaddr_word_q;
     logic              bvalid_q;
 
-    assign axi.awready = !aw_seen_q && !bvalid_q;
+    // AWREADY also drops for a TXDATA write while the TX FIFO is full: the
+    // address phase is refused outright, so the transaction never enters
+    // the peripheral and the backpressure is visible to the master at the
+    // first handshake rather than at B. A slave may derive READY from the
+    // request payload; the address is only meaningful while AWVALID is
+    // high, and the handshake needs both.
+    //
+    // Only TXDATA is gated. Blocking every write while the FIFO is full
+    // would also block CTRL and BAUDDIV, i.e. the registers software would
+    // use to change the situation.
+    //
+    // WREADY is not gated: the write data phase carries no address, so
+    // there is nothing to decode -- refusing it would mean refusing every
+    // write. Data may therefore be accepted before the address; the
+    // do_write hold below covers that ordering.
+    wire [2:0] awaddr_in = axi.awaddr[4:2];
+    wire tx_full_block_aw = (awaddr_in == REG_TXDATA) && !tx_ready;
+
+    assign axi.awready = !aw_seen_q && !bvalid_q && !tx_full_block_aw;
     assign axi.wready  = !w_seen_q && !bvalid_q;
 
     wire              aw_hs = axi.awvalid && axi.awready;
@@ -234,7 +256,6 @@ module axi4_lite_uart #(
 
     wire              aw_present = aw_seen_q || aw_hs;
     wire              w_present = w_seen_q || w_hs;
-    wire              do_write = aw_present && w_present && !bvalid_q;
 
     wire [       2:0] waddr_eff = aw_hs ? axi.awaddr[4:2] : awaddr_word_q;
     wire [DATA_W-1:0] wdata_eff = w_hs ? axi.wdata : wdata_q;
@@ -243,11 +264,28 @@ module axi4_lite_uart #(
     assign axi.bresp  = 2'b00;  // OKAY
     wire b_hs = axi.bvalid && axi.bready;
 
-    // A TX push this cycle: only accepted (has effect) when the TX FIFO has
-    // room; otherwise the write still completes on the AXI side (B still
-    // returns OKAY) but the byte is dropped, per the register-map contract
-    // above.
-    wire tx_push = do_write && (waddr_eff == REG_TXDATA) && tx_ready;
+    // A TXDATA write with no room is held rather than dropped. AWREADY
+    // above refuses the address phase, and this term covers the case where
+    // the data phase arrived first: the write commits -- with B, and with
+    // the push -- only once the engine has shipped a byte and freed a slot.
+    // The wait is bounded by one frame time, since the TX engine drains the
+    // FIFO on its own. Nothing else can be issued meanwhile: a single
+    // outstanding transaction is the contract, and the FIFO only ever fills
+    // from these writes, so once a slot is seen it stays.
+    //
+    // Dropping was the earlier contract, and it made a lost byte
+    // indistinguishable from a byte that was never written: output simply
+    // came out truncated, with the bus reporting OKAY for a write that had
+    // no effect. Holding turns that silent data loss into backpressure the
+    // master can see. Note it costs interrupt latency in the pathological
+    // case: an interrupt is taken at a retire boundary, so a store parked
+    // on a full FIFO delays entry until the write completes.
+    wire tx_addr_sel = (waddr_eff == REG_TXDATA);
+    wire tx_write_hold = tx_addr_sel && !tx_ready;
+
+    wire do_write = aw_present && w_present && !bvalid_q && !tx_write_hold;
+
+    wire tx_push = do_write && tx_addr_sel;
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
