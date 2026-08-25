@@ -5,23 +5,35 @@
 import rv32_pkg::*;
 
 /**
-* UART peripheral (AXI4-Lite slave), 8N1, no FIFO (single-buffer TX/RX).
+* UART peripheral (AXI4-Lite slave), 8N1, with TX and RX FIFOs.
+*
+* WHY FIFOS: with a single-byte RX buffer, a full-duplex echo program
+* loses input. Echoing a byte with a blocking "poll TX_READY then write
+* TXDATA" costs a whole frame time (87 us at 115200), and a terminal that
+* ships a typed line in one burst delivers the next byte 87 us after the
+* previous one — so every byte that arrives while software is stuck in the
+* echo is dropped. That is not a corner case: it is what pasting a line
+* into a serial console does, and it made YarvMon look like it ignored
+* every command. An RX FIFO absorbs the burst; the TX FIFO stops the echo
+* from blocking in the first place. See sim/hw/uart_tb.
 *
 * Register map (word-addressed, byte offsets from the peripheral's base;
 * the LSU/bridge only ever issues single-beat, word-aligned accesses):
 *
-*   0x00 TXDATA  (W)  : write byte[7:0] -> pushes into the TX shift buffer.
-*                        Ignored (no effect, no error) if TX is busy — poll
-*                        STATUS.TX_READY first. Read returns 0.
-*   0x04 RXDATA  (R)  : read byte[7:0] of the last received char and CLEARS
-*                        STATUS.RX_READY (read-to-clear, standard UART RX
-*                        semantics). Read when RX_READY=0 returns stale
-*                        data (undefined from the software contract).
-*   0x08 STATUS  (R)  : bit0 TX_READY  (1 = TX buffer free, can accept a byte)
-*                        bit1 RX_READY  (1 = a received byte is waiting)
-*                        bit2 RX_OVERRUN (1 = a byte arrived while RX_READY
-*                             was still set, i.e. software didn't read in
-*                             time; sticky, cleared by reading RXDATA)
+*   0x00 TXDATA  (W)  : write byte[7:0] -> pushes into the TX FIFO.
+*                        Ignored (no effect, no error) if the TX FIFO is
+*                        full — poll STATUS.TX_READY first. Read returns 0.
+*   0x04 RXDATA  (R)  : read byte[7:0] at the head of the RX FIFO and POP
+*                        it (read-to-consume, standard UART RX semantics).
+*                        Read when RX_READY=0 pops nothing and returns the
+*                        stale head (undefined from the software contract).
+*   0x08 STATUS  (R)  : bit0 TX_READY  (1 = TX FIFO has room for a byte)
+*                        bit1 RX_READY  (1 = at least one received byte is
+*                             waiting in the RX FIFO)
+*                        bit2 RX_OVERRUN (1 = a byte arrived while the RX
+*                             FIFO was full, i.e. software didn't drain in
+*                             time; the byte is dropped. Sticky, cleared by
+*                             reading RXDATA)
 *   0x0C CTRL    (RW) : bit0 TX_IE (TX-ready interrupt enable)
 *                        bit1 RX_IE (RX-ready interrupt enable)
 *   0x10 BAUDDIV (RW) : clk_i cycles per bit - 1 (16-bit). Reset value is
@@ -34,16 +46,20 @@ import rv32_pkg::*;
 *
 * Interrupt: uart_irq_o is LEVEL-SENSITIVE, no separate clear register.
 *   uart_irq_o = (STATUS.TX_READY & CTRL.TX_IE) | (STATUS.RX_READY & CTRL.RX_IE)
-* Software services it the same way it would poll: write TXDATA (which
-* drops TX_READY until the byte ships) or read RXDATA (which drops
-* RX_READY). This mirrors msip_peri's philosophy of no hidden edge-detect
-* state, at the cost of the ISR needing to actually drain the condition
-* (standard for a non-FIFO UART: if you don't feed TX / drain RX, the
-* interrupt stays asserted, which is correct behaviour, not a bug).
+* Both enables reset to 0, so a polling program (YarvMon) never sees an
+* interrupt until it writes CTRL. Software services the IRQ the same way
+* it would poll: fill the TX FIFO (which drops TX_READY once full) or read
+* RXDATA until the RX FIFO drains (which drops RX_READY). This mirrors
+* msip_peri's philosophy of no hidden edge-detect state, at the cost of
+* the ISR needing to actually drain the condition — if you don't, the
+* interrupt stays asserted, which is correct behaviour, not a bug.
+* NOTE: TX_IE therefore fires on "FIFO not full", i.e. almost always;
+* enable it only while you have data queued to send.
 *
 * TX: 1 start bit, 8 data bits (LSB first), 1 stop bit, no parity. Shifts
 * out on the falling edge of the baud tick counter (LSB-first shift
-* register), busy-flagged for the whole frame (10 bit-times).
+* register). The engine pulls its next byte from the TX FIFO whenever it
+* is idle, so queued bytes ship back-to-back with no software involvement.
 *
 * RX: start-bit detected on rxd falling edge while idle; samples each
 * subsequent bit at mid-period (half the baud divisor after the edge /
@@ -70,7 +86,12 @@ import rv32_pkg::*;
 
 module axi4_lite_uart #(
     parameter int unsigned CLK_FREQ_HZ = 40e6,
-    parameter int unsigned BAUD_RATE   = 115200
+    parameter int unsigned BAUD_RATE = 115200,
+    // FIFO depths, in bytes. Must be powers of two >= 2 (the pointer
+    // arithmetic below relies on it). 16 bytes of RX covers a pasted
+    // command line at 115200 against a byte-at-a-time echo.
+    parameter int unsigned TX_FIFO_DEPTH = 16,
+    parameter int unsigned RX_FIFO_DEPTH = 16
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -124,12 +145,9 @@ module axi4_lite_uart #(
     tx_state_e       tx_state_q;
     logic      [7:0] tx_shift_q;
     logic      [2:0] tx_bit_cnt_q;
-    logic            tx_pending_q;  // a byte is latched, waiting to start
-    logic      [7:0] tx_pending_data_q;
     logic            txd_q;
 
     wire             tx_idle = (tx_state_q == TX_IDLE);
-    wire             tx_ready = tx_idle & ~tx_pending_q;  // STATUS.TX_READY
 
     assign txd_o = txd_q;
 
@@ -147,11 +165,52 @@ module axi4_lite_uart #(
     logic      [ 7:0] rx_shift_q;
     logic      [ 2:0] rx_bit_cnt_q;
     logic      [15:0] rx_cnt_q;  // per-bit sample counter (this state)
-    logic      [ 7:0] rx_data_q;  // last completed byte (RXDATA)
-    logic             rx_ready_q;  // STATUS.RX_READY
     logic             rx_overrun_q;  // STATUS.RX_OVERRUN (sticky)
 
     wire              rx_idle = (rx_state_q == RX_IDLE);
+
+    // =================================================================
+    // TX / RX FIFOs.
+    //
+    // Plain synchronous ring buffers: one extra pointer bit distinguishes
+    // full from empty (wrap bit differs, index equal => full; both equal
+    // => empty), which is why the depths must be powers of two. Both are
+    // shallow enough that the synthesiser maps them to LUT RAM / flops,
+    // not BSRAM (the BSRAMs are spoken for by I-mem, D-mem and the
+    // regfile).
+    //
+    // The head of each FIFO is read combinationally: the TX engine needs
+    // its next byte in the same cycle it leaves TX_IDLE, and an RXDATA
+    // read must return the head in the cycle the AR handshake latches
+    // rdata_q (accept = commit, like the rest of the bus layer).
+    // =================================================================
+    localparam int TX_PTR_W = $clog2(TX_FIFO_DEPTH);
+    localparam int RX_PTR_W = $clog2(RX_FIFO_DEPTH);
+
+    logic [7:0] tx_fifo_q[TX_FIFO_DEPTH];
+    logic [7:0] rx_fifo_q[RX_FIFO_DEPTH];
+
+    logic [TX_PTR_W:0] tx_wptr_q, tx_rptr_q;
+    logic [RX_PTR_W:0] rx_wptr_q, rx_rptr_q;
+
+    wire tx_fifo_empty = (tx_wptr_q == tx_rptr_q);
+    wire tx_fifo_full = (tx_wptr_q[TX_PTR_W] != tx_rptr_q[TX_PTR_W]) &&
+        (tx_wptr_q[TX_PTR_W-1:0] == tx_rptr_q[TX_PTR_W-1:0]);
+
+    wire rx_fifo_empty = (rx_wptr_q == rx_rptr_q);
+    wire rx_fifo_full = (rx_wptr_q[RX_PTR_W] != rx_rptr_q[RX_PTR_W]) &&
+        (rx_wptr_q[RX_PTR_W-1:0] == rx_rptr_q[RX_PTR_W-1:0]);
+
+    wire [7:0] tx_fifo_head = tx_fifo_q[tx_rptr_q[TX_PTR_W-1:0]];
+    wire [7:0] rx_fifo_head = rx_fifo_q[rx_rptr_q[RX_PTR_W-1:0]];
+
+    // STATUS flags (see the register map in the header).
+    wire tx_ready = !tx_fifo_full;
+    wire rx_ready = !rx_fifo_empty;
+
+    // The TX engine consumes a byte the cycle it is idle with the FIFO
+    // non-empty; the RX engine produces one at the end of a frame.
+    wire tx_fifo_pop = tx_idle && !tx_fifo_empty;
 
     // =================================================================
     // CTRL
@@ -184,10 +243,10 @@ module axi4_lite_uart #(
     assign axi.bresp  = 2'b00;  // OKAY
     wire b_hs = axi.bvalid && axi.bready;
 
-    // A TX push this cycle: only accepted (has effect) when TX_READY and
-    // nothing already pending; otherwise the write still completes on the
-    // AXI side (B still returns OKAY) but the byte is dropped, per the
-    // register-map contract above.
+    // A TX push this cycle: only accepted (has effect) when the TX FIFO has
+    // room; otherwise the write still completes on the AXI side (B still
+    // returns OKAY) but the byte is dropped, per the register-map contract
+    // above.
     wire tx_push = do_write && (waddr_eff == REG_TXDATA) && tx_ready;
 
     always_ff @(posedge clk_i) begin
@@ -268,18 +327,22 @@ module axi4_lite_uart #(
     always_comb begin
         unique case (axi.araddr[4:2])
             REG_TXDATA:  rdata_mux = '0;
-            REG_RXDATA:  rdata_mux = {24'b0, rx_data_q};
-            REG_STATUS:  rdata_mux = {29'b0, rx_overrun_q, rx_ready_q, tx_ready};
+            REG_RXDATA:  rdata_mux = {24'b0, rx_fifo_head};
+            REG_STATUS:  rdata_mux = {29'b0, rx_overrun_q, rx_ready, tx_ready};
             REG_CTRL:    rdata_mux = {30'b0, rx_ie_q, tx_ie_q};
             REG_BAUDDIV: rdata_mux = {16'b0, div_q};
             default:     rdata_mux = '0;
         endcase
     end
 
-    // RXDATA read-to-clear: consumed on the AR handshake that targets it
-    // (same cycle the read is launched — matches the "accept = commit"
-    // timing the rest of the bus layer uses).
-    wire rx_read_clear = ar_hs && (axi.araddr[4:2] == REG_RXDATA);
+    // RXDATA read: consumed on the AR handshake that targets it (same
+    // cycle the read is launched — matches the "accept = commit" timing the
+    // rest of the bus layer uses). rdata_q latches rx_fifo_head in that
+    // same cycle, so the popped byte is the one the master receives.
+    // A read of an empty FIFO pops nothing (no pointer underflow) but
+    // still acknowledges the overrun latch.
+    wire rx_read = ar_hs && (axi.araddr[4:2] == REG_RXDATA);
+    wire rx_fifo_pop = rx_read && rx_ready;
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
@@ -300,33 +363,23 @@ module axi4_lite_uart #(
     // =================================================================
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            tx_state_q        <= TX_IDLE;
-            tx_shift_q        <= '0;
-            tx_bit_cnt_q      <= '0;
-            tx_pending_q      <= 1'b0;
-            tx_pending_data_q <= '0;
-            txd_q             <= 1'b1;  // idle line high
-            tx_baud_cnt_q     <= '0;
+            tx_state_q    <= TX_IDLE;
+            tx_shift_q    <= '0;
+            tx_bit_cnt_q  <= '0;
+            txd_q         <= 1'b1;  // idle line high
+            tx_baud_cnt_q <= '0;
         end else begin
-            // Latch the pushed byte. tx_pending_q is a flop, so the TX_IDLE
-            // arm below sees it the NEXT cycle and starts the frame then --
-            // a push costs one cycle of latency before the start bit. The
-            // explicit pending register (rather than starting the frame
-            // combinationally) keeps the push path off the TX state machine
-            // and stays correct if tx_push's gating ever changes.
-            if (tx_push) begin
-                tx_pending_data_q <= wdata_eff[7:0];
-                tx_pending_q      <= 1'b1;
-            end
-
             unique case (tx_state_q)
                 TX_IDLE: begin
                     tx_baud_cnt_q <= '0;
-                    if (tx_pending_q) begin
-                        tx_shift_q   <= tx_pending_data_q;
-                        tx_pending_q <= 1'b0;
-                        tx_state_q   <= TX_START;
-                        txd_q        <= 1'b0;  // start bit
+                    // Pull the next queued byte and start its frame. The
+                    // FIFO head is combinational, so a byte pushed while
+                    // the engine is idle starts one cycle later (the push
+                    // is registered), same latency as before.
+                    if (tx_fifo_pop) begin
+                        tx_shift_q <= tx_fifo_head;
+                        tx_state_q <= TX_START;
+                        txd_q      <= 1'b0;  // start bit
                     end
                 end
 
@@ -372,6 +425,37 @@ module axi4_lite_uart #(
     end
 
     // =================================================================
+    // FIFO storage and pointers.
+    //
+    // rx_frame_done is the end of a received frame (mid-stop-bit); it
+    // pushes when there is room and latches RX_OVERRUN when there is not.
+    // A pop that retires a byte in the same cycle frees the slot, so the
+    // frame is still accepted -- no spurious overrun on a full FIFO that
+    // software is draining at that exact moment.
+    // =================================================================
+    wire rx_frame_done = (rx_state_q == RX_STOP) && (rx_cnt_q == div_q);
+    wire rx_fifo_push = rx_frame_done && (!rx_fifo_full || rx_fifo_pop);
+
+    always_ff @(posedge clk_i) begin
+        if (tx_push) tx_fifo_q[tx_wptr_q[TX_PTR_W-1:0]] <= wdata_eff[7:0];
+        if (rx_fifo_push) rx_fifo_q[rx_wptr_q[RX_PTR_W-1:0]] <= rx_shift_q;
+    end
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) begin
+            tx_wptr_q <= '0;
+            tx_rptr_q <= '0;
+            rx_wptr_q <= '0;
+            rx_rptr_q <= '0;
+        end else begin
+            if (tx_push) tx_wptr_q <= tx_wptr_q + 1'b1;
+            if (tx_fifo_pop) tx_rptr_q <= tx_rptr_q + 1'b1;
+            if (rx_fifo_push) rx_wptr_q <= rx_wptr_q + 1'b1;
+            if (rx_fifo_pop) rx_rptr_q <= rx_rptr_q + 1'b1;
+        end
+    end
+
+    // =================================================================
     // RX engine
     // =================================================================
     wire [15:0] rx_half_div = {1'b0, div_q[15:1]};  // div_q/2, mid-bit offset
@@ -382,15 +466,18 @@ module axi4_lite_uart #(
             rx_shift_q   <= '0;
             rx_bit_cnt_q <= '0;
             rx_cnt_q     <= '0;
-            rx_data_q    <= '0;
-            rx_ready_q   <= 1'b0;
             rx_overrun_q <= 1'b0;
         end else begin
-            // RXDATA read clears RX_READY (and the overrun latch — a
-            // fresh read acknowledges the backlog).
-            if (rx_read_clear) begin
-                rx_ready_q   <= 1'b0;
+            // An RXDATA read acknowledges the overrun backlog. The byte
+            // itself is popped by the FIFO pointer block below.
+            if (rx_read) begin
                 rx_overrun_q <= 1'b0;
+            end
+
+            // A completed frame that finds the FIFO full is dropped and
+            // latches RX_OVERRUN (rx_fifo_push below is the accepted case).
+            if (rx_frame_done && rx_fifo_full && !rx_fifo_pop) begin
+                rx_overrun_q <= 1'b1;
             end
 
             unique case (rx_state_q)
@@ -437,17 +524,12 @@ module axi4_lite_uart #(
 
                 RX_STOP: begin
                     if (rx_cnt_q == div_q) begin
+                        // Stop bit not checked (no framing-error flag, see
+                        // header comment) — commit the byte regardless.
+                        // The push itself happens in the FIFO blocks below,
+                        // keyed off rx_frame_done.
                         rx_cnt_q   <= '0;
                         rx_state_q <= RX_IDLE;
-                        // Stop bit not checked (no framing-error flag,
-                        // see header comment) — commit the byte
-                        // regardless.
-                        if (rx_ready_q && !rx_read_clear) begin
-                            // Previous byte was never read: overrun.
-                            rx_overrun_q <= 1'b1;
-                        end
-                        rx_data_q  <= rx_shift_q;
-                        rx_ready_q <= 1'b1;
                     end else begin
                         rx_cnt_q <= rx_cnt_q + 16'd1;
                     end
@@ -461,7 +543,7 @@ module axi4_lite_uart #(
     // =================================================================
     // Interrupt (level-sensitive, see header comment).
     // =================================================================
-    assign uart_irq_o = (tx_ready & tx_ie_q) | (rx_ready_q & rx_ie_q);
+    assign uart_irq_o = (tx_ready & tx_ie_q) | (rx_ready & rx_ie_q);
 
 endmodule
 
