@@ -33,6 +33,12 @@ create_clock -name clk25 -period 40 [get_ports {clk_i}]
 # board) as asynchronous to the fabric clocks.
 set_false_path -from [get_ports {rst_i}]
 
+# UART RX pin: driven by a far-end transmitter with its own oscillator, so
+# it is asynchronous to clk_core by definition. top_module double-flops it
+# before the UART's sampler, which is the synchronizer that makes the
+# crossing safe; there is no launch clock to relate it to, so cut it.
+set_false_path -from [get_ports {uart_rxd_i}]
+
 # Debug LEDs are not timing-critical (human eye).
 set_false_path -to [get_ports {led_o[*]}]
 
