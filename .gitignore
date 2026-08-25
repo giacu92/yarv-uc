@@ -54,3 +54,6 @@ sim/cosim/ecall/rtl.trace
 sim/cosim/__pycache__/
 sim/cosim/ecall/__pycache__/
 
+
+# RVC scramble-bit oracle build artefacts (regenerable)
+sim/sw_rvc_scramble/build/
