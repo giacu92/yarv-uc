@@ -160,13 +160,28 @@ module execute_stage (
     // =================================================================
     // Multi-cycle op control: DIV/REM and memory (LSU) share one FSM.
     //
-    // EX_IDLE    : ready. A DIV/REM launches (alu_start) -> EX_DIV_BUSY.
-    //              A mem op launches (mem_launch: wvalid=1 && bridge
-    //              wready) -> EX_MEM_WAIT. Single-cycle ALU/branch ops
-    //              retire the same cycle and stay in EX_IDLE.
-    // EX_DIV_BUSY: hold the pipe until the ALU asserts result_valid_o.
-    // EX_MEM_WAIT: hold the pipe until the load read response (rvalid) or
-    //              the store write-ack (bvalid) retires the op.
+    // EX_IDLE      : ready. A DIV/REM launches (alu_start) -> EX_DIV_BUSY.
+    //                A mem op CAPTURES its address / write data / strobes
+    //                into flops (mem_stage_req) -> EX_MEM_LAUNCH; nothing
+    //                is driven on the bus this cycle. Single-cycle
+    //                ALU/branch ops retire the same cycle and stay here.
+    // EX_MEM_LAUNCH: drive the request from those flops until the slave
+    //                accepts it. A store retires on the accept (posted);
+    //                a load goes on to EX_MEM_WAIT.
+    // EX_DIV_BUSY  : hold the pipe until the ALU asserts result_valid_o.
+    // EX_MEM_WAIT  : hold the pipe until the load read response (rvalid)
+    //                retires the op.
+    //
+    // Why the capture cycle exists (2026-08-25). Driving the request
+    // straight from alu_result put the whole
+    //   regfile -> forward mux -> adder -> byte-strobe decode -> memory port
+    // chain in one cycle, and the operands come from the execute->decode
+    // forward path, so that is the design's critical path with the bus
+    // hanging off the end of it. Registering address, data and strobes ends
+    // that chain at a flop and starts the bus from one. It costs one cycle
+    // per memory access, which is the price of a launch path that is a flop
+    // output rather than the tail of the deepest combinational chain in the
+    // machine.
     //
     // de_i is held stable across the busy/wait states by decode's stall
     // (stall_o below holds decode's D/E register), so the ALU result (EA)
@@ -206,6 +221,7 @@ module execute_stage (
 
     typedef enum logic [1:0] {
         EX_IDLE,
+        EX_MEM_LAUNCH,
         EX_DIV_BUSY,
         EX_MEM_WAIT
     } ex_state_e;
@@ -218,20 +234,30 @@ module execute_stage (
     logic            alu_result_valid;
     logic [XLEN-1:0] alu_result;
 
-    // Mem launch: assert wvalid for one cycle in EX_IDLE on a valid,
-    // aligned mem op. The bridge is idle (wready=1) whenever the LSU is
-    // idle (single-outstanding), so the launch handshakes the same cycle
-    // and the FSM moves to EX_MEM_WAIT.
-    logic            mem_launch;
-    assign mem_launch = de_i.valid & is_mem_op & ~mem_misaligned &
+    // Capture pulse: a valid, aligned mem op in EX_IDLE latches its
+    // address / write data / strobes and moves to EX_MEM_LAUNCH. No bus
+    // activity this cycle — that is the whole point of the stage.
+    logic            mem_stage_req;
+    assign mem_stage_req = de_i.valid & is_mem_op & ~mem_misaligned &
         (ex_state_q == EX_IDLE) & ~freeze & ~trap_redirect_req;
 
-    // Effective address selects the LSU target: D-mem (addr[PERI_ADDR_BIT]=0)
-    // or the peri bridge (=1). alu_result (the EA) is held stable through
-    // EX_MEM_WAIT (decode stalls de_i), so this one combinational bit drives
-    // both the request target and the response source — no tracking flops
-    // needed (the LSU is single-outstanding).
-    wire is_peri = alu_result[PERI_ADDR_BIT];
+    // Registered request: address, write data, byte strobes and the peri/
+    // D-mem target bit, all sampled in the capture cycle. Everything the
+    // bus and the response path need comes from here, so nothing downstream
+    // depends on alu_result still being live and settled in a later cycle.
+    logic [      XLEN-1:0] mem_addr_q;
+    logic [      XLEN-1:0] mem_wdata_q;
+    logic [STRB_WIDTH-1:0] mem_wstrb_q;
+    logic                  mem_is_peri_q;
+
+    // Drive the request while in EX_MEM_LAUNCH, until the slave accepts.
+    logic                  mem_launch;
+    assign mem_launch = (ex_state_q == EX_MEM_LAUNCH);
+
+    // Target select comes from the captured address bit, not from a live
+    // combinational one: it steers both the request and the response, and
+    // the response arrives cycles after the address was computed.
+    wire is_peri = mem_is_peri_q;
 
     // Effective LSU response: the selected target's rsp (Harvard dmem/peri).
     // All launch/done/load logic reads this so a peri op does not falsely
@@ -268,20 +294,22 @@ module execute_stage (
     // so decode advances (mem_running falls away the cycle mem_done=1).
     logic mem_running;
     assign mem_running = (ex_state_q == EX_MEM_WAIT) & ~mem_done;
-    assign stall_o = alu_start | div_running | (mem_launch & ~store_done) | mem_running | stall_i |
-        wfi_stall;
+    assign stall_o = alu_start | div_running | mem_stage_req | (mem_launch & ~store_done) |
+        mem_running | stall_i | wfi_stall;
 
     always_comb begin
         ex_state_d = ex_state_q;
         unique case (ex_state_q)
             EX_IDLE: begin
                 if (alu_start) ex_state_d = EX_DIV_BUSY;
-                else if (mem_launch_hs)
-                    ex_state_d = de_i.mem_read ? EX_MEM_WAIT : EX_IDLE;  // store retires now
+                else if (mem_stage_req) ex_state_d = EX_MEM_LAUNCH;
             end
+            EX_MEM_LAUNCH:
+            if (mem_launch_hs)
+                ex_state_d = de_i.mem_read ? EX_MEM_WAIT : EX_IDLE;  // store retires now
             EX_DIV_BUSY: if (alu_result_valid) ex_state_d = EX_IDLE;
             EX_MEM_WAIT: if (mem_done) ex_state_d = EX_IDLE;
-            default:     ex_state_d = EX_IDLE;
+            default: ex_state_d = EX_IDLE;
         endcase
     end
 
@@ -420,31 +448,9 @@ module execute_stage (
     // cycle regardless of its depth.
     //
     // Latching also shortens the response-cycle path to a flop output.
-    logic [1:0] mem_addr_lo_q;
-
-    // Latched on the accept handshake, not on the request being asserted:
-    // the request can be held for several cycles while the slave is busy,
-    // and the accept edge is the one the memory samples the address on.
-    always_ff @(posedge clk_i) begin
-        if (!rstn_i) mem_addr_lo_q <= 2'b00;
-        else if (mem_launch_hs) mem_addr_lo_q <= alu_result[1:0];
-    end
-
-`ifdef VERILATOR
-    // The flop is only correct because a read response never arrives in the
-    // same cycle as the accept: every slave in the tree registers rdata, so
-    // rvalid is at least one cycle later. Check it rather than trust it.
-    always_ff @(posedge clk_i) begin
-        if (rstn_i && mem_launch_hs && de_i.mem_read) begin
-            assert (!lsu_rsp.rvalid)
-            else $fatal(1, "load response in the accept cycle: latched byte offset is stale");
-        end
-    end
-`endif
-
     logic [XLEN-1:0] load_shifted;
     logic [XLEN-1:0] load_data;
-    assign load_shifted = lsu_rsp.rdata >> {mem_addr_lo_q, 3'b000};
+    assign load_shifted = lsu_rsp.rdata >> {mem_addr_q[1:0], 3'b000};
     always_comb begin
         unique case (de_i.mem_size)
             MS_B:
@@ -537,6 +543,8 @@ module execute_stage (
     // wstrb[byte]). rready is asserted in EX_MEM_WAIT on a load so the
     // bridge forwards it to the AXI R channel and the read completes.
     // =================================================================
+    // Byte strobes and the lane-aligned write data, computed in the capture
+    // cycle from alu_result and registered with the address below.
     logic [STRB_WIDTH-1:0] store_wstrb;
     always_comb begin
         // Byte strobes for a store of de_i.mem_size at alu_result.
@@ -550,6 +558,36 @@ module execute_stage (
 
     logic [XLEN-1:0] store_wdata;
     assign store_wdata = de_i.rs2_data << {alu_result[1:0], 3'b000};
+
+    // Capture the whole request in the cycle the address is computed. This
+    // is the pipeline stage: alu_result, the store data shifted into its
+    // lanes, the byte strobes and the peri/D-mem select all end here, and
+    // the bus is driven from these flops in EX_MEM_LAUNCH.
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) begin
+            mem_addr_q    <= '0;
+            mem_wdata_q   <= '0;
+            mem_wstrb_q   <= '0;
+            mem_is_peri_q <= 1'b0;
+        end else if (mem_stage_req) begin
+            mem_addr_q    <= alu_result;
+            mem_wdata_q   <= store_wdata;
+            mem_wstrb_q   <= store_wstrb;
+            mem_is_peri_q <= alu_result[PERI_ADDR_BIT];
+        end
+    end
+
+`ifdef VERILATOR
+    // The load byte select reads mem_addr_q when the response arrives, which
+    // is only sound because no slave answers a read in the accept cycle:
+    // every one of them registers rdata. Check it rather than trust it.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && mem_launch_hs && de_i.mem_read) begin
+            assert (!lsu_rsp.rvalid)
+            else $fatal(1, "load response in the accept cycle: registered request is stale");
+        end
+    end
+`endif
 
     // Harvard: steer the launch to D-mem (is_peri=0) or the peri bridge
     // (is_peri=1). Both ports get full defaults so the non-selected port is
@@ -568,18 +606,18 @@ module execute_stage (
         peri_req_o.wstrb  = '0;
         peri_req_o.rready = 1'b0;
         if (is_peri) begin
-            peri_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
+            peri_req_o.wvalid = mem_launch;  // held until the slave accepts
             peri_req_o.we     = de_i.mem_write;
-            peri_req_o.addr   = alu_result;  // EA
-            peri_req_o.wdata  = store_wdata;
-            peri_req_o.wstrb  = store_wstrb;
+            peri_req_o.addr   = mem_addr_q;  // registered EA
+            peri_req_o.wdata  = mem_wdata_q;
+            peri_req_o.wstrb  = mem_wstrb_q;
             peri_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
         end else begin
-            mem_req_o.wvalid = mem_launch;  // launch one cycle in EX_IDLE
+            mem_req_o.wvalid = mem_launch;  // held until the slave accepts
             mem_req_o.we     = de_i.mem_write;
-            mem_req_o.addr   = alu_result;  // EA
-            mem_req_o.wdata  = store_wdata;
-            mem_req_o.wstrb  = store_wstrb;
+            mem_req_o.addr   = mem_addr_q;  // registered EA
+            mem_req_o.wdata  = mem_wdata_q;
+            mem_req_o.wstrb  = mem_wstrb_q;
             mem_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
         end
     end
