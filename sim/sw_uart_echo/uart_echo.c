@@ -31,6 +31,7 @@
 
 #define MSTATUS_MIE (1u << 3)
 #define MIE_MEIE    (1u << 11)
+#define MIP_MEIP    (1u << 11)
 #define MCAUSE_MEI  0x8000000Bu
 
 #define PHASE_CHARS 4
@@ -49,9 +50,23 @@ static inline uint32_t read_mcause(void)
     return v;
 }
 
+static inline uint32_t read_mip(void)
+{
+    uint32_t v;
+    __asm__ volatile("csrr %0, mip" : "=r"(v));
+    return v;
+}
+
 /* GCC's machine-interrupt attribute emits the register save/restore and
- * the mret for us; mtvec is programmed to this address in direct mode. */
-__attribute__((interrupt("machine"))) void trap_handler(void)
+ * the mret for us; mtvec is programmed to this address in direct mode.
+ *
+ * aligned(4) is not cosmetic: mtvec holds BASE in bits [31:2] and MODE in
+ * [1:0], so a write masks the low two bits away. With RVC enabled a
+ * function can land on a 2-byte boundary, and mtvec would then point two
+ * bytes BELOW the handler -- into the middle of the preceding
+ * instruction. The core would vector into garbage on the first interrupt,
+ * with no output and no way to tell it from a dead interrupt path. */
+__attribute__((interrupt("machine"), aligned(4))) void trap_handler(void)
 {
     uint32_t cause = read_mcause();
 
@@ -80,10 +95,33 @@ int main(void)
     for (int i = 0; i < PHASE_CHARS; ++i) uart_putc(uart_getc());
     uart_puts("\r\nIRQ\r\n");
 
-    /* ---- Phase 2: interrupt-driven ---- */
+    /* ---- Phase 2: interrupt-driven ----
+     *
+     * Split into three observable steps, so a board that stops here says
+     * WHICH link of the chain is broken instead of just going quiet:
+     *
+     *   2a: enable CTRL.RX_IE and mie.MEIE but leave mstatus.MIE clear,
+     *       then poll mip. This walks uart_irq_o -> meip_i -> mip.MEIP
+     *       with traps still globally disabled, so nothing about trap
+     *       entry can be blamed. Prints the mip value it saw.
+     *   2b: enable mstatus.MIE with that byte still sitting unread in the
+     *       RX FIFO. The IRQ is level-sensitive, so the interrupt must be
+     *       taken immediately -- no wfi involved. This isolates trap entry
+     *       and the handler from the wfi wake.
+     *   2c: sleep in wfi for the remaining bytes, which is the wfi-wake
+     *       path.
+     */
     UART_CTRL = CTRL_RX_IE;
     __asm__ volatile("csrw mtvec, %0" ::"r"((uint32_t)&trap_handler));
     __asm__ volatile("csrs mie, %0" ::"r"(MIE_MEIE));
+
+    /* 2a -- send one byte now; it stays queued (nothing reads RXDATA). */
+    while (!(read_mip() & MIP_MEIP)) { /* spin */ }
+    uart_puts("MIP ");
+    uart_put_hex32(read_mip());
+    uart_puts("\r\n");
+
+    /* 2b + 2c */
     __asm__ volatile("csrsi mstatus, %0" ::"i"(MSTATUS_MIE));
 
     while (irq_chars < PHASE_CHARS && !bad_cause) __asm__ volatile("wfi");
