@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include "../sw/uart.h"
+#include "uart.h"
 
 /*
  * ISA probe: check individual instructions on hardware without depending on

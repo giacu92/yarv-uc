@@ -1,7 +1,6 @@
-# Build a C program into a pair of $readmemh images for the Harvard
-# Verilator sim, using the prebuilt bare-metal RISC-V toolchain
-# (riscv32-esp-elf-gcc, found under the PlatformIO/esphome cache -- no
-# install needed).
+# Build the YarvMon monitor into a pair of $readmemh images for the Harvard
+# Verilator sim + the board (this is the default product firmware:
+# top_module.sv INIT_FILE points at build/imem.hex).
 #
 #   make          build build/imem.hex + build/dmem.hex (.elf/.bin/.objdump)
 #   make show     disassemble build/program.elf
@@ -9,14 +8,13 @@
 #
 # Output: build/imem.hex (code, -> I-mem) + build/dmem.hex (data, -> D-mem)
 # Load them in the sim (from sim/):
-#   make run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"
+#   make run RUN_ARGS="+IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex"
 
 # --- Toolchain -----------------------------------------------------------
-# The bare-metal RISC-V GCC that PlatformIO dropped under the esphome
-# cache. Override RISCV_PREFIX to point at another rv32-capable toolchain
-# (e.g. riscv64-unknown-elf, riscv-none-elf) if you have one on PATH.
-ESP_TC      ?= $(HOME)/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin
-RISCV_PREFIX ?= $(ESP_TC)/riscv32-esp-elf
+# Default: buildroot glibc rv32 toolchain (gcc 14.3.0). Override
+# RISCV_PREFIX to point at another rv32-capable toolchain (e.g.
+# riscv64-unknown-elf, riscv-none-elf) if you have one on PATH.
+RISCV_PREFIX ?= $(HOME)/_toolchains/riscv32-ilp32d--glibc--stable-2025.08-1/bin/riscv32-buildroot-linux-gnu
 
 CC      := $(RISCV_PREFIX)-gcc
 OBJCOPY := $(RISCV_PREFIX)-objcopy
@@ -25,7 +23,7 @@ OBJDUMP := $(RISCV_PREFIX)-objdump
 # rv32imac = the core's implemented integer subset (I + M + A + C). The
 # core also implements Zicsr + Zifencei + machine-mode traps, but plain C
 # (-march=rv32imac, no zicsr in the arch string) emits only integer code
-# (no CSR / fence / atomics); the trap oracle (sim/sw_trap) builds with
+# (no CSR / fence / atomics); the trap oracle (sim/sw/intr/trap) builds with
 # rv32imac_zicsr_zifencei when it needs those. Zilx indexed loads are
 # implemented (retire via the LSU) but have no assembler mnemonics, so
 # yarvmon.c hand-encodes them with .insn.
@@ -40,7 +38,8 @@ ABI  := ilp32
 # .text lands in D-mem instead of I-mem. Without this, mtvec ends up loaded
 # from an uninitialised .got word.
 CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-          -fno-builtin -fno-stack-protector -fomit-frame-pointer -O2 -Wall -g -fno-pie
+          -fno-builtin -fno-stack-protector -fomit-frame-pointer -O2 -Wall -g -fno-pie \
+          -I../sw/common
 # -no-pie -Wl,-N: needed when RISCV_PREFIX points at a *linux* (glibc)
 # toolchain such as riscv32-buildroot-linux-gnu instead of a bare-metal
 # one. That ld defaults to emitting a PT_PHDR segment, which link.ld's

@@ -17,7 +17,7 @@ The UART is driven for real in both directions: `uart_rxd_i` is a port
 (double-flopped exactly like the board top, so the board's synchronizer
 is actually simulated), fed with 8N1 frames by the C++ harness, and every
 byte the CPU pushes into the TX FIFO is captured to `sim_uart_tx.txt`.
-That is how a serial-console program (YarvMon, `sw_uart_echo`) is
+That is how a serial-console program (YarvMon, `sw/peri/uart_echo`) is
 observed and driven — see "UART console I/O" below.
 
 This harness is **not** part of the synthesis file list.
@@ -35,7 +35,7 @@ sudo apt-get install -y verilator
 ```
 cd sim
 make run                                          # Harvard: imem.hex/dmem.hex oracle
-make run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"  # C program
+make run RUN_ARGS="+IINIT=sw/quicksort/build/imem.hex +DINIT=sw/quicksort/build/dmem.hex"  # C program
 # or, from the repo root:
 make sw-run       # build the C program (sim/sw) + run the Harvard sim loading it
 ```
@@ -104,7 +104,7 @@ line; the word value IS the instruction/data word):
 
 The images are **plusarg-selected**: `+IINIT=<path>` / `+DINIT=<path>`
 override the defaults, so a C-compiled image pair can be loaded without
-clobbering the oracle. To compile C → images, use the `sim/sw/` flow
+clobbering the oracle. To compile C → images, use the `sim/sw/quicksort/` flow
 (see `sim/sw/README.md`).
 
 ## UART console I/O
@@ -177,7 +177,7 @@ deasserts when software drains the condition.
 cd hw/uart_tb && make run     # "146 checks, 0 failures"
 ```
 
-## UART echo + external-interrupt (MEIP) oracle (`sw_uart_echo/`)
+## UART echo + external-interrupt (MEIP) oracle (`sw/peri/uart_echo/`)
 
 `uart_echo.c` echoes `PHASE_CHARS` (4) bytes read by polling, then
 enables `CTRL.RX_IE` + `mie.MEIE` + `mstatus.MIE` and echoes 4 more from
@@ -190,9 +190,9 @@ This is the only end-to-end test of the machine *external* interrupt:
 including the `wfi` wake on an external interrupt.
 
 ```
-cd sw_uart_echo && make
+cd sw/peri/uart_echo && make
 cd .. && UART_RX='abcdefgh' make run \
-  RUN_ARGS="+IINIT=sw_uart_echo/build/imem.hex +DINIT=sw_uart_echo/build/dmem.hex"
+  RUN_ARGS="+IINIT=sw/peri/uart_echo/build/imem.hex +DINIT=sw/peri/uart_echo/build/dmem.hex"
 # serial log: "ECHO / abcd / IRQ / efgh / GOOD", and wb x15 = 0x0000600d
 ```
 
@@ -226,7 +226,7 @@ turned a board that went silent into a board that says where it is:
 never fills — that is what separates "the FIFO filled" from "the poll
 never returned".
 
-## Instruction-access-fault oracle (`sw_ifault/`)
+## Instruction-access-fault oracle (`sw/isa/ifault/`)
 
 `ifault_test.S` jumps to 0x100000 — far outside the 16 KiB I-mem — and
 checks that exactly one trap arrived, with `mcause` = 1 (instruction access
@@ -240,12 +240,12 @@ forever. It rewrites `mepc` to a known label instead, which is what a real
 handler has to do with this trap.
 
 ```
-cd sw_ifault && make
+cd sw/isa/ifault && make
 cd .. && make run \
-  RUN_ARGS="+IINIT=sw_ifault/build/imem.hex +DINIT=sw_ifault/build/dmem.hex"
+  RUN_ARGS="+IINIT=sw/isa/ifault/build/imem.hex +DINIT=sw/isa/ifault/build/dmem.hex"
 ```
 
-## ISA / memory probe (`sw_isa_probe/`)
+## ISA / memory probe (`sw/isa/isa_probe/`)
 
 A board bring-up probe for the case where the *reporting* is what lies.
 It reports through fixed strings (`name OK` / `name BAD`) and dumps values
@@ -266,14 +266,14 @@ byte-select bug, where a load whose address came from a distance-1
 forward read the right word but the wrong byte, on silicon only.
 
 ```
-cd sw_isa_probe && make UART_TX_PACED=1
+cd sw/isa/isa_probe && make UART_TX_PACED=1
 cd .. && UART_BIT_CYCLES=217 make run \
-  RUN_ARGS="+IINIT=sw_isa_probe/build/imem.hex +DINIT=sw_isa_probe/build/dmem.hex"
+  RUN_ARGS="+IINIT=sw/isa/isa_probe/build/imem.hex +DINIT=sw/isa/isa_probe/build/dmem.hex"
 # every line OK, "rodata2 0123456789ABCDEF", "PROBE END"
 ```
 
-`UART_TX_PACED=1` (in `sw/uart.h`, honoured by `sw/Makefile` and
-`sw_uart_echo/Makefile`) replaces the `TX_READY` poll with a software
+`UART_TX_PACED=1` (in `sw/common/uart.h`, honoured by `sw/quicksort/Makefile` and
+`sw/peri/uart_echo/Makefile`) replaces the `TX_READY` poll with a software
 delay longer than one frame, so a single byte is in flight at a time and
 the TX FIFO never fills. It is a diagnostic, not a shipping setting: it
 separates "the FIFO filled" from "the poll never returned" when a board
@@ -322,7 +322,7 @@ retires and parks both sides at the halt self-loop.
 Harvard co-sim needs `.data` at a non-zero VMA: Spike is a single
 unified address space, so `.text`@0 and `.data`@0 would clobber each
 other (the second LOAD segment overwrites the first at vaddr 0). The
-linker places `.data` at DMEM 0x2000 (`sim/sw/link.ld`), and the cosim
+linker places `.data` at DMEM 0x2000 (`sim/sw/common/link.ld`), and the cosim
 `SPIKE_MEM` (`0x0:0x1000` for code, `0x2000:0x2000` for data+stack — the
 real 8 KiB D-mem, so an access the hardware would silently alias makes
 Spike trap here instead of quietly succeeding)
@@ -346,7 +346,7 @@ only the harness is committed: `cosim_diff.py` + `build_spike.sh` at
 `cosim/` (shared with the illegal-trap co-sim), and the `Makefile` at
 `cosim/quicksort/`.
 
-## Trap oracle (`sw_trap/`)
+## Trap oracle (`sw/intr/trap/`)
 
 A standalone M-mode trap-exercise program (`trap_test.S`, built
 `-march=rv32imac_zicsr_zifencei` so the toolchain emits csr/mret/wfi):
@@ -358,8 +358,8 @@ markers; `main` self-checks them and writes `0x600D` at D-mem 0x2000
 (pass) or `0xBAD` (probe word 0x800). Run from `sim/`:
 
 ```
-cd sw_trap && make                                      # -> build/imem.hex + build/dmem.hex
-cd .. && make run RUN_ARGS="+IINIT=sw_trap/build/imem.hex +DINIT=sw_trap/build/dmem.hex"
+cd sw/intr/trap && make                                      # -> build/imem.hex + build/dmem.hex
+cd .. && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/trap/build/dmem.hex"
 ```
 
 ## Illegal-trap co-sim (`cosim/ecall/`)
@@ -376,7 +376,7 @@ only by the standalone oracle above.
 cd cosim/ecall && make cosim   # -> "PASS -- matched 17 retires" (run from sim/)
 ```
 
-## Timer oracle (`sw_timer/`)
+## Timer oracle (`sw/intr/timer/`)
 
 A standalone M-mode program (`timer_test.S`, built
 `-march=rv32imac_zicsr_zifencei`) exercising the machine timer interrupt:
@@ -389,11 +389,11 @@ checks `mcause[31:0]=0x8000_0007`, stores `0x07` as a marker at D-mem
 (pass, probe word 0x800) or `0xBAD`. Run from `sim/`:
 
 ```
-cd sw_timer && make                                   # -> build/imem.hex + build/dmem.hex
-cd .. && make run RUN_ARGS="+IINIT=sw_timer/build/imem.hex +DINIT=sw_timer/build/dmem.hex"
+cd sw/intr/timer && make                                   # -> build/imem.hex + build/dmem.hex
+cd .. && make run RUN_ARGS="+IINIT=sw/intr/timer/build/imem.hex +DINIT=sw/intr/timer/build/dmem.hex"
 ```
 
-## WFI-wake arbitration oracle (`sw_wfi_trap/`)
+## WFI-wake arbitration oracle (`sw/intr/wfi_trap/`)
 
 Regression for a WFI-halt deadlock: `wfi_halt_q` must clear on a pending
 enabled interrupt, not on `take_interrupt` (which loses priority to a
@@ -409,8 +409,8 @@ disarmed); `main` checks both markers and writes `0x600D`/`0xBAD`.
 riscv32 toolchain:
 
 ```
-cd sw_wfi_trap && python3 gen_hex.py
-cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap/build/dmem.hex"
+cd sw/intr/wfi_trap && python3 gen_hex.py
+cd .. && make run RUN_ARGS="+IINIT=sw/intr/wfi_trap/build/imem.hex +DINIT=sw/intr/wfi_trap/build/dmem.hex"
 ```
 
 ## Files
@@ -438,22 +438,22 @@ cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap
 - `cosim/ecall/`     — Spike co-sim of an illegal-instruction sync trap
   (see "Illegal-trap co-sim").
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
-- `sw_trap/`      — standalone M-mode trap-exercise program
+- `sw/intr/trap/`      — standalone M-mode trap-exercise program
   (ecall/misaligned/illegal/MSIP+WFI, self-checking — see "Trap oracle").
-- `sw_ifault/`    — instruction-access-fault oracle (jump outside the
+- `sw/isa/ifault/`    — instruction-access-fault oracle (jump outside the
   I-mem, check cause and mtval — see "Instruction-access-fault oracle").
-- `sw_isa_probe/` — instruction/memory probe that reports without using
+- `sw/isa/isa_probe/` — instruction/memory probe that reports without using
   the hex printer or any instruction under test (see "ISA / memory
   probe").
-- `sw_timer/`     — standalone M-mode timer-interrupt program
+- `sw/intr/timer/`     — standalone M-mode timer-interrupt program
   (MTIE+MIE, `mtimecmp=100`, WFI wake, self-checking — see "Timer oracle").
-- `sw_wfi_trap/`  — WFI-wake arbitration regression (illegal-trap behind
+- `sw/intr/wfi_trap/`  — WFI-wake arbitration regression (illegal-trap behind
   `wfi` + pending MTI; toolchain-free via `gen_hex.py` — see
   "WFI-wake arbitration oracle").
-- `sw_uart_echo/` — UART echo + external-interrupt (MEIP) oracle, and the
+- `sw/peri/uart_echo/` — UART echo + external-interrupt (MEIP) oracle, and the
   hardware bring-up program (see "UART echo + external-interrupt (MEIP)
   oracle").
 
-Build artefacts (`obj_dir/`, `sw/build/`, `cosim/ecall/build/`,
+Build artefacts (`obj_dir/`, `sw/quicksort/build/`, `cosim/ecall/build/`,
 `cosim/quicksort/*.log`, `*.vcd`, `*.log`, `sim_uart_tx.txt`) are
 gitignored.

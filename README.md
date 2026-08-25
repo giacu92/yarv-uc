@@ -175,7 +175,7 @@ from `rv32_pkg`; unmapped → DECERR). The remaining work, in order:
    program empty. On hardware YarvMon looked like it ignored every
    command. Reproduced in simulation (`UART_RX_PACED=0`), fixed by the
    FIFOs, guarded by `sim/hw/uart_tb` (146 checks) and the
-   `sim/sw_uart_echo` oracle.
+   `sim/sw/peri/uart_echo` oracle.
 
    Bring-up then found two more defects in this peripheral. A write to a
    full TX FIFO was **dropped** while still answering OKAY on the bus,
@@ -200,13 +200,13 @@ Done (for reference): CLINT-style timer (`clint_timer.sv` — 64-bit
 `mtip` → `mip.MTIP`), the `msip_peri` MMIO slave, the UART MMIO slave
 wired as the MEIP source, and the peri-bus 1→3 address-decode mux with
 DECERR terminator. All sim-verified (standalone timer oracle
-`sim/sw_timer`, MSIP/trap oracle `sim/sw_trap`, WFI-wake arbitration
-oracle `sim/sw_wfi_trap`, Spike cosim of an illegal-instruction trap
+`sim/sw/intr/timer`, MSIP/trap oracle `sim/sw/intr/trap`, WFI-wake arbitration
+oracle `sim/sw/intr/wfi_trap`, Spike cosim of an illegal-instruction trap
 `sim/cosim/ecall`).
 
 The sim harness now drives the UART in both directions: it types real
 8N1 frames into `uart_rxd_i` (double-flopped as on the board) and
-captures every transmitted byte, and `sim/sw_uart_echo` verifies MEIP end
+captures every transmitted byte, and `sim/sw/peri/uart_echo` verifies MEIP end
 to end — `uart_irq_o` → `meip_i` → `mip.MEIP` → `trap_unit` → interrupt
 entry, including the `wfi` wake on an external interrupt.
 
@@ -243,7 +243,7 @@ I-mem raises a real trap instead of relying on the ROM being padded with
 
 The pattern they shared: when hardware and simulation disagree, suspect a
 value whose *lifetime* differs between the two, and instrument so that the
-reporting path is not itself under test — which is what `sim/sw_isa_probe`
+reporting path is not itself under test — which is what `sim/sw/isa/isa_probe`
 exists for.
 
 The CPU exposes **three** ports (Harvard): a native `imem` (fetch,
@@ -269,7 +269,8 @@ src/rtl/utils/ native_ram.sv (Harvard I/D-mem), axi4_lite_ram.sv (AXI slave, sim
 src/phys/      pin assignment (.cst) + timing constraints (.sdc)
 impl/          Gowin EDA project + synthesis/PnR Tcl + reports
 sim/           Verilator functional sim + native/AXI RAM + UART compliance tests
-sim/sw/        C → imem.hex + dmem.hex flow (prebuilt rv32imac toolchain)
+sim/sw/        firmware tree: quicksort program + isa/intr/peri test oracles
+               (shared build logic in common/sw_build.mk; make -C sim/sw builds all)
 verible.flags  SystemVerilog formatting policy (Verible --flagfile)
 Makefile       format / sim / sw targets
 CLAUDE.md      detailed architecture + build guidance (read this)
@@ -300,7 +301,7 @@ See `sim/README.md` for the logs, VCD/GTKWave, the native-RAM
 (`sim/hw/native_mem_tb/`) and AXI4-Lite RAM (`sim/hw/ram_tb/`) compliance
 tests, the RTL-vs-Spike co-sim (`make cosim` — retire-for-retire match
 against the golden ISA reference), the trap + timer + WFI-wake oracles
-(`sim/sw_trap/`, `sim/sw_timer/`, `sim/sw_wfi_trap/`), and the
+(`sim/sw/intr/trap/`, `sim/sw/intr/timer/`, `sim/sw/intr/wfi_trap/`), and the
 illegal-trap cosim (`sim/cosim/ecall/`).
 
 ### Synthesize / place & route (Gowin EDA, remote host)

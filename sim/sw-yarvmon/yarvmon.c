@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include "../sw/uart.h"
+#include "uart.h"
 
 /*
  * RV32 YarvMon — port of Steve Wozniak's Apple 1 monitor.

@@ -9,8 +9,7 @@ SCRIPT_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
 COSIM_DIR  := $(SCRIPT_DIR)../
 SPIKE      := $(COSIM_DIR)riscv-isa-sim-install/bin/spike
 
-ESP_TC      ?= $(HOME)/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin
-RISCV_PREFIX ?= $(ESP_TC)/riscv32-esp-elf
+RISCV_PREFIX ?= $(HOME)/_toolchains/riscv32-ilp32d--glibc--stable-2025.08-1/bin/riscv32-buildroot-linux-gnu
 CC      := $(RISCV_PREFIX)-gcc
 OBJCOPY := $(RISCV_PREFIX)-objcopy
 OBJDUMP := $(RISCV_PREFIX)-objdump

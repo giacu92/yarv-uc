@@ -52,7 +52,7 @@ HEX_PREREQ := imem.hex dmem.hex
 TOP := obj_dir/Vsim_top
 
 # Extra args for the sim binary.
-#   RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"
+#   RUN_ARGS="+IINIT=sw/quicksort/build/imem.hex +DINIT=sw/quicksort/build/dmem.hex"
 # With no RUN_ARGS the sim loads the defaults baked into sim_top
 # (imem.hex/dmem.hex).
 RUN_ARGS ?=

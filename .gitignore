@@ -25,11 +25,9 @@ sim/*.vcd
 sim/*.fst
 sim/*.log
 
-# C-program build artefacts (sim/sw: C -> program.hex, regenerable)
-sim/sw/build/
+# C-program build artefacts (sim/sw tree: C -> $readmemh hex, regenerable)
+sim/sw/**/build/
 sim/sw-yarvmon/build/
-sim/sw_trap/build/
-sim/sw_timer/build/
 sim/cosim/ecall/build/
 
 # Local sim artifacts (backups, GTKWave session layouts — not shared)
@@ -54,16 +52,6 @@ sim/cosim/ecall/rtl.trace
 sim/cosim/__pycache__/
 sim/cosim/ecall/__pycache__/
 
-
-# RVC scramble-bit oracle build artefacts (regenerable)
-sim/sw_rvc_scramble/build/
-sim/sw_uart_echo/build/
-
-# ISA probe build artefacts (regenerable)
-sim/sw_isa_probe/build/
-
-# Instruction-access-fault oracle build artefacts (regenerable)
-sim/sw_ifault/build/
 
 # UART TX capture written by the sim harness (sim_top's tx monitor).
 sim/sim_uart_tx.txt

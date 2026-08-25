@@ -1,114 +1,21 @@
-# Build a C program into a pair of $readmemh images for the Harvard
-# Verilator sim, using the prebuilt bare-metal RISC-V toolchain
-# (riscv32-esp-elf-gcc, found under the PlatformIO/esphome cache -- no
-# install needed).
+# Aggregator for all sim/sw firmware. One command builds every program and
+# every test oracle:
 #
-#   make          build build/imem.hex + build/dmem.hex (.elf/.bin/.objdump)
-#   make show     disassemble build/program.elf
-#   make clean    remove build/
+#   make            build quicksort + every isa/intr/peri test
+#   make clean      clean all
+#   make quicksort  build one group/program (quicksort | isa | intr | peri)
 #
-# Output: build/imem.hex (code, -> I-mem) + build/dmem.hex (data, -> D-mem)
-# Load them in the sim (from sim/):
-#   make run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"
+# Each leaf harness has its own Makefile (see common/sw_build.mk for the shared
+# build logic); this just recurses into each subdir.
 
-# --- Toolchain -----------------------------------------------------------
-# The bare-metal RISC-V GCC that PlatformIO dropped under the esphome
-# cache. Override RISCV_PREFIX to point at another rv32-capable toolchain
-# (e.g. riscv64-unknown-elf, riscv-none-elf) if you have one on PATH.
-ESP_TC      ?= $(HOME)/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin
-RISCV_PREFIX ?= $(ESP_TC)/riscv32-esp-elf
+GROUPS := quicksort isa intr peri
 
-CC      := $(RISCV_PREFIX)-gcc
-OBJCOPY := $(RISCV_PREFIX)-objcopy
-OBJDUMP := $(RISCV_PREFIX)-objdump
+.PHONY: all clean $(GROUPS)
+all:
+	@for d in $(GROUPS); do $(MAKE) -C $$d || exit 1; done
 
-# rv32imac = the core's implemented integer subset (I + M + A + C). The
-# core also implements Zicsr + Zifencei + machine-mode traps, but plain C
-# (-march=rv32imac, no zicsr in the arch string) emits only integer code
-# (no CSR / fence / atomics); the trap oracle (sim/sw_trap) builds with
-# rv32imac_zicsr_zifencei when it needs those. Zilx indexed loads are
-# implemented (retire via the LSU) but have no assembler mnemonics, so
-# main.c hand-encodes them with .insn.
-ARCH := rv32imac
-ABI  := ilp32
-
-# -fno-pie: a linux/glibc toolchain (riscv32-buildroot-linux-gnu) defaults
-# to PIE, which makes gas expand `la sym` into a GOT load (auipc + lw from
-# .got) and gcc emit PC-relative data addressing. Both are wrong here: the
-# GOT does not exist in a flat two-image layout, and link.ld requires
-# medlow ABSOLUTE addressing (lui + addi) so a data address computed in
-# .text lands in D-mem instead of I-mem. Without this, mtvec ends up loaded
-# from an uninitialised .got word.
-CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-          -fno-builtin -fno-stack-protector -fomit-frame-pointer -O2 -Wall -g -fno-pie
-# -no-pie -Wl,-N: needed when RISCV_PREFIX points at a *linux* (glibc)
-# toolchain such as riscv32-buildroot-linux-gnu instead of a bare-metal
-# one. That ld defaults to emitting a PT_PHDR segment, which link.ld's
-# flat MEMORY layout does not cover ("PHDR segment not covered by LOAD
-# segment"); -no-pie plus -N (omagic) drops it. Harmless on a bare-metal
-# toolchain.
-
-# PRINT_ARRAY=0 compiles out the array printing (see main.c): the co-sim
-# needs a build that makes no UART access before the sort.
-# UART_TX_PACED=1 replaces the TX_READY poll with a software delay (see
-# sim/sw/uart.h): a board diagnostic for output that stops when the TX FIFO
-# first fills.
-UART_TX_PACED ?= 0
-CFLAGS += -DUART_TX_PACED=$(UART_TX_PACED)
-PRINT_ARRAY ?= 1
-CFLAGS += -DPRINT_ARRAY=$(PRINT_ARRAY)
-LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-           -T link.ld -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
-
-BUILD := build
-ELF     := $(BUILD)/program.elf
-IMEM_BIN := $(BUILD)/imem.bin
-DMEM_BIN := $(BUILD)/dmem.bin
-IMEM_HEX := $(BUILD)/imem.hex
-DMEM_HEX := $(BUILD)/dmem.hex
-OBJD    := $(BUILD)/program.elf.objdump
-
-# start.o first so _start (.text.init) is the first thing linked -> IMEM 0x0.
-OBJS := $(BUILD)/start.o $(BUILD)/main.o
-
-.PHONY: all clean show
-all: $(IMEM_HEX) $(DMEM_HEX) $(OBJD)
-
-$(BUILD):
-	mkdir -p $(BUILD)
-
-$(BUILD)/start.o: start.S | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/main.o: main.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(ELF): $(OBJS) link.ld
-	$(CC) $(LDFLAGS) $(OBJS) -o $@
-
-# Instruction image: .text.init + .text -> IMEM (VMA 0). Fetch's read-only port.
-$(IMEM_BIN): $(ELF)
-	$(OBJCOPY) -O binary -j .text.init -j .text $< $@
-
-# Data image: .rodata + .data -> DMEM (VMA 0x2000). .bss is NOBITS (no file
-# content) and placed last, so it does not punch a gap in this binary.
-# objcopy -j starts the binary at the lowest kept-section VMA (0x2000, the
-# DMEM ORIGIN), so bin2hex --base 0x2000 emits @0x800 and the words land at
-# D-mem 0x2000 (where the program addresses them), not word 0.
-$(DMEM_BIN): $(ELF)
-	$(OBJCOPY) -O binary -j .rodata -j .data $< $@
-
-$(IMEM_HEX): $(IMEM_BIN) bin2hex.py
-	python3 bin2hex.py $< $@
-
-$(DMEM_HEX): $(DMEM_BIN) bin2hex.py
-	python3 bin2hex.py --base 0x2000 $< $@
-
-$(OBJD): $(ELF)
-	$(OBJDUMP) -d $< > $@
-
-show: $(ELF)
-	$(OBJDUMP) -d $<
+$(GROUPS):
+	$(MAKE) -C $@
 
 clean:
-	rm -rf $(BUILD)
+	@for d in $(GROUPS); do $(MAKE) -C $$d clean; done

@@ -43,7 +43,7 @@ help:
 	@echo "  wave          build + run the sim, then open the VCD in gtkwave"
 	@echo "  run           build + run the Verilator sim"
 	@echo "  clean         remove simulation build artefacts + waveforms"
-	@echo "  sw            build a C program -> sim/sw/build/{imem,dmem}.hex (rv32imac, Harvard)"
+	@echo "  sw            build the quicksort C program -> sim/sw/quicksort/build/{imem,dmem}.hex"
 	@echo "  sw-run        build the C program and run the sim loading it"
 	@echo "  cosim         build Spike + sw, run both, diff vs golden Spike"
 	@echo ""
@@ -106,17 +106,20 @@ run:
 # ----------------------------------------------------------------------
 #
 # Build (and optionally run) a C program for the Harvard sim. `sw`
-# compiles sim/sw/main.c with the prebuilt riscv32-esp-elf-gcc and links
+# compiles sim/sw/quicksort/main.c with the prebuilt riscv32-esp-elf-gcc and links
 # across two 0-based regions (link.ld): .text -> IMEM, .data -> DMEM,
 # producing a $readmemh word hex for each. `sw-run` then runs the sim
 # loading both images via +IINIT/+DINIT instead of the hand-crafted
 # imem.hex/dmem.hex oracle.
 #
+# `make -C sim/sw` builds every program and test oracle at once; this target
+# builds only quicksort (what sw-run needs).
+#
 sw:
-	$(MAKE) -C sim/sw
+	$(MAKE) -C sim/sw/quicksort
 
 sw-run: sw
-	$(MAKE) -C sim run RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex"
+	$(MAKE) -C sim run RUN_ARGS="+IINIT=sw/quicksort/build/imem.hex +DINIT=sw/quicksort/build/dmem.hex"
 
 # ----------------------------------------------------------------------
 # Co-sim: RTL vs Spike (golden ISA reference)

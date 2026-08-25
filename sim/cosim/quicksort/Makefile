@@ -17,11 +17,11 @@
 
 SCRIPT_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
 SPIKE      := $(SCRIPT_DIR)../riscv-isa-sim-install/bin/spike
-ELF        := $(SCRIPT_DIR)../../sw/build/program.elf
+ELF        := $(SCRIPT_DIR)../../sw/quicksort/build/program.elf
 # Harvard: the C build emits a code image (-> I-mem) and a data image
 # (-> D-mem), not a single program.hex. The RTL sim loads both.
-IMEM_HEX   := $(SCRIPT_DIR)../../sw/build/imem.hex
-DMEM_HEX   := $(SCRIPT_DIR)../../sw/build/dmem.hex
+IMEM_HEX   := $(SCRIPT_DIR)../../sw/quicksort/build/imem.hex
+DMEM_HEX   := $(SCRIPT_DIR)../../sw/quicksort/build/dmem.hex
 SPIKE_LOG  := $(SCRIPT_DIR)spike.log
 RTL_LOG    := $(SCRIPT_DIR)rtl.trace
 
@@ -74,8 +74,8 @@ TC_ARGS := $(if $(RISCV_PREFIX),RISCV_PREFIX=$(RISCV_PREFIX))
 
 .PHONY: sw-cosim-build
 sw-cosim-build:
-	@$(MAKE) -C $(SCRIPT_DIR)../../sw clean
-	@$(MAKE) -C $(SCRIPT_DIR)../../sw PRINT_ARRAY=0 $(TC_ARGS)
+	@$(MAKE) -C $(SCRIPT_DIR)../../sw/quicksort clean
+	@$(MAKE) -C $(SCRIPT_DIR)../../sw/quicksort PRINT_ARRAY=0 $(TC_ARGS)
 
 $(ELF) $(IMEM_HEX) $(DMEM_HEX): sw-cosim-build
 
@@ -92,7 +92,7 @@ rtl-run: $(IMEM_HEX) $(DMEM_HEX)
 	@rm -f $(RTL_LOG)
 	@RTL_TRACE=$(RTL_LOG) MAX_CYC=200000 \
 	  $(MAKE) -C $(SCRIPT_DIR)../.. run \
-	    RUN_ARGS="+IINIT=sw/build/imem.hex +DINIT=sw/build/dmem.hex" \
+	    RUN_ARGS="+IINIT=sw/quicksort/build/imem.hex +DINIT=sw/quicksort/build/dmem.hex" \
 	  >/dev/null
 	@test -s $(RTL_LOG) || { echo "rtl: no trace produced (RTL_TRACE unset? sim_main.cpp edit missing?)"; exit 1; }
 	@echo "rtl: $$(wc -l < $(RTL_LOG)) retires -> $(RTL_LOG)"

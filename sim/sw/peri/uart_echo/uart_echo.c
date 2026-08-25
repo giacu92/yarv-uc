@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include "../sw/uart.h"
+#include "uart.h"
 
 /*
  * UART echo + external-interrupt (MEIP) oracle.

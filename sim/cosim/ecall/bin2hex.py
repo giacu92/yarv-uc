@@ -1,1 +1,1 @@
-../../sw/bin2hex.py
+../../sw/common/bin2hex.py

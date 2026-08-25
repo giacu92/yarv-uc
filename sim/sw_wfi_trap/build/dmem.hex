@@ -1,5 +1,0 @@
-@00000800
-// Placeholder: the program writes its own data at runtime
-// (pass sentinel at 0x2000 = probe word 0x800, markers at
-// 0x2040 / 0x2044).
-00000000
