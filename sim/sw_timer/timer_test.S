@@ -28,7 +28,7 @@
     .section .text.init, "ax"
     .global _start
 _start:
-    li      sp, 0x10000          /* top of the 64 KiB D-mem; stack grows down */
+    li      sp, 0x4000           /* top of the 16 KiB D-mem; stack grows down */
 
     /* mtvec = trap_handler, direct mode (MODE[1:0] = 00). */
     la      t0, trap_handler

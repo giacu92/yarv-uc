@@ -109,7 +109,7 @@ def li(rd, imm):
 
 # (label, mnemonic, args). Transcribed from wfi_trap_test.S.
 PROG = [
-    ("_start",        "li",    ("sp", 0x10000)),
+    ("_start",        "li",    ("sp", 0x4000)),
     (None,            "li",    ("t0", "trap_handler")),
     (None,            "csrw",  ("mtvec", "t0")),
     (None,            "li",    ("t0", 0x2040)),

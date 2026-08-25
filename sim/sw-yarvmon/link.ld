@@ -1,14 +1,19 @@
 /* Linker script for Harvard sim programs: split the image across two
  * independent address spaces.
  *
- *   IMEM (rx)  : ORIGIN = 0x0000, LENGTH = 64K   -> .text.init + .text (fetch)
- *   DMEM (rwx) : ORIGIN = 0x2000, LENGTH = 56K   -> .rodata + .data + .bss
+ *   IMEM (rx)  : ORIGIN = 0x0000, LENGTH = 16K   -> .text.init + .text (fetch)
+ *   DMEM (rwx) : ORIGIN = 0x2000, LENGTH = 8K    -> .rodata + .data + .bss
  *                                                    + stack (LSU)
+ *
+ * 16 KiB each is what the device holds: the GW2AR-18C has 46 BSRAM blocks,
+ * 828 Kb in total, so two 64 KiB memories (1024 Kb) cannot both exist. The
+ * D-mem spans 0x0000-0x3FFF and the data image starts at 0x2000, which
+ * leaves 8 KiB for .rodata/.data/.bss and the stack.
  *
  * The CPU boots at 0x0 (top_module / sim_top boot_addr_i = 0); _start
  * (in .text.init, placed first) lands at IMEM 0x0. .data lands at DMEM
- * 0x2000; the stack grows down from the top of the D-mem (sp = 0x10000,
- * the 64 KiB physical BSRAM boundary; the first push lands at 0xFFFC,
+ * 0x2000; the stack grows down from the top of the D-mem (sp = 0x4000,
+ * the 16 KiB physical BSRAM boundary; the first push lands at 0x3FFC,
  * clear of .data).
  *
  * Why DMEM ORIGIN = 0x2000 (not 0): the core is Harvard, but the co-sim
@@ -43,8 +48,8 @@ ENTRY(_start)
 
 MEMORY
 {
-    IMEM (rx)  : ORIGIN = 0x00000000, LENGTH = 64K
-    DMEM (rwx) : ORIGIN = 0x00002000, LENGTH = 56K
+    IMEM (rx)  : ORIGIN = 0x00000000, LENGTH = 16K
+    DMEM (rwx) : ORIGIN = 0x00002000, LENGTH = 8K
 }
 
 SECTIONS
@@ -54,9 +59,19 @@ SECTIONS
         *(.text*)
     } > IMEM
 
-    .rodata : { *(.rodata*) } > DMEM
-    .data   : { *(.data*) }   > DMEM
-    .bss    : { *(.bss*) *(COMMON) } > DMEM
+    /* Small-data sections are collected into these same output sections on
+     * purpose. RISC-V gcc puts any constant or variable of at most
+     * -msmall-data-limit bytes (8 by default) into .srodata / .sdata /
+     * .sbss rather than .rodata / .data / .bss. Left uncollected they
+     * become orphan sections: the linker still gives them addresses, but
+     * the image is extracted with `objcopy -j .rodata -j .data`, so their
+     * contents never reach the D-mem hex and every read of them returns
+     * whatever the memory happens to hold -- zero in simulation. A 4-byte
+     * const read as 0 while the same constant folded at compile time
+     * reads correctly is exactly as confusing as it sounds. */
+    .rodata : { *(.rodata*) *(.srodata*) } > DMEM
+    .data   : { *(.data*) *(.sdata*) }     > DMEM
+    .bss    : { *(.bss*) *(.sbss*) *(COMMON) } > DMEM
 
     /* Drop metadata that has no place in a flat image. */
     /DISCARD/ : {

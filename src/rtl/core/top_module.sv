@@ -237,7 +237,7 @@ module top_module (
     // $readmemh in sim_top.
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (16),                              // 64 KiB
+        .ADDR_W    (14),                              // 16 KiB (see note below)
         .DATA_WIDTH(32),
         .READ_ONLY (1),
         // A read-only I-mem with no init and no write port is a zero-ROM:
@@ -269,7 +269,7 @@ module top_module (
     // power-up; .bss and the stack are zeroed by start.S / runtime use.
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (16),                              // 64 KiB
+        .ADDR_W    (14),                              // 16 KiB (see note below)
         .DATA_WIDTH(32),
         .READ_ONLY (0),
         .INIT_FILE ("sim/sw-yarvmon/build/dmem.hex")

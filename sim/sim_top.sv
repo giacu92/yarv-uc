@@ -109,7 +109,8 @@ module sim_top #(
     // via $readmemh with the +IINIT=<path> plusarg (default "imem.hex").
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (16),  // 64 KiB
+        .ADDR_W    (14),  // 16 KiB (matches top_module: 46 BSRAM blocks
+                                 // = 828 Kb total, so 2 x 64 KiB does not fit)
         .DATA_WIDTH(32),
         .READ_ONLY (1),
         .INIT_FILE ("")
@@ -126,7 +127,8 @@ module sim_top #(
     // plusarg (default "dmem.hex").
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (16),  // 64 KiB
+        .ADDR_W    (14),  // 16 KiB (matches top_module: 46 BSRAM blocks
+                                 // = 828 Kb total, so 2 x 64 KiB does not fit)
         .DATA_WIDTH(32),
         .READ_ONLY (0),
         .INIT_FILE ("")

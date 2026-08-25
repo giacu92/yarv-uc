@@ -85,7 +85,21 @@ module native_ram #(
     // -----------------------------------------------------------------
     // Storage (BSRAM)
     // -----------------------------------------------------------------
+    // ram_style is the Vivado/Xilinx spelling; GowinSynthesis reads
+    // syn_ramstyle / syn_romstyle, so the first attribute alone was a no-op
+    // there. syn_noprune keeps the tool from folding the array away.
+    //
+    // None of these fix a depth reduction on their own: an uninitialised
+    // word is a constant, so GowinSynthesis is entitled to build a
+    // read-only array only as deep as its $readmemh content and let the
+    // upper address bits alias. Padding the image with a real instruction
+    // word (see the firmware Makefiles' IMEM_PAD_VALUE) is what actually
+    // pins the depth; these attributes only keep the implementation style
+    // predictable.
     (* ram_style = "block" *)
+    (* syn_ramstyle = "block_ram" *)
+    (* syn_romstyle = "block_rom" *)
+    (* syn_noprune = 1 *)
     logic [DATA_W-1:0] mem[DEPTH_WORDS];
 
     initial begin
