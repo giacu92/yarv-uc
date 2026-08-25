@@ -37,11 +37,22 @@
 
 #define PHASE_CHARS 4
 
-/* .bss is not zeroed by start.S, so anything needing a known initial
- * value lives in .data (an explicit initialiser puts it there). */
-static volatile uint32_t irq_chars = 0;  /* bytes echoed by the handler */
-static volatile uint32_t sync_traps = 0; /* ecall traps taken */
-static volatile uint32_t bad_cause = 0;  /* unexpected mcause, if any */
+/* start.S does not zero .bss, and .bss is NOBITS so it is not part of the
+ * loaded image either: in hardware these words come up with whatever the
+ * BSRAM powered up holding. A `= 0` initialiser is NOT enough -- gcc puts
+ * zero-initialised statics in .bss precisely because it assumes a runtime
+ * that clears it. Forcing them into .data puts them in the image, so the
+ * zero is actually loaded.
+ *
+ * This bit us: sync_traps came up non-zero on the board, so the ecall
+ * probe below printed "TRAP OK" without any trap having been taken, and
+ * the simulation could not show it because the sim's D-mem is
+ * zero-initialised. */
+#define IN_DATA __attribute__((section(".data")))
+
+static volatile uint32_t IN_DATA irq_chars = 0;   /* bytes echoed by the handler */
+static volatile uint32_t IN_DATA sync_traps = 0;  /* ecall traps taken */
+static volatile uint32_t IN_DATA bad_cause = 0;   /* unexpected mcause, if any */
 
 static volatile uint32_t *const result = (volatile uint32_t *)0x3000;
 
