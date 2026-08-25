@@ -226,10 +226,12 @@ module decode_stage (
             2'b00: begin
                 unique case (f3)
                     3'b000: begin  // c.addi4spn  -> addi rd', x2, nzuimm
-                        // nzuimm[9:6]=c[10:7], [5:4]=c[12:11], [3]=c[6],
-                        // [2]=c[5], [1:0]=00. Illegal if nzuimm==0.
+                        // nzuimm[9:6]=c[10:7], [5:4]=c[12:11], [3]=c[5],
+                        // [2]=c[6], [1:0]=00. Illegal if nzuimm==0.
+                        // (spec nzuimm[5:4|9:6|2|3]=instr[12:11|10:7|6|5];
+                        //  bit[2] comes from c[6], bit[3] from c[5].)
                         logic [9:0] nz;
-                        nz = {c[10:7], c[12:11], c[6], c[5], 2'b00};
+                        nz = {c[10:7], c[12:11], c[5], c[6], 2'b00};
                         if (nz != 10'd0) begin
                             off = {22'b0, nz};
                             res = mk_i(OPC_OP_IMM, crd, 5'd2, 3'b000, off);
