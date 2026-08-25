@@ -44,6 +44,11 @@
 
 #define PHASE_CHARS 4
 
+/* Iterations before a wait on an interrupt is declared dead. ~10 cycles
+ * per iteration, so 200000 is ~80 ms at 25 MHz -- five orders of magnitude
+ * more than the handful of cycles an interrupt entry actually takes. */
+#define MSI_SPIN_LIMIT 200000u
+
 /* start.S does not zero .bss, and .bss is NOBITS so it is not part of the
  * loaded image either: in hardware these words come up with whatever the
  * BSRAM powered up holding. A `= 0` initialiser is NOT enough -- gcc puts
@@ -89,6 +94,20 @@ static inline uint32_t read_mstatus(void)
 {
     uint32_t v;
     __asm__ volatile("csrr %0, mstatus" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t read_mtvec(void)
+{
+    uint32_t v;
+    __asm__ volatile("csrr %0, mtvec" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t read_mepc(void)
+{
+    uint32_t v;
+    __asm__ volatile("csrr %0, mepc" : "=r"(v));
     return v;
 }
 
@@ -176,6 +195,17 @@ int main(void)
     __asm__ volatile("csrw mtvec, %0" ::"r"((uint32_t)&trap_handler));
     __asm__ volatile("csrs mie, %0" ::"r"(MIE_MEIE));
 
+    /* Read mtvec back against the handler address. A wrong mtvec breaks
+     * every trap and every interrupt at once, and it breaks them
+     * invisibly: the core vectors into whatever the I-mem holds there,
+     * which faults, which vectors to the same wrong place -- a silent trap
+     * storm. The two values must be equal with MODE=00 in the low bits. */
+    uart_puts("MTVEC ");
+    uart_put_hex32(read_mtvec());
+    uart_puts(" HND ");
+    uart_put_hex32((uint32_t)&trap_handler);
+    uart_puts("\r\n");
+
     /* 2a -- send one byte now; it stays queued (nothing reads RXDATA). */
     while (!(read_mip() & MIP_MEIP)) { /* spin */ }
     uart_puts("MIP ");
@@ -193,7 +223,14 @@ int main(void)
      * somewhere that never comes back -- either way the interrupt path is
      * not the thing to look at. */
     __asm__ volatile("ecall");
-    uart_puts(sync_traps ? "TRAP OK\r\n" : "TRAP FAIL\r\n");
+    /* mcause/mepc are the trap's own footprint: mcause == 11 (ecall from
+     * M-mode) and mepc pointing at the ecall prove the trap happened,
+     * independently of the sync_traps counter in D-mem. */
+    uart_puts(sync_traps ? "TRAP OK CAUSE " : "TRAP FAIL CAUSE ");
+    uart_put_hex32(read_mcause());
+    uart_puts(" EPC ");
+    uart_put_hex32(read_mepc());
+    uart_puts("\r\n");
 
     /* 2a'' -- software interrupt (MSIP) before the external one. It is the
      * simplest interrupt in the machine: no peripheral IRQ line, no
@@ -206,10 +243,56 @@ int main(void)
     __asm__ volatile("csrc mie, %0" ::"r"(MIE_MEIE));
     __asm__ volatile("csrs mie, %0" ::"r"(MIE_MSIE));
     MSIP_REG = 1;
+
+    /* Read the register back and dump mip/mie BEFORE enabling
+     * mstatus.MIE. Three data in one line, each one cutting the search
+     * space in a different place:
+     *   REG bit0 set   -> the posted store reached msip_peri, so the LSU
+     *                     peri steering, the bridge and the xbar decode
+     *                     are all good.
+     *   MIP bit3 set   -> msip_o reached csr_regfile (top-level wiring).
+     *   MIE bit3 set   -> the local enable write took.
+     * If all three read right and no interrupt follows, everything except
+     * the taking machinery (int_pending -> take_interrupt -> redirect) has
+     * been cleared. */
+    uart_puts("MSIPREG ");
+    uart_put_hex32(MSIP_REG);
+    uart_puts(" MIP ");
+    uart_put_hex32(read_mip());
+    uart_puts(" MIE ");
+    uart_put_hex32(read_mie());
+    uart_puts("\r\n");
+
     __asm__ volatile("csrsi mstatus, %0" ::"i"(MSTATUS_MIE));
-    while (!msi_count && !bad_cause) { /* spin */ }
+
+    /* Bounded wait. An interrupt that is going to be taken is taken within
+     * a few cycles of mstatus.MIE going high, so a timeout here is a
+     * diagnosis rather than a tolerance: it says every pending and enable
+     * bit was set and the core still did not vector. It also keeps the
+     * board from going silent, which is the least informative failure a
+     * bring-up program can produce. */
+    {
+        uint32_t spin = 0;
+        while (!msi_count && !bad_cause && ++spin < MSI_SPIN_LIMIT) { /* spin */ }
+    }
     __asm__ volatile("csrc mie, %0" ::"r"(MIE_MSIE));
-    uart_puts(msi_count ? "MSI OK\r\n" : "MSI FAIL\r\n");
+    if (msi_count) {
+        uart_puts("MSI OK\r\n");
+    } else {
+        uart_puts("MSI TIMEOUT MST ");
+        uart_put_hex32(read_mstatus());
+        uart_puts(" MIP ");
+        uart_put_hex32(read_mip());
+        uart_puts(" MIE ");
+        uart_put_hex32(read_mie());
+        uart_puts(" BADC ");
+        uart_put_hex32(bad_cause);
+        uart_puts(" CAUSE ");
+        uart_put_hex32(read_mcause());
+        uart_puts(" EPC ");
+        uart_put_hex32(read_mepc());
+        uart_puts("\r\n");
+    }
     __asm__ volatile("csrs mie, %0" ::"r"(MIE_MEIE));
 
     /* 2b + 2c -- external interrupt. mstatus.MIE is already set, so with
