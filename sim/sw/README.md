@@ -8,6 +8,10 @@ instead of the hand-crafted `sim/imem.hex`/`sim/dmem.hex` oracle.
 ## Toolchain
 
 Any rv32-capable toolchain works; override `RISCV_PREFIX` to pick one.
+The esp toolchain named below is gone from the current machine, so in
+practice every build here passes
+`RISCV_PREFIX=/home/giacomo/_toolchains/riscv32-ilp32d--glibc--stable-2024.05-1/bin/riscv32-buildroot-linux-gnu`,
+which is why the Makefiles carry `-fno-pie -no-pie -Wl,-N` (see below).
 The default in the `Makefile` is the bare-metal
 `riscv32-esp-elf-gcc` 14.2.0 (PlatformIO/esphome cache at
 `~/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin`),

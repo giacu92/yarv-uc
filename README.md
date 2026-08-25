@@ -12,22 +12,19 @@ Disclaimer: This project is created by me with the assistance of Claude Code
 > sources are now wired — MSIP, MTIP (CLINT timer), and MEIP (UART IRQ)
 > — behind a 1→3 peripheral mux with a DECERR terminator for unmapped
 > addresses; see **Roadmap** below for what is still missing. Synthesis
-> + PnR are re-confirmed on the build host (2026-08-24, **post-forwarding,
-> with the UART + `axi4_lite_xbar_3` in the build**; the UART TX/RX FIFOs
-> added 2026-08-25 are *not* in that run, so their Fmax impact is
-> unverified):
-> the **active build is the 25 MHz PLL-bypass** (`clk_core = clk_i`,
-> rPLL removed — the chosen operating point), with a verified-closing
-> **35 MHz** rPLL retarget option (knife-edge, +0.040 ns slack) — see
-> the timing note in **Status** below. The execute→decode forward path
-> is **committed and timing-re-verified** (cosim still PASS; 35 MHz
-> closes).
+> + PnR are re-confirmed on the build host (2026-08-25): the **active
+> build runs at 40 MHz** from the on-chip rPLL (25 × 8/5) and **closes at
+> 40.281 MHz actual**. It took two register stages in the datapath to get
+> there — the LSU request and the CSR read — and the design has since been
+> **brought up on silicon**: quicksort prints its 256 values, YarvMon
+> answers on the serial console, and the MEIP oracle passes. See the
+> timing note in **Status** and the bring-up notes in **Roadmap** below.
 
 An RV32IMAC + Zicsr + Zifencei RISC-V processor core targeting a **Gowin
 GW2AR-18C** FPGA (`GW2AR-LV18QN88C8/I7`, QFN88) on a Tang Nano 20k-based
 board. The board is clocked by a 25 MHz single-ended reference from an
 MS5351M clock generator (CLK0 on PIN10, LVCMOS33); an on-chip rPLL
-multiplies it up to a 35 MHz `clk_core` that drives the whole fabric.
+multiplies it up to a 40 MHz `clk_core` that drives the whole fabric.
 
 The core is an **in-order, 3-stage pipeline — Fetch / Decode / Execute
 (F/D/E)** — with a **Harvard** memory system: a dedicated
@@ -105,28 +102,41 @@ instruction-address-misaligned traps, an **illegal-CSR-access** trap
 (unimplemented CSR addrs still silently read 0 / ignore writes), and a
 **PLIC-style interrupt controller** (MEIP is a single ORed level with no
 cause register — the ISR must poll). `fence.i` is a nop (Harvard has no
-D->I write path — self-modifying code unsupported). Synth + PnR of the
-trap + timer path are **re-confirmed** on the build host (2026-08-24,
-**post-forwarding, with the UART + `axi4_lite_xbar_3` in the build**):
-the 64-bit timer compare (two-stage pipelined) + trap redirect mux
-exposed the route-dominated CSR-address fan-out critical path at
-~37 MHz actual (pre-forwarding), so the target was lowered 50 → 40 →
-**35 MHz** (rPLL `IDIV_SEL=4`/`FBDIV_SEL=6`/`ODIV_SEL=16`, VCO 560 MHz).
-PnR closes 35 MHz at **35.049 MHz Actual Fmax, worst setup slack
-+0.040 ns, TNS 0** — a **knife-edge** closure (~40 ps margin; may not
-repeat run-to-run), slightly better than the pre-forwarding
-35.004/+0.004. The critical path shifted post-forwarding to the
-**regfile async read → decode forward mux** (the bypass fanning into
-the D/E operands, 17 logic levels), so the bypass — not the CSR fan-out
-— is now the limiter. The **active build is the 25 MHz PLL-bypass**
-(`clk_core = clk_i` direct, rPLL removed, +2.248 ns slack — the chosen
-operating point); the 35 MHz rPLL config above is the verified-closing
-retarget option (restore the rPLL instance + SDC generated clock +
-`global_freq 35.000` to switch). The execute→decode forward path is
-**committed and timing-re-verified** (cosim still PASS; 35 MHz closes).
-To reclaim a safe 40 MHz, the async CSR read must be pipelined into a
-registered 1-cycle read and/or the forward mux registered (invasive
-Zicsr / decode-latency change, deferred).
+D->I write path — self-modifying code unsupported). Synth + PnR are **re-confirmed on the build host (2026-08-25)** and the
+design **closes 40 MHz at 40.281 MHz actual Fmax** (rPLL
+`IDIV_SEL=4`/`FBDIV_SEL=7`/`ODIV_SEL=16`, VCO 640 MHz, 25 ns period).
+
+Getting there was a sequence of critical paths, each one measured at
+25 MHz and then removed:
+
+| change | slack @25 MHz | Fmax | limiter afterwards |
+|---|---|---|---|
+| (baseline) | +2.2 ns | ~27.7 MHz | regfile async read → decode forward mux |
+| load byte offset latched | +5.320 ns | ~28.9 MHz | store data path into `mtimecmp` |
+| LSU request registered | +10.152 ns | ~33.5 MHz | CSR-address fan-out into the redirect |
+| CSR read registered | +12.577 ns | ~36.5 MHz | regfile → forward → branch compare/target → PC |
+
+The last row says ~36.5 MHz, and 40 MHz needs 25 ns — but every one of
+those numbers was measured under a **40 ns** constraint, where PnR has no
+reason to push. Constrained at 25 ns it found the rest. Worth remembering
+before concluding a target is unreachable: an Fmax reported under a loose
+constraint understates what the tool will do when actually asked.
+
+The two register stages cost cycles, and the cost was measured rather than
+assumed: the LSU request stage is one cycle per memory access (quicksort
+59318 → 63238 cycles, IPC 0.500 → 0.469), while the registered CSR read is
+**free** — 1600 back-to-back CSR reads take 4432 cycles either way,
+because at 2.2 cycles per instruction the single-outstanding I-mem is the
+bottleneck and the extra execute cycle fits inside a bubble that already
+exists. The mirror stage on the load *return* path was implemented,
+measured (another cycle per load, 68014 cycles) and **not kept**: with the
+request registered the board runs correctly and the critical path is far
+from the LSU.
+
+If more headroom is ever wanted, the next limiter is the branch/redirect
+path: compute PC-relative targets in decode (only `jalr` genuinely needs a
+register operand), or register the redirect at the cost of a cycle on
+taken branches.
 
 ## Roadmap (what is next)
 
@@ -137,15 +147,14 @@ The peripheral/interrupt story is the current active front. **MSIP**
 all wired, behind a 1→3 peri mux (`axi4_lite_xbar_3`, base+size windows
 from `rv32_pkg`; unmapped → DECERR). The remaining work, in order:
 
-1. **UART — wired + synthesized, hardware bring-up in progress.** The
+1. **UART — wired, synthesized and brought up on hardware.** The
    UART (`axi4_lite_uart.sv`, TXDATA/RXDATA/STATUS/CTRL/BAUDDIV MMIO at
    `UART_BASE` 0x1000_0000, 8N1, **16-byte TX and RX FIFOs**, level IRQ →
    MEIP, `rxd_i` double-flopped off the async pin) is wired into
    `top_module.sv` and `sim_top.sv`, **added to the `.gprj`** with
    `axi4_lite_xbar_3.sv`, and **has pin assignments in `.cst`**
    (`uart_txd_o` PIN69, `uart_rxd_i` PIN70, the onboard BL616 USB-UART
-   bridge) — synthesized + PnR'd 2026-08-24, *before* the FIFOs, so Fmax
-   needs re-confirming. `BAUDDIV` is a programmable RW register (reset
+   bridge) — synthesized, PnR'd and running on the board at 40 MHz. `BAUDDIV` is a programmable RW register (reset
    from `CLK_FREQ_HZ/BAUD_RATE`, reprogrammable at runtime, applied only
    when TX+RX are idle so an in-flight frame is never corrupted).
 
@@ -157,8 +166,20 @@ from `rv32_pkg`; unmapped → DECERR). The remaining work, in order:
    arriving during the echo was dropped and the command line reached the
    program empty. On hardware YarvMon looked like it ignored every
    command. Reproduced in simulation (`UART_RX_PACED=0`), fixed by the
-   FIFOs, guarded by `sim/hw/uart_tb` (144 checks) and the new
+   FIFOs, guarded by `sim/hw/uart_tb` (146 checks) and the
    `sim/sw_uart_echo` oracle.
+
+   Bring-up then found two more defects in this peripheral. A write to a
+   full TX FIFO was **dropped** while still answering OKAY on the bus,
+   which makes a lost byte indistinguishable from a byte never written —
+   output simply came out truncated after sixteen characters, with nothing
+   reporting a problem. It is now **held**: AWREADY drops for that address
+   and the write commits when the engine frees a slot, bounded by one frame
+   time. And register writes now honour `wstrb[0]`: every register here
+   lives in the low byte of its word, so a byte store to one of the upper
+   lanes addresses no field, yet it used to push `wdata[7:0]` — a NUL. That
+   one showed up from the monitor, where `10000000: 41 42 43` increments
+   the address per byte and so sent 'A' followed by two NULs.
 2. **GPIO.** Direction / output / input registers, per-pin or global
    interrupt. Same MMIO/AXI4-Lite slave template as UART/MSIP.
 3. **Simple PLIC-style interrupt controller.** MEIP is a single ORed
@@ -181,11 +202,33 @@ captures every transmitted byte, and `sim/sw_uart_echo` verifies MEIP end
 to end — `uart_irq_o` → `meip_i` → `mip.MEIP` → `trap_unit` → interrupt
 entry, including the `wfi` wake on an external interrupt.
 
-Also still open: a vectored-mode
-interrupt co-sim (direct mode is covered), and a safe 40 MHz re-target
-(needs the async CSR read pipelined — see the timing note above). S/U
-mode, delegation, PMP, instruction-access-fault, and illegal-CSR-access
-traps remain deferred.
+Also still open: a vectored-mode interrupt co-sim (direct mode is
+covered). S/U mode, delegation, PMP, instruction-access-fault, and
+illegal-CSR-access traps remain deferred. The 40 MHz re-target that used
+to sit on this list is **done** (see the timing note above).
+
+Silicon bring-up (2026-08-25) turned up five defects worth recording,
+because four of them simulation structurally could not show:
+
+- the load byte select read a live combinational value one cycle after it
+  was produced, so a load whose address came through the forward path read
+  the right word but the wrong byte — silicon only, since simulation
+  settles a combinational chain regardless of its depth;
+- the I-mem ROM is sized by GowinSynthesis from its `$readmemh` content,
+  not from the declared depth, so a fetch above the program aliased back
+  into real instructions instead of trapping (images are now padded with
+  `ebreak`);
+- `sp` sat above the top of a memory that decodes fewer address bits, so
+  the stack aliased into the data it was meant to clear;
+- small-data sections (`.srodata`/`.sdata`/`.sbss`) were never collected by
+  the link scripts, so any constant up to 8 bytes read as 0 at runtime
+  while the same constant folded at compile time read correctly;
+- the UART's dropped write described above.
+
+The pattern they shared: when hardware and simulation disagree, suspect a
+value whose *lifetime* differs between the two, and instrument so that the
+reporting path is not itself under test — which is what `sim/sw_isa_probe`
+exists for.
 
 The CPU exposes **three** ports (Harvard): a native `imem` (fetch,
 read-only), a native `dmem` (LSU data, byte-strobed), and an AXI4-Lite
@@ -227,13 +270,15 @@ make run        # hand-crafted imem.hex/dmem.hex oracle (fetch/decode/retire log
 make sw-run     # build the C program + run the sim loading it (Harvard)
 ```
 
-Each run prints a retire/IPC/stall summary. On the Harvard build the
-recursive quicksort retires at **IPC ~0.5** (~20% of cycles stalled, the
-bulk of it waiting on the LSU); the dedicated I-mem removes fetch/LSU bus
-contention (measured on the earlier 32-element array: 4711 cycles / IPC
-~0.46 Harvard against 5863 / ~0.37 for the dropped von-Neumann build). The
-program now sorts 256 words and prints the array before and after, so the
-run is longer; `make sw-run PRINT_ARRAY=0` gives the print-free variant.
+Each run prints a retire/IPC/stall summary. The recursive quicksort sorts
+256 words and retires at **IPC ~0.47** (29668 retires in 63238 cycles,
+print-free variant) — the LSU request register stage costs one cycle per
+access, and the single-outstanding I-mem is what sets the ~2.2 cycles per
+instruction underneath that. The dedicated I-mem removes fetch/LSU bus
+contention: measured on the earlier 32-element array, 4711 cycles / IPC
+~0.46 Harvard against 5863 / ~0.37 for the dropped von-Neumann build.
+`make sw-run PRINT_ARRAY=0` builds the print-free variant (the default
+prints the array before and after, which makes the run UART-bound).
 
 See `sim/README.md` for the logs, VCD/GTKWave, the native-RAM
 (`sim/hw/native_mem_tb/`) and AXI4-Lite RAM (`sim/hw/ram_tb/`) compliance

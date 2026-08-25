@@ -132,20 +132,24 @@ Environment knobs:
   arriving during the echo was dropped and the command line arrived
   empty. Keep it in any UART regression — the paced default cannot
   provoke an overrun by construction.
-- `UART_BIT_CYCLES=217` — clocks per bit in the driver. Must match the
-  UART instance; pair it with a board-accurate build (below).
+- `UART_BIT_CYCLES=<n>` — clocks per bit in the driver. Must match the
+  UART instance: 347 for the active 40 MHz board build, 217 for the 25 MHz
+  PLL-bypass one. Pair it with a board-accurate build (below).
 - `NO_VCD=1` — skip the waveform dump. A board-accurate run is millions
   of cycles, i.e. a multi-gigabyte VCD.
 
 `sim_top`'s UART clock/baud are parameters, so the sim can run either
 fast (default 50 MHz / 10 MHz = 5 clocks per bit) or with the board's
-real divisor (25 MHz / 115200 = 217 clocks per bit) to check the RX
+real divisor to check the RX
 sampling phase at the ratio the hardware actually uses:
 
 ```
 rm -rf obj_dir
-make VPARAMS="-GUART_CLK_HZ=25000000 -GUART_BAUD=115200"
-NO_VCD=1 UART_BIT_CYCLES=217 UART_RX='2000\r' MAX_CYC=400000 \
+# The board now runs clk_core at 40 MHz (rPLL 25 x 8/5), so its divisor is
+# 40e6/115200 = 347 clocks per bit. Pass the numbers of whichever build you
+# are reproducing -- 25 MHz/217 for the PLL-bypass build.
+make VPARAMS="-GUART_CLK_HZ=40000000 -GUART_BAUD=115200"
+NO_VCD=1 UART_BIT_CYCLES=347 UART_RX='2000\r' MAX_CYC=400000 \
   ./obj_dir/Vsim_top +IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex
 rm -rf obj_dir && make        # back to the fast default
 ```
@@ -159,8 +163,10 @@ BFM master driving `axi4_lite_uart` directly, with a continuous 8N1
 decoder on `txd_o` and a frame driver on `rxd_i` (10 clocks per bit).
 Checks the FIFO contract and the interrupt, not just the AXI handshake:
 queued TX bytes ship in order with no polling in between; TX_READY drops
-when the TX FIFO is full and a write to a full FIFO is dropped (the bus
-still returns OKAY); an RX burst inside the depth is fully retained in
+when the TX FIFO is full and a write to a full FIFO is **held** until room
+appears — the test measures how many cycles the write took, so it can tell
+a held write from an immediate one, and checks the byte still ships in
+order; an RX burst inside the depth is fully retained in
 order with RX_OVERRUN clear; one frame past the depth is dropped and
 latches RX_OVERRUN while the queued bytes survive; reading an empty RX
 FIFO pops nothing (no pointer underflow); the IRQ is level-sensitive and
@@ -168,7 +174,7 @@ gated by CTRL — nothing fires until an enable is written, and it
 deasserts when software drains the condition.
 
 ```
-cd hw/uart_tb && make run     # "144 checks, 0 failures"
+cd hw/uart_tb && make run     # "146 checks, 0 failures"
 ```
 
 ## UART echo + external-interrupt (MEIP) oracle (`sw_uart_echo/`)
@@ -194,6 +200,31 @@ It doubles as the hardware bring-up program: it is deliberately smaller
 and dumber than YarvMon, so on a board that shows no echo, phase 1 tells
 you whether bytes reach the CPU at all and phase 2 whether the interrupt
 path works.
+
+Bring-up added probes that are worth keeping, because between them they
+turned a board that went silent into a board that says where it is:
+
+- `PAT` prints two literals with every nibble distinct, so the hex printer
+  is checked before anything is concluded from the values it prints. That
+  was not paranoia: on silicon every hex value came out with the low two
+  bits of each nibble cleared, which looked exactly like corrupted CSRs.
+- `CSRW` writes and reads back `mscratch`/`mcause`/`mepc`/`mtval` with
+  walking patterns, which separates "the register does not hold this bit"
+  from "the value was computed wrong".
+- `MTVEC` is read back against the handler address. A wrong `mtvec` breaks
+  every trap at once and does it invisibly, by vectoring into whatever the
+  I-mem holds there.
+- the handler prints `H<mcause>@<mepc>` on entry and `X` before every
+  return, so "died in the handler" and "returned somewhere wrong" are
+  distinguishable.
+- interrupt waits are bounded and print the full CSR state on timeout.
+  An unbounded spin on an interrupt that never arrives looks identical to
+  a dead UART, a dead core and a trap storm.
+
+`make UART_TX_PACED=1` builds it with a software delay instead of the
+`TX_READY` poll, so a single byte is in flight at a time and the TX FIFO
+never fills — that is what separates "the FIFO filled" from "the poll
+never returned".
 
 ## ISA / memory probe (`sw_isa_probe/`)
 
