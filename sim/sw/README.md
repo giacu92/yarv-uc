@@ -7,15 +7,33 @@ instead of the hand-crafted `sim/imem.hex`/`sim/dmem.hex` oracle.
 
 ## Toolchain
 
-Uses the prebuilt bare-metal RISC-V toolchain already on the machine —
-**no install needed**:
+Any rv32-capable toolchain works; override `RISCV_PREFIX` to pick one.
+The default in the `Makefile` is the bare-metal
+`riscv32-esp-elf-gcc` 14.2.0 (PlatformIO/esphome cache at
+`~/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin`),
+which supports `-march=rv32imac -mabi=ilp32` and ships full binutils.
 
-- `riscv32-esp-elf-gcc` 14.2.0 (PlatformIO/esphome cache) at
-  `~/esphome/config/.esphome/platformio/packages/toolchain-riscv32-esp/bin`.
-- Supports `-march=rv32imac -mabi=ilp32`; has full binutils
-  (`ld`, `objcopy`, `objdump`).
+A **linux/glibc** toolchain also works, e.g.
 
-Override `RISCV_PREFIX` in the `Makefile` to use another rv32 toolchain.
+```
+make RISCV_PREFIX=/home/giacomo/_toolchains/riscv32-ilp32d--glibc--stable-2024.05-1/bin/riscv32-buildroot-linux-gnu
+```
+
+but it needs two flags that every firmware `Makefile` in this tree now
+carries, because both of its defaults are wrong for a freestanding
+Harvard image:
+
+- **`-fno-pie`** — that toolchain defaults to PIE, so `gas` expands
+  `la sym` into a GOT load (`auipc` + `lw` from `.got`) and gcc emits
+  PC-relative data addressing. Neither survives here: there is no GOT in
+  a flat two-image layout, and `link.ld` requires medlow **absolute**
+  addressing (`lui` + `addi`) so that a data address computed inside
+  `.text` resolves in D-mem, not I-mem. Without it `sim/sw_trap` loaded
+  `mtvec` from an uninitialised `.got` word and reboot-looped.
+- **`-no-pie -Wl,-N`** — its `ld` emits a `PT_PHDR` segment that the flat
+  `MEMORY` layout does not cover, failing the link with "PHDR segment not
+  covered by LOAD segment". `-N` (omagic) drops it. Harmless on a
+  bare-metal toolchain.
 
 ## Build & run
 

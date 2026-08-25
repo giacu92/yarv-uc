@@ -32,10 +32,23 @@ OBJDUMP := $(RISCV_PREFIX)-objdump
 ARCH := rv32imac
 ABI  := ilp32
 
+# -fno-pie: a linux/glibc toolchain (riscv32-buildroot-linux-gnu) defaults
+# to PIE, which makes gas expand `la sym` into a GOT load (auipc + lw from
+# .got) and gcc emit PC-relative data addressing. Both are wrong here: the
+# GOT does not exist in a flat two-image layout, and link.ld requires
+# medlow ABSOLUTE addressing (lui + addi) so a data address computed in
+# .text lands in D-mem instead of I-mem. Without this, mtvec ends up loaded
+# from an uninitialised .got word.
 CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-          -fno-builtin -fno-stack-protector -fomit-frame-pointer -O2 -Wall -g
+          -fno-builtin -fno-stack-protector -fomit-frame-pointer -O2 -Wall -g -fno-pie
+# -no-pie -Wl,-N: needed when RISCV_PREFIX points at a *linux* (glibc)
+# toolchain such as riscv32-buildroot-linux-gnu instead of a bare-metal
+# one. That ld defaults to emitting a PT_PHDR segment, which link.ld's
+# flat MEMORY layout does not cover ("PHDR segment not covered by LOAD
+# segment"); -no-pie plus -N (omagic, single writable non-demand-paged
+# LOAD) drops it. Harmless on a bare-metal toolchain.
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-           -T link.ld -Wl,--no-relax -Wl,--no-check-sections
+           -T link.ld -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
 
 BUILD := build
 ELF     := $(BUILD)/program.elf
