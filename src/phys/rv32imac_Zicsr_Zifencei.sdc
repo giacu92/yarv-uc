@@ -18,16 +18,17 @@
 create_clock -name clk25 -period 40 [get_ports {clk_i}]
 
 # CPU core clock.
-# *** 25 MHz PLL-BYPASS MODE (active): clk_core = clk_i (no rPLL), so it
-# inherits the 25 MHz clk25 constraint above (40 ns). The generated-clock
-# constraint used for the 35 MHz rPLL build is commented out below. To
-# retarget 35 MHz: restore top_module's rPLL instance AND uncomment the
-# create_generated_clock here (and set pnr_check.tcl / cmd.do global_freq
-# back to 35.000). ***
+# *** 40 MHz rPLL MODE (active): clk_core = clk_i * 8 / 5 = 40 MHz, period
+# 25 ns. Must agree with top_module's rPLL (IDIV_SEL=4 / FBDIV_SEL=7 /
+# ODIV_SEL=16) and with global_freq in pnr_check.tcl / impl/pnr/cmd.do — if
+# these three disagree the reports are constrained to something the design
+# does not run at. To fall back to the 25 MHz PLL-bypass build: comment the
+# rPLL out in top_module, comment this line out again (clk_core then
+# inherits clk25's 40 ns), and set global_freq back to 25.000. ***
 # Gowin auto-derives a clock on the rPLL output (named *.default_gen_clk);
 # this explicit constraint takes precedence (a PnR warning is expected and
 # harmless — it just names the clock clk_core for the timing reports).
-# create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 7 -divide_by 5 [get_nets {clk_core}]
+create_generated_clock -name clk_core -source [get_ports {clk_i}] -master_clock clk25 -multiply_by 8 -divide_by 5 [get_nets {clk_core}]
 
 # Async reset: treat rst_i (board reset button S1, active-high on this
 # board) as asynchronous to the fabric clocks.
@@ -43,7 +44,7 @@ set_false_path -from [get_ports {uart_rxd_i}]
 set_false_path -to [get_ports {led_o[*]}]
 
 # Single clock domain: the CPU, both AXI4-Lite bridges, the buses and
-# the axi4_lite_ram slave all run on clk_core (35 MHz, generated above).
+# the peripheral slaves all run on clk_core (40 MHz, generated above).
 # clk_i (25 MHz, clk25) only feeds the rPLL — there are no user-logic
 # paths on clk25, so there is no clock-domain crossing to cut. Slave
 # outputs (rdata, rvalid, etc.) are registered in axi4_lite_ram and

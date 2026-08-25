@@ -65,76 +65,73 @@ module top_module (
     //   clk_i = 25 MHz (MS5351M clock generator, crystal-fed; CLK0 on
     //   PIN10, single-ended LVCMOS33)
     //
-    // Internal CPU clock (rPLL CLKOUT) — target 35 MHz:
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 7 / 5 = 35 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=6 -> FBDIV=7; ODIV_SEL=16 sets
-    //   the VCO = 25*7*16/5 = 560 MHz and does NOT divide CLKOUT).
-    //   Period = 40 * 5 / 7 = 28.571 ns. Constrained in the SDC.
+    // Internal CPU clock (rPLL CLKOUT) — target 40 MHz:
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 8 / 5 = 40 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=7 -> FBDIV=8; ODIV_SEL=16 sets
+    //   the VCO = 25*8*16/5 = 640 MHz and does NOT divide CLKOUT).
+    //   Period = 25 ns. Constrained in the SDC as a generated clock.
     //
-    // PnR closes 35 MHz knife-edge: 35.004 MHz Actual Fmax, +0.004 ns
-    // worst setup slack (verified 2026-08-22). The route-dominated
-    // CSR-address fan-out critical path runs at ~37 MHz actual, so 35 MHz
-    // is the boundary — essentially zero margin, may not repeat run-to-run.
-    // Comfortable fallback if a re-run fails: drop the rPLL and tie
-    //   assign clk_core = clk_i;   // 25 MHz PLL-bypass, +2.248 ns slack
-    // (the rPLL cannot do a clean 25 MHz out: VCO = 25*ODIV_SEL <= 400
-    // < the 500 MHz floor, so 25 MHz bypasses the PLL entirely).
+    // Constraint check for this device: PFD = FCLKIN/IDIV = 5 MHz (range
+    // 3-400 MHz), CLKOUT = 40 MHz (range 3.125-600), VCO = 640 MHz (range
+    // 500-1250, and ODIV_SEL maxes out at 16 on this primitive — larger
+    // values are silently replaced by the default 8, which would drop the
+    // VCO to 320 and trip EX0311).
     //
-    // VCO must stay in 500-1250 MHz (GowinSynthesis EX0311 range), and
-    // ODIV_SEL is a bounded rPLL parameter (max 16 on this primitive;
-    // larger values get replaced by the default 8, dropping the VCO
-    // below the floor and tripping EX0311). For 35 MHz out the VCO is
-    // 35*ODIV_SEL, so ODIV_SEL=16 gives the max VCO = 560 MHz (above the
-    // 500 floor, +60 margin).
-    // -----------------------------------------------------------------
-
+    // 40 MHz is a target, not a verified closure. The last measured build
+    // was 25 MHz PLL-bypass at +10.152 ns slack (~33.5 MHz Fmax) with the
+    // critical path on the CSR-address fan-out, and that fan-out has since
+    // been registered, so whether the remaining paths make 25 ns is what
+    // the next PnR run answers. The fallback recipe is below the rPLL.
     // clk_core frequency, in Hz. MUST track the clock source below: it is
     // what the UART divides down to hit BAUD_RATE, so editing the clock
     // source without editing this too leaves the UART running at the wrong
     // baud (garbage on the wire).
     //
-    // *** 25 MHz PLL-BYPASS MODE (active). ***
-    // clk_core = clk_i directly (the 25 MHz MS5351M reference on PIN10),
-    // rPLL disabled. This is the documented fallback (+2.248 ns setup
-    // slack vs the knife-edge 35 MHz rPLL path) AND a diagnostic: it
-    // removes the rPLL from the picture, so if the design still does not
-    // come alive on silicon the clock reference itself (clk_i / MS5351M)
-    // is the culprit, not the rPLL. UART baud at 25 MHz: BAUDDIV resets to
-    // CLK_FREQ_HZ/BAUD_RATE-1 = 216, so baud = 25e6/217 = 115 207 Hz
-    // (115200, 0.006% off, well within RS-232 tolerance). To return to
-    // 35 MHz: restore the rPLL instance below and set CLK_CORE_HZ =
-    // 35_000_000.
-    localparam int unsigned CLK_CORE_HZ = 25_000_000;
+    // *** 40 MHz rPLL MODE (active). ***
+    // MUST match the rPLL settings below: this is what the UART divides
+    // down to hit BAUD_RATE, so changing one without the other puts the
+    // serial line at the wrong baud, which on a board looks exactly like a
+    // dead core. At 40 MHz BAUDDIV resets to CLK_FREQ_HZ/BAUD_RATE-1 = 346,
+    // giving 40e6/347 = 115 274 Hz against a nominal 115 200 (+0.06%, well
+    // inside RS-232 tolerance).
+    localparam int unsigned CLK_CORE_HZ = 40_000_000;
 
-    wire clk_core = clk_i;  // PLL-bypass: core runs on the 25 MHz reference
-    wire pll_lock = 1'b1;  // no rPLL -> always "locked"
+    wire clk_core;
+    wire pll_lock;
 
-    // rPLL instance (disabled in bypass mode). Restore this block (and
-    // change CLK_CORE_HZ to 35_000_000, clk_core/pll_lock back to declared
-    // wires) to retarget 35 MHz. Kept here so the bypass is a one-spot
-    // toggle, not a delete-and-rewrite.
-    // rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
-    //     .FCLKIN   ("25"),
-    //     .IDIV_SEL (4),     // -> PFD = 5 MHz (range: 3-400 MHz)
-    //     .FBDIV_SEL(6),     // -> CLKOUT = 35 MHz (range: 3.125-600 MHz)
-    //     .ODIV_SEL (16)     // -> VCO = 560 MHz (range: 500-1250 MHz; ODIV_SEL max 16)
-    // ) pll (
-    //     .CLKOUTP (),
-    //     .CLKOUTD (),
-    //     .CLKOUTD3(),
-    //     .RESET   (1'b0),
-    //     .RESET_P (1'b0),
-    //     .CLKFB   (1'b0),
-    //     .FBDSEL  (6'b0),
-    //     .IDSEL   (6'b0),
-    //     .ODSEL   (6'b0),
-    //     .PSDA    (4'b0),
-    //     .DUTYDA  (4'b0),
-    //     .FDLY    (4'b0),
-    //     .CLKIN   (clk_i),     // 25 MHz
-    //     .CLKOUT  (clk_core),  // 35 MHz
-    //     .LOCK    (pll_lock)
-    // );
+    rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
+        .FCLKIN   ("25"),
+        .IDIV_SEL (4),     // -> IDIV = 5,  PFD    =   5 MHz (range 3-400)
+        .FBDIV_SEL(7),     // -> FBDIV = 8, CLKOUT =  40 MHz (range 3.125-600)
+        .ODIV_SEL (16)     // ->            VCO    = 640 MHz (range 500-1250)
+    ) pll (
+        .CLKOUTP (),
+        .CLKOUTD (),
+        .CLKOUTD3(),
+        .RESET   (1'b0),
+        .RESET_P (1'b0),
+        .CLKFB   (1'b0),
+        .FBDSEL  (6'b0),
+        .IDSEL   (6'b0),
+        .ODSEL   (6'b0),
+        .PSDA    (4'b0),
+        .DUTYDA  (4'b0),
+        .FDLY    (4'b0),
+        .CLKIN   (clk_i),     // 25 MHz reference
+        .CLKOUT  (clk_core),  // 40 MHz core clock
+        .LOCK    (pll_lock)
+    );
+
+    // Falling back to the 25 MHz PLL-bypass build is three lines: comment
+    // the rPLL out and restore
+    //   localparam int unsigned CLK_CORE_HZ = 25_000_000;
+    //   wire clk_core = clk_i;
+    //   wire pll_lock = 1'b1;
+    // then re-comment the SDC's create_generated_clock and set
+    // pnr_check.tcl / cmd.do global_freq back to 25.000. The bypass is also
+    // the diagnostic configuration: it takes the rPLL out of the picture, so
+    // a board that still does not come alive points at the clock reference
+    // (clk_i / MS5351M) rather than at the PLL.
 
     // -----------------------------------------------------------------
     // Reset synchronization
