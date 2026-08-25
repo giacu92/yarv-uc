@@ -33,12 +33,14 @@
 #define MIE_MEIE    (1u << 11)
 #define MIP_MEIP    (1u << 11)
 #define MCAUSE_MEI  0x8000000Bu
+#define MCAUSE_ECALL_M 11u
 
 #define PHASE_CHARS 4
 
 /* .bss is not zeroed by start.S, so anything needing a known initial
  * value lives in .data (an explicit initialiser puts it there). */
 static volatile uint32_t irq_chars = 0;  /* bytes echoed by the handler */
+static volatile uint32_t sync_traps = 0; /* ecall traps taken */
 static volatile uint32_t bad_cause = 0;  /* unexpected mcause, if any */
 
 static volatile uint32_t *const result = (volatile uint32_t *)0x3000;
@@ -57,6 +59,20 @@ static inline uint32_t read_mip(void)
     return v;
 }
 
+static inline uint32_t read_mie(void)
+{
+    uint32_t v;
+    __asm__ volatile("csrr %0, mie" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t read_mstatus(void)
+{
+    uint32_t v;
+    __asm__ volatile("csrr %0, mstatus" : "=r"(v));
+    return v;
+}
+
 /* GCC's machine-interrupt attribute emits the register save/restore and
  * the mret for us; mtvec is programmed to this address in direct mode.
  *
@@ -69,6 +85,17 @@ static inline uint32_t read_mip(void)
 __attribute__((interrupt("machine"), aligned(4))) void trap_handler(void)
 {
     uint32_t cause = read_mcause();
+
+    if (cause == MCAUSE_ECALL_M) {
+        /* Sync-trap probe (see main). mret returns to mepc, which points
+         * AT the ecall, so step over it or we would trap forever. ecall is
+         * always the 4-byte encoding. */
+        uint32_t epc;
+        __asm__ volatile("csrr %0, mepc" : "=r"(epc));
+        __asm__ volatile("csrw mepc, %0" ::"r"(epc + 4));
+        sync_traps = sync_traps + 1;
+        return;
+    }
 
     if (cause != MCAUSE_MEI) {
         /* Not the external interrupt: record it and mask everything so we
@@ -119,10 +146,34 @@ int main(void)
     while (!(read_mip() & MIP_MEIP)) { /* spin */ }
     uart_puts("MIP ");
     uart_put_hex32(read_mip());
+    uart_puts(" MIE ");
+    uart_put_hex32(read_mie());
+    uart_puts(" MST ");
+    uart_put_hex32(read_mstatus());
     uart_puts("\r\n");
+
+    /* 2a' -- does trap entry work AT ALL? A synchronous ecall does not
+     * depend on mstatus.MIE, mie or the interrupt arbitration, only on
+     * mtvec and the redirect. If this prints FAIL the ecall retired
+     * without trapping; if nothing prints at all, the vector landed
+     * somewhere that never comes back -- either way the interrupt path is
+     * not the thing to look at. */
+    __asm__ volatile("ecall");
+    uart_puts(sync_traps ? "TRAP OK\r\n" : "TRAP FAIL\r\n");
 
     /* 2b + 2c */
     __asm__ volatile("csrsi mstatus, %0" ::"i"(MSTATUS_MIE));
+
+    /* With a byte already queued and the IRQ level-high, the interrupt is
+     * taken before this line runs, so the echoed byte appears BEFORE this
+     * print. Reading mstatus back here is the last discriminator: if it
+     * shows MIE set and no byte was echoed, then mip, mie, mstatus and
+     * trap entry are all provably fine and the interrupt simply is not
+     * being taken -- which points at the arbitration/timing, not the
+     * peripheral. */
+    uart_puts("MST2 ");
+    uart_put_hex32(read_mstatus());
+    uart_puts("\r\n");
 
     while (irq_chars < PHASE_CHARS && !bad_cause) __asm__ volatile("wfi");
 
