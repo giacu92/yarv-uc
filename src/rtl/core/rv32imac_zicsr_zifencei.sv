@@ -41,7 +41,13 @@ import rv32_pkg::*;
  * neither inputs nor outputs).
  */
 
-module rv32imac_zicsr_zifencei (
+module rv32imac_zicsr_zifencei #(
+    // Implemented I-mem size in address bits, forwarded to fetch so a PC
+    // outside it raises an instruction access fault instead of aliasing
+    // back into the image. Must match the I-mem instantiated at the top
+    // level (native_ram's ADDR_W).
+    parameter int IMEM_ADDR_W = 14
+) (
     input wire clk_i,
     input wire rstn_i,
 
@@ -100,6 +106,7 @@ module rv32imac_zicsr_zifencei (
     wire      [XLEN-1:0] fe_pc;
     wire      [XLEN-1:0] fe_instr;
     wire                 fe_valid;
+    wire                 fe_fault;
 
     // Decode -> fetch back-pressure (propagates execute's stall).
     wire                 dec_stall;
@@ -173,7 +180,9 @@ module rv32imac_zicsr_zifencei (
     // execute stage's div stall). branch_* come from the execute stage's
     // branch-resolve path (redirect + in-flight flush).
     // -------------------------------------------------------------
-    fetch_stage fetch_stage_i (
+    fetch_stage #(
+        .IMEM_ADDR_W(IMEM_ADDR_W)
+    ) fetch_stage_i (
         .clk_i         (clk_i),
         .rstn_i        (rstn_i),
         .boot_addr_i   (boot_addr_i),
@@ -184,7 +193,8 @@ module rv32imac_zicsr_zifencei (
         .imem_rsp_i    (fe_rsp),
         .fe_instr_o    (fe_instr),
         .fe_pc_o       (fe_pc),
-        .fe_valid_o    (fe_valid)
+        .fe_valid_o    (fe_valid),
+        .fe_fault_o    (fe_fault)
     );
 
     // -------------------------------------------------------------
@@ -285,6 +295,7 @@ module rv32imac_zicsr_zifencei (
         .fe_instr_i  (fe_instr),
         .fe_pc_i     (fe_pc),
         .fe_valid_i  (fe_valid),
+        .fe_fault_i  (fe_fault),
         .rs1_addr_o  (rs1_addr),
         .rs2_addr_o  (rs2_addr),
         .rs1_data_i  (rs1_data),

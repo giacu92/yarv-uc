@@ -196,6 +196,7 @@ package rv32_pkg;
 
     // mcause exception / interrupt codes (mcause[31]=1 -> interrupt).
     // XLEN-wide so they map 1:1 onto the mcause register.
+    localparam logic [XLEN-1:0] MCAUSE_INSTR_ACC = 32'h0000_0001;  // instruction access fault
     localparam logic [XLEN-1:0] MCAUSE_ILLEGAL = 32'h0000_0002;  // illegal instruction
     localparam logic [XLEN-1:0] MCAUSE_BREAKPOINT = 32'h0000_0003;  // ebreak
     localparam logic [XLEN-1:0] MCAUSE_LAD_MIS = 32'h0000_0004;  // load addr misaligned

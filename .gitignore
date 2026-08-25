@@ -62,5 +62,8 @@ sim/sw_uart_echo/build/
 # ISA probe build artefacts (regenerable)
 sim/sw_isa_probe/build/
 
+# Instruction-access-fault oracle build artefacts (regenerable)
+sim/sw_ifault/build/
+
 # UART TX capture written by the sim harness (sim_top's tx monitor).
 sim/sim_uart_tx.txt

@@ -106,7 +106,14 @@ import rv32_pkg::*;
  * register (and to disambiguate fe_pc_q from pc_q, the next-fetch
  * address).
  */
-module fetch_stage (
+module fetch_stage #(
+    // Implemented I-mem size, in address bits (2**IMEM_ADDR_W bytes). A PC
+    // outside that range cannot be fetched: the memory decodes only these
+    // bits, so the access would alias back into real instructions and
+    // execute them. Fetch raises an instruction access fault instead. Must
+    // match the I-mem actually instantiated at the top level.
+    parameter int IMEM_ADDR_W = 14
+) (
     input wire clk_i,
     input wire rstn_i,
 
@@ -128,7 +135,8 @@ module fetch_stage (
     // `fe_`). Any further debug is added on demand.
     output wire [XLEN-1:0] fe_instr_o,  // F/D instruction word
     output wire [XLEN-1:0] fe_pc_o,     // F/D instruction PC (exact)
-    output wire            fe_valid_o   // F/D valid (held level)
+    output wire            fe_valid_o,  // F/D valid (held level)
+    output wire            fe_fault_o   // F/D entry is an access fault, not an instruction
 );
 
     // -----------------------------------------------------------------
@@ -148,6 +156,8 @@ module fetch_stage (
     logic [XLEN-1:0] fe_instr_q, fe_instr_d;
 
     logic skid_valid_q, skid_valid_d;
+    logic skid_fault_q, skid_fault_d;
+    logic fe_fault_q, fe_fault_d;
     logic [XLEN-1:0] skid_pc_q, skid_pc_d;
     logic [XLEN-1:0] skid_instr_q, skid_instr_d;
 
@@ -163,6 +173,14 @@ module fetch_stage (
     // -----------------------------------------------------------------
     wire buf_room = !fe_valid_q || !skid_valid_q;
 
+    // PC outside the implemented I-mem. No bus request is issued for it --
+    // there is nothing there to read, and the memory would answer with an
+    // aliased word from inside the image, which is how a runaway redirect
+    // used to keep executing plausible code silently. Instead a FIFO entry
+    // is pushed with fault=1, and decode turns it into a precise
+    // instruction-access-fault trap carrying this PC as mtval.
+    wire pc_fault = |pc_q[XLEN-1:IMEM_ADDR_W];
+
     always_comb begin
         // Accept read data when the FIFO has a free slot, or drain a
         // flushed (redirected) response to free the bridge.
@@ -172,7 +190,7 @@ module fetch_stage (
         // FIFO has a free slot for the response. The skid slot lets
         // fetch run ahead of decode (issue while F/D is full, response
         // -> skid) while keeping the bus drainable for the LSU.
-        imem_req_o.wvalid = !busy_q && !branch_valid_i && buf_room;
+        imem_req_o.wvalid = !busy_q && !branch_valid_i && buf_room && !pc_fault;
         imem_req_o.we     = 1'b0;
         imem_req_o.addr   = pc_q;
         imem_req_o.wdata  = '0;
@@ -181,6 +199,17 @@ module fetch_stage (
 
     wire launch = imem_req_o.wvalid && imem_rsp_i.wready;  // req accepted
     wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready;  // read data consumed
+
+    // A faulting PC enqueues without a bus round trip: nothing is in flight
+    // (the issue gate refused it) and nothing will answer, so the entry is
+    // synthesised here in the same slot a response would have taken. The
+    // instruction word is a don't-care -- decode traps on the flag, not on
+    // the word.
+    wire fault_push = pc_fault && !busy_q && !branch_valid_i && buf_room;
+    wire push = rsp_cap || fault_push;
+    wire [XLEN-1:0] push_pc = rsp_cap ? req_pc_q : pc_q;
+    wire [XLEN-1:0] push_instr = rsp_cap ? imem_rsp_i.rdata : 32'd0;
+    wire push_fault = !rsp_cap;
 
     // -----------------------------------------------------------------
     // Next-state / datapath (combinational)
@@ -194,7 +223,9 @@ module fetch_stage (
         fe_valid_d   = fe_valid_q;
         fe_pc_d      = fe_pc_q;
         fe_instr_d   = fe_instr_q;
+        fe_fault_d   = fe_fault_q;
         skid_valid_d = skid_valid_q;
+        skid_fault_d = skid_fault_q;
         skid_pc_d    = skid_pc_q;
         skid_instr_d = skid_instr_q;
 
@@ -240,29 +271,35 @@ module fetch_stage (
                 pc_d     = (pc_q & ~32'h3) + 32'd4;  // pc runs ahead (word-aligned)
             end
 
-            // Enqueue a response (rsp_cap implies busy_q -> busy_d=0).
-            // Mutually exclusive with launch (busy_q).
-            if (rsp_cap) begin
-                busy_d = 1'b0;
+            // Enqueue either a read response or a synthesised fault entry.
+            // The two are mutually exclusive (a fault issues no request, so
+            // nothing can be in flight for it) and both are mutually
+            // exclusive with launch (which needs !busy_q and !pc_fault).
+            if (push) begin
+                if (rsp_cap) busy_d = 1'b0;
+                if (fault_push) pc_d = (pc_q & ~32'h3) + 32'd4;
                 if (fe_valid_q && !stall_i) begin
                     // F/D is being consumed this cycle: load the response
                     // straight into F/D (no skid, no bubble).
                     fe_valid_d = 1'b1;
-                    fe_pc_d    = req_pc_q;
-                    fe_instr_d = imem_rsp_i.rdata;
+                    fe_pc_d    = push_pc;
+                    fe_instr_d = push_instr;
+                    fe_fault_d = push_fault;
                 end else if (fe_valid_q) begin
                     // F/D full and held (stalled): land in the skid. The
                     // issue gate reserved this slot (buf_room was true at
                     // issue, and skid_valid_q is 0 here — a read is never
                     // in flight while the skid is full), so this is safe.
                     skid_valid_d = 1'b1;
-                    skid_pc_d    = req_pc_q;
-                    skid_instr_d = imem_rsp_i.rdata;
+                    skid_pc_d    = push_pc;
+                    skid_instr_d = push_instr;
+                    skid_fault_d = push_fault;
                 end else begin
                     // F/D empty: land directly in F/D (head).
                     fe_valid_d = 1'b1;
-                    fe_pc_d    = req_pc_q;
-                    fe_instr_d = imem_rsp_i.rdata;
+                    fe_pc_d    = push_pc;
+                    fe_instr_d = push_instr;
+                    fe_fault_d = push_fault;
                 end
             end else if (fe_valid_q && !stall_i) begin
                 // Decode consumes F/D (head). Promote the skid (tail) into
@@ -272,6 +309,7 @@ module fetch_stage (
                     fe_valid_d   = 1'b1;
                     fe_pc_d      = skid_pc_q;
                     fe_instr_d   = skid_instr_q;
+                    fe_fault_d   = skid_fault_q;
                     skid_valid_d = 1'b0;
                 end else begin
                     fe_valid_d = 1'b0;
@@ -285,6 +323,7 @@ module fetch_stage (
                 fe_valid_d   = 1'b1;
                 fe_pc_d      = skid_pc_q;
                 fe_instr_d   = skid_instr_q;
+                fe_fault_d   = skid_fault_q;
                 skid_valid_d = 1'b0;
             end
         end
@@ -302,9 +341,11 @@ module fetch_stage (
             fe_valid_q   <= 1'b0;
             fe_pc_q      <= '0;
             fe_instr_q   <= '0;
+            fe_fault_q   <= 1'b0;
             skid_valid_q <= 1'b0;
             skid_pc_q    <= '0;
             skid_instr_q <= '0;
+            skid_fault_q <= 1'b0;
         end else begin
             pc_q         <= pc_d;
             req_pc_q     <= req_pc_d;
@@ -313,15 +354,18 @@ module fetch_stage (
             fe_valid_q   <= fe_valid_d;
             fe_pc_q      <= fe_pc_d;
             fe_instr_q   <= fe_instr_d;
+            fe_fault_q   <= fe_fault_d;
             skid_valid_q <= skid_valid_d;
             skid_pc_q    <= skid_pc_d;
             skid_instr_q <= skid_instr_d;
+            skid_fault_q <= skid_fault_d;
         end
     end
 
     assign fe_pc_o    = fe_pc_q;
     assign fe_instr_o = fe_instr_q;
     assign fe_valid_o = fe_valid_q;
+    assign fe_fault_o = fe_fault_q;
 
 endmodule
 

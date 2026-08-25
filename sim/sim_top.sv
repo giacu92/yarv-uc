@@ -89,7 +89,12 @@ module sim_top #(
     // it carries no per-stage debug, just a "pipe stalled" status bit.
     // -----------------------------------------------------------------
     wire unused_dbg_stall;
-    rv32imac_zicsr_zifencei u_cpu (
+    // IMEM_ADDR_W must match u_imem below: fetch uses it to tell a PC inside
+    // the implemented I-mem from one outside it, which is the difference
+    // between fetching an instruction and taking an access fault.
+    rv32imac_zicsr_zifencei #(
+        .IMEM_ADDR_W(14)
+    ) u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
         .boot_addr_i(32'h0000_0000),

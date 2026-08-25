@@ -212,7 +212,12 @@ module top_module (
     // (the per-stage taps are internal; the simulation probes them via
     // the Verilator hierarchy).
     // -----------------------------------------------------------------
-    rv32imac_zicsr_zifencei u_cpu (
+    // IMEM_ADDR_W must match u_imem below: fetch uses it to tell a PC inside
+    // the implemented I-mem from one outside it, which is the difference
+    // between fetching an instruction and taking an access fault.
+    rv32imac_zicsr_zifencei #(
+        .IMEM_ADDR_W(14)
+    ) u_cpu (
         .clk_i      (clk_core),
         .rstn_i     (rstn_core),
         .boot_addr_i(32'h0000_0000),

@@ -91,6 +91,10 @@ module decode_stage (
     input wire [XLEN-1:0] fe_instr_i,
     input wire [XLEN-1:0] fe_pc_i,
     input wire            fe_valid_i,
+    // The F/D entry is an instruction access fault (PC outside the
+    // implemented I-mem), not an instruction. There is no word to decode:
+    // it becomes a precise trap with this PC as mtval.
+    input wire            fe_fault_i,
 
     // Register-file read port (decode drives addresses; data returns
     // combinationally the same cycle).
@@ -551,12 +555,18 @@ module decode_stage (
     // over flops + inputs.
     // -----------------------------------------------------------------
     wire hold_is_span = (hold_word_q[1:0] == 2'b11);  // stashed low half of a 32-bit instr
+    // A fault entry outranks every other source. If a spanning
+    // instruction was waiting for its upper half, that upper half is
+    // exactly what could not be fetched, so the fault belongs to it and the
+    // stash is dropped rather than stitched against a synthesised word.
+    wire fetch_fault = fe_valid_i && fe_fault_i;
+
     wire is_hold = hold_q;
-    wire is_hold_plain = hold_q && !hold_is_span;  // compressed upper half ready
+    wire is_hold_plain = !fetch_fault && hold_q && !hold_is_span;  // upper half ready
     wire span_pending = hold_q && hold_is_span;  // spanning low half held
-    wire span_complete = span_pending && fe_valid_i;  // upper-half word arrived -> stitch
-    wire span_wait = span_pending && !fe_valid_i;  // waiting for the upper-half word
-    wire target_upper = !hold_q && fe_valid_i && fe_pc_i[1];  // redirect to odd half
+    wire span_complete = !fetch_fault && span_pending && fe_valid_i;  // stitch
+    wire span_wait = !fetch_fault && span_pending && !fe_valid_i;  // waiting for the word
+    wire target_upper = !fetch_fault && !hold_q && fe_valid_i && fe_pc_i[1];  // odd half
     wire target_span = target_upper && (fe_instr_i[17:16] == 2'b11);  // 32-bit at target
 
     logic [4:0] rs1_addr_dec;
@@ -617,7 +627,13 @@ module decode_stage (
         // halfword is stashed in the hold buffer (or sits at an odd-half
         // branch target); its upper halfword is the next fetch word's
         // low half, stitched in here when that word arrives (span_complete).
-        if (span_complete) begin
+        if (fetch_fault) begin
+            // No instruction word exists. src_instr32 is a don't-care; the
+            // exception below carries the cause and the faulting PC.
+            src_instr32       = 32'd0;
+            src_pc            = fe_pc_i;
+            src_is_compressed = 1'b0;
+        end else if (span_complete) begin
             // Stitch: low half = hold_word_q[15:0] (bytes 2-3 of word W),
             // upper half = fe_instr_i[15:0] (bytes 0-1 of word W+1). PC
             // is the spanning instr's own PC (hold_pc_q). The stitched
@@ -682,8 +698,8 @@ module decode_stage (
         // (just stashed the low half, waiting for the stitch). This feeds
         // de_d.valid and the forward-path compare, so neither wait state
         // emits a spurious valid or false-triggers a forward.
-        decoded_valid = span_complete | is_hold_plain | (target_upper && !target_span) |
-            (fe_valid_i && !hold_q && !target_upper);
+        decoded_valid = fetch_fault | span_complete | is_hold_plain |
+            (target_upper && !target_span) | (fe_valid_i && !hold_q && !target_upper);
 
         // ---- Field extraction ----
         opcode = src_instr32[6:0];
@@ -1168,6 +1184,16 @@ module decode_stage (
             exc_tval  = src_instr32;
         end
 
+        // An access fault overrides the illegal decode of the don't-care
+        // word above: there was no instruction to be illegal. mtval is the
+        // address that could not be fetched, which is what makes the trap
+        // useful -- it names where the pc went.
+        if (fetch_fault) begin
+            exc_req   = 1'b1;
+            exc_cause = MCAUSE_INSTR_ACC;
+            exc_tval  = fe_pc_i;
+        end
+
         // ---- Assemble the D/E word for this cycle ----
         de_d                 = '0;
         de_d.valid           = decoded_valid;
@@ -1226,6 +1252,8 @@ module decode_stage (
 
         if (flush_i) begin
             hold_d = 1'b0;  // redirect: drop any stashed half
+        end else if (fetch_fault) begin
+            hold_d = 1'b0;  // the unfetchable half is gone; drop the stash
         end else if (stall_i) begin
             // DIV-REM / mem-wait stall: preserve the stash.
         end else if (span_wait) begin
