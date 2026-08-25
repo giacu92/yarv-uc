@@ -28,9 +28,22 @@ import rv32_pkg::*;
  * Naming follows the project convention: ports *_i/_o, internal
  * signals (incl. interface instances) have no prefix.
  */
-module sim_top (
+module sim_top #(
+    // UART clock/baud, overridable from the Verilator command line
+    // (-GUART_CLK_HZ=... -GUART_BAUD=...). The defaults keep the sim fast
+    // (5 clocks per bit); pass the board's real numbers
+    // (25_000_000 / 115_200 -> 217 clocks per bit) to check the RX
+    // sampling phase at the divisor the hardware actually uses.
+    parameter int unsigned UART_CLK_HZ = 50_000_000,
+    parameter int unsigned UART_BAUD   = 10_000_000
+) (
     input  wire       clk_i,
     input  wire       rstn_i,
+    // UART RX serial line, driven by the C++ harness (idle high). Lets a
+    // serial-console program (YarvMon) be fed real bit-level input; the
+    // harness paces one frame at a time off u_uart's rx_ready_q so it
+    // cannot overrun the single-byte RX buffer. Tie high for no input.
+    input  wire       uart_rxd_i,
     output wire [3:0] led_o
 );
 
@@ -199,19 +212,57 @@ module sim_top (
         .mtip_o(mtip)
     );
 
+    // Double-flop the harness RX line before the UART, exactly as
+    // top_module does for the board pin. Parity matters: without it the
+    // synchronizer that only exists in the board top is never exercised
+    // in simulation, so a bug in it could not be reproduced here.
+    logic [1:0] uart_rxd_sync_q;
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) begin
+            uart_rxd_sync_q <= 2'b11;  // idle line is high
+        end else begin
+            uart_rxd_sync_q <= {uart_rxd_sync_q[0], uart_rxd_i};
+        end
+    end
+
     wire uart_txd;
 
     axi4_lite_uart #(
-        .CLK_FREQ_HZ(50_000_000),  // sim clock is a free-running C++ tick, not board-accurate
-        .BAUD_RATE  (10_000_000)
+        .CLK_FREQ_HZ(UART_CLK_HZ),  // sim clock is a free-running C++ tick, not board-accurate
+        .BAUD_RATE  (UART_BAUD)
     ) u_uart (
         .clk_i     (clk_i),
         .rstn_i    (rstn_i),
         .axi       (axi_bus_uart.slave),
         .txd_o     (uart_txd),
-        .rxd_i     (1'b1),                // idle line; no RX stimulus in this harness
+        .rxd_i     (uart_rxd_sync_q[1]),  // harness line, double-flopped (board parity)
         .uart_irq_o(uart_irq)
     );
+
+    // -----------------------------------------------------------------
+    // UART TX character monitor (sim only). Logs every byte the CPU
+    // actually pushes into the TX shift buffer (u_uart.tx_push), so a
+    // serial-console program such as YarvMon is observable without
+    // decoding txd_o at the bit level. Dropped pushes (write while TX
+    // busy) do not appear here -- by construction, since tx_push is
+    // already gated on TX_READY, which is exactly the byte stream the
+    // pin will carry.
+    // -----------------------------------------------------------------
+`ifdef VERILATOR
+    int uart_log_fd;
+
+    initial begin
+        uart_log_fd = $fopen("sim_uart_tx.txt", "w");
+    end
+
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && u_uart.tx_push) begin
+            $fwrite(uart_log_fd, "%c", u_uart.wdata_eff[7:0]);
+            $fflush(uart_log_fd);
+        end
+    end
+`endif
 
     // -----------------------------------------------------------------
     // LED: free-running counter, parity with the board top.

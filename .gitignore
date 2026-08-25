@@ -57,3 +57,6 @@ sim/cosim/ecall/__pycache__/
 
 # RVC scramble-bit oracle build artefacts (regenerable)
 sim/sw_rvc_scramble/build/
+
+# UART TX capture written by the sim harness (sim_top's tx monitor).
+sim/sim_uart_tx.txt

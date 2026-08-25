@@ -44,6 +44,7 @@
 #include "verilated.h"
 #include "verilated_vcd_c.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -61,27 +62,154 @@
 // Taps inside the execute stage (one level below the CPU top).
 #define XTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_execute__DOT__##field)
 
+// Taps inside the UART peripheral (sim_top level).
+#define UTAP(field) (top->rootp->sim_top__DOT__u_uart__DOT__##field)
+
+// ---------------------------------------------------------------------
+// UART RX stimulus driver.
+//
+// Feeds a byte string into the UART's RX pin as real 8N1 frames (start
+// bit, 8 data bits LSB first, stop bit), so a serial-console program
+// (YarvMon) can be driven from the harness instead of parking forever in
+// its uart_getc() poll.
+//
+// BIT_CYCLES must match the UART instance in sim_top: the divisor resets
+// to CLK_FREQ_HZ/BAUD_RATE - 1 (50 MHz / 10 MHz - 1 = 4), and the RX
+// engine samples one bit every div+1 = 5 clocks. Sending faster would
+// smear frames; slower would sample the wrong bit.
+//
+// Pacing: by default a new frame only starts while the UART's RX FIFO has
+// room, so the stimulus can never provoke RX_OVERRUN. UART_RX_PACED=0
+// removes that interlock and ships frames back-to-back — what a
+// line-buffered terminal does with a pasted line, and the case the RX FIFO
+// exists to survive.
+// ---------------------------------------------------------------------
+class UartRxDriver {
+public:
+    // Clocks per bit. Must match the UART instance: default 5 for the fast
+    // sim divisor, or 217 for the board-accurate 25 MHz / 115200 build
+    // (UART_BIT_CYCLES env, paired with -GUART_CLK_HZ / -GUART_BAUD).
+    static int bit_cycles() {
+        const char *e = getenv("UART_BIT_CYCLES");
+        return e ? atoi(e) : 5;
+    }
+    static const int GAP_CYCLES = 10;  // idle-high clocks between frames
+
+    static bool paced() {
+        const char *e = getenv("UART_RX_PACED");
+        return e ? atoi(e) != 0 : true;
+    }
+
+    explicit UartRxDriver(std::string bytes)
+        : bytes_(std::move(bytes)), bit_cycles_(bit_cycles()), paced_(paced()) {}
+
+    bool done() const { return idx_ >= (int)bytes_.size() && !active_; }
+    int  sent() const { return idx_ - (active_ ? 1 : 0); }
+
+    // Returns the line level to drive for the cycle about to be clocked.
+    // blocked = the UART cannot take another byte (RX FIFO full).
+    //
+    // Pacing is on by default (see class comment). UART_RX_PACED=0 sends
+    // frames back-to-back regardless of RX_READY -- what a line-buffered
+    // terminal actually does when it ships a whole typed line at once.
+    // That is the case where a single-byte RX buffer with no FIFO drops
+    // input, so it must be reproducible here.
+    int step(bool blocked) {
+        if (!active_) {
+            if (gap_ > 0) { --gap_; return 1; }
+            if (idx_ >= (int)bytes_.size() || (paced_ && blocked)) return 1;
+            cur_    = (uint8_t)bytes_[idx_++];
+            active_ = true;
+            bit_    = 0;  // start bit
+            cnt_    = 0;
+        }
+        int level = (bit_ == 0) ? 0 : (bit_ <= 8 ? ((cur_ >> (bit_ - 1)) & 1) : 1);
+        if (++cnt_ == bit_cycles_) {
+            cnt_ = 0;
+            if (++bit_ > 9) {  // stop bit shipped -> frame complete
+                active_ = false;
+                gap_    = GAP_CYCLES;
+            }
+        }
+        return level;
+    }
+
+private:
+    std::string bytes_;
+    int         bit_cycles_;
+    bool        paced_;
+    int         idx_    = 0;
+    bool        active_ = false;
+    uint8_t     cur_    = 0;
+    int         bit_    = 0;
+    int         cnt_    = 0;
+    int         gap_    = 0;
+};
+
+// Decode C-style escapes in the UART_RX env string so a shell can pass
+// control characters (\r is the Enter key YarvMon's get_line waits for).
+static std::string unescape(const char* s) {
+    std::string out;
+    for (const char* p = s; *p; ++p) {
+        if (*p != '\\' || !p[1]) { out.push_back(*p); continue; }
+        switch (*++p) {
+            case 'r':  out.push_back('\r'); break;
+            case 'n':  out.push_back('\n'); break;
+            case 't':  out.push_back('\t'); break;
+            case '0':  out.push_back('\0'); break;
+            case '\\': out.push_back('\\'); break;
+            case 'x': {
+                int v = 0, n = 0;
+                while (n < 2 && isxdigit((unsigned char)p[1])) {
+                    char c = *++p;
+                    v = v * 16 + (isdigit((unsigned char)c) ? c - '0'
+                                                            : (tolower(c) - 'a' + 10));
+                    ++n;
+                }
+                out.push_back((char)v);
+                break;
+            }
+            default: out.push_back(*p); break;
+        }
+    }
+    return out;
+}
+
 static vluint64_t sim_time = 0;
+
+// Waveform dumping is skipped entirely when NO_VCD=1 (see main()).
+static bool g_no_vcd = false;
+
+static inline void vdump(VerilatedVcdC* tfp, vluint64_t t) {
+    if (!g_no_vcd) tfp->dump(t);
+}
 
 // One full clock period: low half then high half, dumping the waveform
 // at each step. Outputs are sampled after the rising edge.
 static void tick(Vsim_top* top, VerilatedVcdC* tfp) {
     top->clk_i = 0;
     top->eval();
-    tfp->dump(sim_time++);
+    vdump(tfp, sim_time++);
     top->clk_i = 1;
     top->eval();
-    tfp->dump(sim_time++);
+    vdump(tfp, sim_time++);
 }
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
     Vsim_top* top = new Vsim_top;
+    // NO_VCD=1 skips the waveform dump. A board-accurate UART run (217
+    // clocks per bit) needs millions of cycles, which would produce a
+    // multi-gigabyte VCD nobody can open.
+    const bool no_vcd = getenv("NO_VCD") && atoi(getenv("NO_VCD"));
+    g_no_vcd = no_vcd;
     VerilatedVcdC* tfp = new VerilatedVcdC;
-    Verilated::traceEverOn(true);
-    top->trace(tfp, 99);
-    tfp->open("sim_top.vcd");
+    if (!no_vcd) {
+        Verilated::traceEverOn(true);
+        top->trace(tfp, 99);
+        tfp->open("sim_top.vcd");
+    }
 
     printf("=== RV32 fetch + decode + execute (LSU) sim ===\n");
 
@@ -93,6 +221,13 @@ int main(int argc, char** argv) {
     // change, keeping the clock a clean 0/1/0/1 throughout.
     top->clk_i  = 0;
     top->rstn_i = 0;
+
+    // UART RX stimulus: UART_RX="2000\r" types that into the console
+    // program (escapes decoded above). Unset = idle line, i.e. the old
+    // behaviour (a uart_getc() poll never completes).
+    UartRxDriver rx_drv(getenv("UART_RX") ? unescape(getenv("UART_RX")) : std::string());
+    top->uart_rxd_i = 1;  // idle high
+
     for (int i = 0; i < 4; ++i) tick(top, tfp);
 
     // Release reset: carried by the run loop's first tick below.
@@ -175,12 +310,15 @@ int main(int argc, char** argv) {
     char line[96];
     int cyc;
     for (cyc = 0; cyc < max_cyc; ++cyc) {
+        // UART RX line level for this clock period, paced off the RX FIFO.
+        top->uart_rxd_i = rx_drv.step(UTAP(rx_fifo_full) != 0);
+
         // Low half: de_q holds the op about to retire at this edge; sample
         // its writeback before the edge commits it (wb is combinational
         // from de_q, so the pre-edge value lines up with this retire).
         top->clk_i = 0;
         top->eval();
-        tfp->dump(sim_time++);
+        vdump(tfp, sim_time++);
         bool     wb_en  = TAP(wb_en);
         uint32_t wb_addr = TAP(wb_addr);
         uint32_t wb_data = TAP(wb_data);
@@ -189,7 +327,7 @@ int main(int argc, char** argv) {
         // stage registers. fe/de/ex valid are sampled post-edge.
         top->clk_i = 1;
         top->eval();
-        tfp->dump(sim_time++);
+        vdump(tfp, sim_time++);
 
         // Aggregate pipe-stall status for this cycle (dbg_stall_o =
         // dec_stall | ex_stall, sunk to unused_dbg_stall in sim_top).
@@ -358,7 +496,7 @@ int main(int argc, char** argv) {
 
     if (trace_fp) fclose(trace_fp);
 
-    tfp->close();
+    if (!no_vcd) tfp->close();
     delete top;
     delete tfp;
     return wfi_fail_cyc >= 0 ? 1 : 0;

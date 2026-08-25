@@ -35,7 +35,13 @@ RTL := \
 # Harvard topology: native u_imem (read-only) + u_dmem (byte-strobed) on
 # dedicated CPU ports, AXI only for peripherals (msip_peri + clint_timer
 # behind the peri xbar).
-VFLAGS := --cc --exe --build --top-module sim_top \
+# Extra Verilator parameter overrides, e.g. board-accurate UART timing:
+#   make VPARAMS="-GUART_CLK_HZ=25000000 -GUART_BAUD=115200"
+# (pair it with UART_BIT_CYCLES=217 at run time, and rm -rf obj_dir first --
+# a VPARAMS change is not tracked by the build dependencies).
+VPARAMS ?=
+
+VFLAGS := --cc --exe --build --top-module sim_top $(VPARAMS) \
 	-Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT -Wno-LATCH -Wno-INITIALDLY -Wno-TIMESCALEMOD \
 	--public-flat-rw \
 	--trace \
