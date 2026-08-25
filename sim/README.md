@@ -9,11 +9,16 @@ a 1→3 address-decode xbar (`axi4_lite_xbar_3`, base+size windows from
 `rv32_pkg`; unmapped → DECERR): `axi4_lite_uart` (UART, `0x1000_0000` —
 its level IRQ drives `mip.MEIP`), `clint_timer` (machine timer
 interrupt, `0x1000_1000+`), and `msip_peri` (machine software interrupt,
-`0x1000_3000`). The UART's `rxd_i` is tied idle-high in this harness —
-there is no RX stimulus, so `uart_getc()`-blocking programs can't
-advance. The board top's wiring is replicated in `sim_top.sv` so the
-memories can be preloaded and the CPU's per-stage debug taps can be
+`0x1000_3000`). The board top's wiring is replicated in `sim_top.sv` so
+the memories can be preloaded and the CPU's per-stage debug taps can be
 logged.
+
+The UART is driven for real in both directions: `uart_rxd_i` is a port
+(double-flopped exactly like the board top, so the board's synchronizer
+is actually simulated), fed with 8N1 frames by the C++ harness, and every
+byte the CPU pushes into the TX FIFO is captured to `sim_uart_tx.txt`.
+That is how a serial-console program (YarvMon, `sw_uart_echo`) is
+observed and driven — see "UART console I/O" below.
 
 This harness is **not** part of the synthesis file list.
 
@@ -101,6 +106,94 @@ The images are **plusarg-selected**: `+IINIT=<path>` / `+DINIT=<path>`
 override the defaults, so a C-compiled image pair can be loaded without
 clobbering the oracle. To compile C → images, use the `sim/sw/` flow
 (see `sim/sw/README.md`).
+
+## UART console I/O
+
+The harness types into the UART and records what comes out, so a serial
+program can be exercised end to end without hardware.
+
+```
+cd sim
+UART_RX='2000\r' make run RUN_ARGS="+IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex"
+cat sim_uart_tx.txt          # everything the CPU transmitted
+```
+
+Environment knobs:
+
+- `UART_RX="..."` — the string to type, as real 8N1 frames on
+  `uart_rxd_i`. C escapes are decoded, so `\r` is the Enter key
+  `get_line` waits for. Unset = idle line (a `uart_getc()` poll never
+  completes).
+- `UART_RX_PACED=0` — ship frames back-to-back instead of waiting for RX
+  FIFO room. This is what a line-buffered terminal does when it sends a
+  whole typed line at once, and it is the case that broke YarvMon on
+  hardware before the UART had FIFOs: echoing a byte costs a full frame
+  time (87 µs at 115200), so with a single-byte RX buffer every byte
+  arriving during the echo was dropped and the command line arrived
+  empty. Keep it in any UART regression — the paced default cannot
+  provoke an overrun by construction.
+- `UART_BIT_CYCLES=217` — clocks per bit in the driver. Must match the
+  UART instance; pair it with a board-accurate build (below).
+- `NO_VCD=1` — skip the waveform dump. A board-accurate run is millions
+  of cycles, i.e. a multi-gigabyte VCD.
+
+`sim_top`'s UART clock/baud are parameters, so the sim can run either
+fast (default 50 MHz / 10 MHz = 5 clocks per bit) or with the board's
+real divisor (25 MHz / 115200 = 217 clocks per bit) to check the RX
+sampling phase at the ratio the hardware actually uses:
+
+```
+rm -rf obj_dir
+make VPARAMS="-GUART_CLK_HZ=25000000 -GUART_BAUD=115200"
+NO_VCD=1 UART_BIT_CYCLES=217 UART_RX='2000\r' MAX_CYC=400000 \
+  ./obj_dir/Vsim_top +IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex
+rm -rf obj_dir && make        # back to the fast default
+```
+
+A `VPARAMS` change is not tracked by the build dependencies, hence the
+explicit `rm -rf obj_dir`.
+
+## UART FIFO + IRQ compliance test (`hw/uart_tb/`)
+
+BFM master driving `axi4_lite_uart` directly, with a continuous 8N1
+decoder on `txd_o` and a frame driver on `rxd_i` (10 clocks per bit).
+Checks the FIFO contract and the interrupt, not just the AXI handshake:
+queued TX bytes ship in order with no polling in between; TX_READY drops
+when the TX FIFO is full and a write to a full FIFO is dropped (the bus
+still returns OKAY); an RX burst inside the depth is fully retained in
+order with RX_OVERRUN clear; one frame past the depth is dropped and
+latches RX_OVERRUN while the queued bytes survive; reading an empty RX
+FIFO pops nothing (no pointer underflow); the IRQ is level-sensitive and
+gated by CTRL — nothing fires until an enable is written, and it
+deasserts when software drains the condition.
+
+```
+cd hw/uart_tb && make run     # "144 checks, 0 failures"
+```
+
+## UART echo + external-interrupt (MEIP) oracle (`sw_uart_echo/`)
+
+`uart_echo.c` echoes `PHASE_CHARS` (4) bytes read by polling, then
+enables `CTRL.RX_IE` + `mie.MEIE` + `mstatus.MIE` and echoes 4 more from
+a machine-interrupt handler, sleeping in `wfi` in between. It writes
+`0x600D`/`0xBAD` to D-mem **0x3000** — not 0x2000, where `.rodata` is
+linked (writing there would clobber the strings it prints).
+
+This is the only end-to-end test of the machine *external* interrupt:
+`uart_irq_o` → `meip_i` → `mip.MEIP` → `trap_unit` → interrupt entry,
+including the `wfi` wake on an external interrupt.
+
+```
+cd sw_uart_echo && make
+cd .. && UART_RX='abcdefgh' make run \
+  RUN_ARGS="+IINIT=sw_uart_echo/build/imem.hex +DINIT=sw_uart_echo/build/dmem.hex"
+# serial log: "ECHO / abcd / IRQ / efgh / GOOD", and wb x15 = 0x0000600d
+```
+
+It doubles as the hardware bring-up program: it is deliberately smaller
+and dumber than YarvMon, so on a board that shows no echo, phase 1 tells
+you whether bytes reach the CPU at all and phase 2 whether the interrupt
+path works.
 
 ## Native RAM compliance test (`hw/native_mem_tb/`)
 
@@ -230,17 +323,20 @@ cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap
 
 - `sim_top.sv`    — sim wrapper (CPU + native I/D-mem +
   `axi4_lite_uart` + `clint_timer` + `msip_peri` MMIO slaves on the peri
-  bus (behind the peri 1→3 xbar; UART `rxd_i` tied idle-high) +
-  `mem_probe` generate block exposing a window of the data RAM to the
-  VCD). Ports only `clk_i`/`rstn_i`/`led_o`; CPU taps stay internal,
-  probed via the Verilator hierarchy.
+  bus, behind the peri 1→3 xbar, + `mem_probe` generate block exposing a
+  window of the data RAM to the VCD). Ports `clk_i`/`rstn_i`/
+  `uart_rxd_i`/`led_o`; the RX pin is double-flopped as on the board, and
+  a TX monitor writes every transmitted byte to `sim_uart_tx.txt`. UART
+  clock/baud are the `UART_CLK_HZ`/`UART_BAUD` parameters. CPU taps stay
+  internal, probed via the Verilator hierarchy.
 - `sim_main.cpp`  — Verilator C++ harness (clk/rst, trace, three logs
   incl. writeback values, stall breakdown, WFI-halt invariant check,
-  park/`MAX_CYC` stop).
+  park/`MAX_CYC` stop, UART RX frame driver — see "UART console I/O").
 - `imem.hex`/`dmem.hex` — Harvard oracle preload (code / data).
 - `Makefile`      — build/run rules (`RUN_ARGS` forwards plusargs).
 - `hw/native_mem_tb/` — native RAM compliance test.
 - `hw/ram_tb/`       — AXI4-Lite RAM compliance test.
+- `hw/uart_tb/`      — UART FIFO + IRQ compliance test.
 - `cosim/`           — shared co-sim assets: `cosim_diff.py` +
   `build_spike.sh` + the local Spike build/install.
 - `cosim/quicksort/` — RTL vs Spike golden ISA ref co-sim (see
@@ -255,6 +351,10 @@ cd .. && make run RUN_ARGS="+IINIT=sw_wfi_trap/build/imem.hex +DINIT=sw_wfi_trap
 - `sw_wfi_trap/`  — WFI-wake arbitration regression (illegal-trap behind
   `wfi` + pending MTI; toolchain-free via `gen_hex.py` — see
   "WFI-wake arbitration oracle").
+- `sw_uart_echo/` — UART echo + external-interrupt (MEIP) oracle, and the
+  hardware bring-up program (see "UART echo + external-interrupt (MEIP)
+  oracle").
 
 Build artefacts (`obj_dir/`, `sw/build/`, `cosim/ecall/build/`,
-`cosim/quicksort/*.log`, `*.vcd`, `*.log`) are gitignored.
+`cosim/quicksort/*.log`, `*.vcd`, `*.log`, `sim_uart_tx.txt`) are
+gitignored.

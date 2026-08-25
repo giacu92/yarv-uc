@@ -13,7 +13,9 @@ Disclaimer: This project is created by me with the assistance of Claude Code
 > — behind a 1→3 peripheral mux with a DECERR terminator for unmapped
 > addresses; see **Roadmap** below for what is still missing. Synthesis
 > + PnR are re-confirmed on the build host (2026-08-24, **post-forwarding,
-> with the UART + `axi4_lite_xbar_3` in the build**):
+> with the UART + `axi4_lite_xbar_3` in the build**; the UART TX/RX FIFOs
+> added 2026-08-25 are *not* in that run, so their Fmax impact is
+> unverified):
 > the **active build is the 25 MHz PLL-bypass** (`clk_core = clk_i`,
 > rPLL removed — the chosen operating point), with a verified-closing
 > **35 MHz** rPLL retarget option (knife-edge, +0.040 ns slack) — see
@@ -135,17 +137,28 @@ The peripheral/interrupt story is the current active front. **MSIP**
 all wired, behind a 1→3 peri mux (`axi4_lite_xbar_3`, base+size windows
 from `rv32_pkg`; unmapped → DECERR). The remaining work, in order:
 
-1. **UART — wired + synthesized, bring-up pending on hardware.** The
+1. **UART — wired + synthesized, hardware bring-up in progress.** The
    UART (`axi4_lite_uart.sv`, TXDATA/RXDATA/STATUS/CTRL/BAUDDIV MMIO at
-   `UART_BASE` 0x1000_0000, 8N1 single-buffer, level IRQ → MEIP, `rxd_i`
-   double-flopped off the async pin) is wired into `top_module.sv` and
-   `sim_top.sv`, **added to the `.gprj`** with `axi4_lite_xbar_3.sv`, and
-   **has pin assignments in `.cst`** (`uart_txd_o` PIN69, `uart_rxd_i`
-   PIN70, the onboard BL616 USB-UART bridge) — synthesized + PnR'd
-   2026-08-24. Not yet exercised on hardware. `BAUDDIV` is already a
-   programmable RW register (reset from `CLK_FREQ_HZ/BAUD_RATE`,
-   reprogrammable at runtime, applied only when TX+RX are idle so an
-   in-flight frame is never corrupted).
+   `UART_BASE` 0x1000_0000, 8N1, **16-byte TX and RX FIFOs**, level IRQ →
+   MEIP, `rxd_i` double-flopped off the async pin) is wired into
+   `top_module.sv` and `sim_top.sv`, **added to the `.gprj`** with
+   `axi4_lite_xbar_3.sv`, and **has pin assignments in `.cst`**
+   (`uart_txd_o` PIN69, `uart_rxd_i` PIN70, the onboard BL616 USB-UART
+   bridge) — synthesized + PnR'd 2026-08-24, *before* the FIFOs, so Fmax
+   needs re-confirming. `BAUDDIV` is a programmable RW register (reset
+   from `CLK_FREQ_HZ/BAUD_RATE`, reprogrammable at runtime, applied only
+   when TX+RX are idle so an in-flight frame is never corrupted).
+
+   The FIFOs were added on 2026-08-25 during board bring-up. With a
+   single-byte RX buffer, a full-duplex echo program loses input: echoing
+   a byte with a blocking "poll TX_READY, write TXDATA" costs a whole
+   frame time (87 µs at 115200), and a terminal that ships a typed line
+   in one burst delivers the next byte 87 µs later — so every byte
+   arriving during the echo was dropped and the command line reached the
+   program empty. On hardware YarvMon looked like it ignored every
+   command. Reproduced in simulation (`UART_RX_PACED=0`), fixed by the
+   FIFOs, guarded by `sim/hw/uart_tb` (144 checks) and the new
+   `sim/sw_uart_echo` oracle.
 2. **GPIO.** Direction / output / input registers, per-pin or global
    interrupt. Same MMIO/AXI4-Lite slave template as UART/MSIP.
 3. **Simple PLIC-style interrupt controller.** MEIP is a single ORed
@@ -162,8 +175,13 @@ DECERR terminator. All sim-verified (standalone timer oracle
 oracle `sim/sw_wfi_trap`, Spike cosim of an illegal-instruction trap
 `sim/cosim/ecall`).
 
-Also still open: RX stimulus in the sim harness (`rxd_i` tied idle-high,
-so `uart_getc()`-blocking programs can't advance), a vectored-mode
+The sim harness now drives the UART in both directions: it types real
+8N1 frames into `uart_rxd_i` (double-flopped as on the board) and
+captures every transmitted byte, and `sim/sw_uart_echo` verifies MEIP end
+to end — `uart_irq_o` → `meip_i` → `mip.MEIP` → `trap_unit` → interrupt
+entry, including the `wfi` wake on an external interrupt.
+
+Also still open: a vectored-mode
 interrupt co-sim (direct mode is covered), and a safe 40 MHz re-target
 (needs the async CSR read pipelined — see the timing note above). S/U
 mode, delegation, PMP, instruction-access-fault, and illegal-CSR-access
@@ -187,11 +205,11 @@ src/rtl/bus/   AXI4-Lite interface + master bridge + crossbar (peri mux)
 src/rtl/utils/ native_ram.sv (Harvard I/D-mem), axi4_lite_ram.sv (AXI slave, sim),
                msip_peri.sv (MSIP MMIO slave — machine software interrupt),
                clint_timer.sv (CLINT timer MMIO slave — machine timer interrupt),
-               axi4_lite_uart.sv (UART MMIO slave — 8N1, level IRQ -> mip.MEIP),
+               axi4_lite_uart.sv (UART MMIO slave — 8N1, TX+RX FIFOs, level IRQ -> mip.MEIP),
                axi4_lite_xbar_3.sv (1->3 peri mux, UART/timer/MSIP + DECERR)
 src/phys/      pin assignment (.cst) + timing constraints (.sdc)
 impl/          Gowin EDA project + synthesis/PnR Tcl + reports
-sim/           Verilator functional sim + native & AXI RAM compliance tests
+sim/           Verilator functional sim + native/AXI RAM + UART compliance tests
 sim/sw/        C → imem.hex + dmem.hex flow (prebuilt rv32imac toolchain)
 verible.flags  SystemVerilog formatting policy (Verible --flagfile)
 Makefile       format / sim / sw targets

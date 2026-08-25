@@ -89,11 +89,13 @@ module trap_unit (
     output wire            csr_we_mstatus_o,
     output wire [XLEN-1:0] csr_d_mstatus_o,
 
-    // Pending+enabled machine software interrupt (for execute / WFI wake).
+    // Pending+enabled machine interrupt of any kind — external, software or
+    // timer (for execute / WFI wake).
     output wire int_pending_o,
 
-    // Resolved interrupt cause (MSI > MTI priority; MEI not wired). Execute
-    // uses this as the mcause for the interrupt entry.
+    // Resolved interrupt cause (MEI > MSI > MTI priority, spec order — all
+    // three are wired). Execute uses this as the mcause for the interrupt
+    // entry.
     output wire [XLEN-1:0] int_cause_o
 );
 
