@@ -34,6 +34,13 @@
 #define MIP_MEIP    (1u << 11)
 #define MCAUSE_MEI  0x8000000Bu
 #define MCAUSE_ECALL_M 11u
+#define MCAUSE_MSI     0x80000003u
+
+#define MIE_MSIE (1u << 3)
+#define MIP_MSIP (1u << 3)
+
+/* msip_peri: writing bit0 sets/clears mip.MSIP. */
+#define MSIP_REG (*(volatile unsigned int *)0x10003000u)
 
 #define PHASE_CHARS 4
 
@@ -52,6 +59,7 @@
 
 static volatile uint32_t IN_DATA irq_chars = 0;   /* bytes echoed by the handler */
 static volatile uint32_t IN_DATA sync_traps = 0;  /* ecall traps taken */
+static volatile uint32_t IN_DATA msi_count = 0;    /* software interrupts taken */
 static volatile uint32_t IN_DATA bad_cause = 0;   /* unexpected mcause, if any */
 
 static volatile uint32_t *const result = (volatile uint32_t *)0x3000;
@@ -96,6 +104,21 @@ static inline uint32_t read_mstatus(void)
 __attribute__((interrupt("machine"), aligned(4))) void trap_handler(void)
 {
     uint32_t cause = read_mcause();
+
+    /* Entry marker, before anything can go wrong further down. A burst of
+     * 'H' means the vector is re-entered without progressing (livelock);
+     * a single 'H' means entry works and the handler body is the problem;
+     * no 'H' at all means the interrupt is never taken, or it vectors
+     * somewhere that is not this function. */
+    uart_putc('H');
+
+    if (cause == MCAUSE_MSI) {
+        /* MSIP is a level, held by the peripheral until software clears
+         * it -- not clearing it here would re-enter forever. */
+        MSIP_REG  = 0;
+        msi_count = msi_count + 1;
+        return;
+    }
 
     if (cause == MCAUSE_ECALL_M) {
         /* Sync-trap probe (see main). mret returns to mepc, which points
@@ -172,7 +195,25 @@ int main(void)
     __asm__ volatile("ecall");
     uart_puts(sync_traps ? "TRAP OK\r\n" : "TRAP FAIL\r\n");
 
-    /* 2b + 2c */
+    /* 2a'' -- software interrupt (MSIP) before the external one. It is the
+     * simplest interrupt in the machine: no peripheral IRQ line, no
+     * meip_i, just a bit software sets in a register. If this hangs, the
+     * fault is in interrupt entry/arbitration and has nothing to do with
+     * the UART. Interrupts are enabled here for the first time. */
+    /* Mask MEIE for the duration: MEIP is already pending and MEI outranks
+     * MSI, so leaving it enabled would serve the external interrupt first
+     * and tangle the two steps into one illegible output. */
+    __asm__ volatile("csrc mie, %0" ::"r"(MIE_MEIE));
+    __asm__ volatile("csrs mie, %0" ::"r"(MIE_MSIE));
+    MSIP_REG = 1;
+    __asm__ volatile("csrsi mstatus, %0" ::"i"(MSTATUS_MIE));
+    while (!msi_count && !bad_cause) { /* spin */ }
+    __asm__ volatile("csrc mie, %0" ::"r"(MIE_MSIE));
+    uart_puts(msi_count ? "MSI OK\r\n" : "MSI FAIL\r\n");
+    __asm__ volatile("csrs mie, %0" ::"r"(MIE_MEIE));
+
+    /* 2b + 2c -- external interrupt. mstatus.MIE is already set, so with
+     * the byte still queued this fires as soon as we get here. */
     __asm__ volatile("csrsi mstatus, %0" ::"i"(MSTATUS_MIE));
 
     /* With a byte already queued and the IRQ level-high, the interrupt is
