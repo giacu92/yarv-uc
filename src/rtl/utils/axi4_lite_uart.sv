@@ -245,8 +245,8 @@ module axi4_lite_uart #(
     // there is nothing to decode -- refusing it would mean refusing every
     // write. Data may therefore be accepted before the address; the
     // do_write hold below covers that ordering.
-    wire [2:0] awaddr_in = axi.awaddr[4:2];
-    wire tx_full_block_aw = (awaddr_in == REG_TXDATA) && !tx_ready;
+    wire  [       2:0] awaddr_in = axi.awaddr[4:2];
+    wire               tx_full_block_aw = (awaddr_in == REG_TXDATA) && !tx_ready;
 
     assign axi.awready = !aw_seen_q && !bvalid_q && !tx_full_block_aw;
     assign axi.wready  = !w_seen_q && !bvalid_q;

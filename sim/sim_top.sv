@@ -109,8 +109,11 @@ module sim_top #(
     // via $readmemh with the +IINIT=<path> plusarg (default "imem.hex").
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (14),  // 16 KiB (matches top_module: 46 BSRAM blocks
-                                 // = 828 Kb total, so 2 x 64 KiB does not fit)
+        // 16 KiB, same depth as top_module: the GW2AR-18C has 46 BSRAM
+        // blocks (828 Kb), so two 64 KiB memories cannot both exist -- and a
+        // simulation with different memories stops modelling the board
+        // exactly where it matters.
+        .ADDR_W    (14),
         .DATA_WIDTH(32),
         .READ_ONLY (1),
         .INIT_FILE ("")
@@ -127,8 +130,11 @@ module sim_top #(
     // plusarg (default "dmem.hex").
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (14),  // 16 KiB (matches top_module: 46 BSRAM blocks
-                                 // = 828 Kb total, so 2 x 64 KiB does not fit)
+        // 16 KiB, same depth as top_module: the GW2AR-18C has 46 BSRAM
+        // blocks (828 Kb), so two 64 KiB memories cannot both exist -- and a
+        // simulation with different memories stops modelling the board
+        // exactly where it matters.
+        .ADDR_W    (14),
         .DATA_WIDTH(32),
         .READ_ONLY (0),
         .INIT_FILE ("")

@@ -437,8 +437,7 @@ module execute_stage (
     always_ff @(posedge clk_i) begin
         if (rstn_i && mem_launch_hs && de_i.mem_read) begin
             assert (!lsu_rsp.rvalid)
-            else
-                $fatal(1, "load response in the accept cycle: latched byte offset is stale");
+            else $fatal(1, "load response in the accept cycle: latched byte offset is stale");
         end
     end
 `endif
