@@ -196,6 +196,14 @@ module execute_stage (
     logic is_mem_op;
     assign is_mem_op = de_i.mem_read | de_i.mem_write;
 
+    // A CSR op now takes two cycles: one to present the address to the
+    // registered CSR read, one to retire with the data it returned.
+    logic is_csr_op;
+    assign is_csr_op = de_i.csr_wren & ~de_i.illegal;
+
+    logic csr_start;
+    logic csr_ready;
+
     // Misaligned access: raises a precise sync trap (LAD_MIS / SAD_MIS)
     // below; the access never launches.
     // LH/LHU needs addr[0]=0; LW/SW needs addr[1:0]=00. Because every
@@ -219,11 +227,12 @@ module execute_stage (
         end
     end
 
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         EX_IDLE,
         EX_MEM_LAUNCH,
         EX_DIV_BUSY,
-        EX_MEM_WAIT
+        EX_MEM_WAIT,
+        EX_CSR_WAIT
     } ex_state_e;
     ex_state_e ex_state_q, ex_state_d;
 
@@ -295,7 +304,11 @@ module execute_stage (
     logic mem_running;
     assign mem_running = (ex_state_q == EX_MEM_WAIT) & ~mem_done;
     assign stall_o = alu_start | div_running | mem_stage_req | (mem_launch & ~store_done) |
-        mem_running | stall_i | wfi_stall;
+        mem_running | csr_start | stall_i | wfi_stall;
+
+    assign
+        csr_start = de_i.valid & is_csr_op & (ex_state_q == EX_IDLE) & ~freeze & ~trap_redirect_req;
+    assign csr_ready = (ex_state_q == EX_CSR_WAIT);
 
     always_comb begin
         ex_state_d = ex_state_q;
@@ -303,7 +316,9 @@ module execute_stage (
             EX_IDLE: begin
                 if (alu_start) ex_state_d = EX_DIV_BUSY;
                 else if (mem_stage_req) ex_state_d = EX_MEM_LAUNCH;
+                else if (csr_start) ex_state_d = EX_CSR_WAIT;
             end
+            EX_CSR_WAIT: ex_state_d = EX_IDLE;
             EX_MEM_LAUNCH:
             if (mem_launch_hs)
                 ex_state_d = de_i.mem_read ? EX_MEM_WAIT : EX_IDLE;  // store retires now
@@ -480,7 +495,7 @@ module execute_stage (
     // a load on mem_done (rvalid). Stores have reg_write=0 so their
     // result_ready is don't-care for the regfile write.
     logic result_ready;
-    assign result_ready = is_mem_op ? mem_op_done : alu_result_valid;
+    assign result_ready = is_mem_op ? mem_op_done : (is_csr_op ? csr_ready : alu_result_valid);
 
     assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~freeze &
         result_ready & ~mem_misaligned & ~trap_redirect_req;

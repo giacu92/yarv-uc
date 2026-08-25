@@ -194,7 +194,18 @@ module csr_regfile (
         end
     end
 
-    assign csr_data_o = csr_rdata;
+    // Registered read (experiment): the decode-side address is presented one
+    // cycle and the data comes out the next, so the read mux is no longer in
+    // the same cycle as everything it feeds. Execute holds the CSR op an
+    // extra cycle to collect it.
+    logic [XLEN-1:0] csr_rdata_q;
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) csr_rdata_q <= '0;
+        else csr_rdata_q <= csr_rdata;
+    end
+
+    assign csr_data_o = csr_rdata_q;
 
     // Trap-unit taps (combinational). mip_o reflects the live msip_i /
     // mtip_i / meip_i bits via regs[8] (updated every cycle above).
