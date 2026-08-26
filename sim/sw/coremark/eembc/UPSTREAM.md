@@ -28,8 +28,9 @@ before reading a run:
 - **A run under 10 s ends in "Errors detected".** Upstream counts the
   CoreMark run-rule violation as an error, and it is right to: a short run
   is not a reportable score. The four CRC lines are what say whether the
-  benchmark computed correctly. Raise `ITERATIONS` (643..6905 at 40 MHz) for
-  a run that passes on its own terms.
+  benchmark computed correctly. Raise `ITERATIONS` (804..6905 at 50 MHz; the
+  minimum scales with the clock, the wrap maximum is cycle-based) for a run
+  that passes on its own terms.
 - **Upstream prints the duration and rate as integers** when `HAS_FLOAT=0`,
   and prints no CoreMark/MHz figure at all without an FPU. The port prints
   its own summary after CoreMark's, with two decimals and the

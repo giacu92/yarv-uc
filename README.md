@@ -8,8 +8,8 @@ built with Claude Code assistance. Implemented and sim-verified (Verilator +
 Spike co-sim) and **brought up on silicon**.
 
 A 25 MHz MS5351M reference feeds an on-chip rPLL that drives the fabric at
-**40 MHz** (`clk_core = 25 × 8/5`). Synthesis + PnR close at **40.281 MHz
-actual Fmax**.
+**50 MHz** (`clk_core = 25 × 10/5`). Synthesis + PnR re-close at **50 MHz** on
+the 64-bit fetch-rewrite design (the pre-rewrite design closed at 40.281 MHz).
 
 ## Core
 
@@ -17,9 +17,12 @@ In-order **3-stage pipeline — Fetch / Decode / Execute (F/D/E)** with a
 **Harvard** memory system: a read-only I-mem for fetch, a byte-strobed D-mem
 for the LSU, and AXI4-Lite kept only for peripherals.
 
-- **Fetch** — single-outstanding 32-bit-word prefetch over a native memory
-  port, with a 1-entry skid buffer so run-ahead responses free the bus
-  instead of deadlocking; branch redirect + in-flight flush.
+- **Fetch** — 64-bit, 2-outstanding fetch over a native read-only I-mem port
+  with a depth-8 (32-bit-word) instruction buffer. One 8-byte access delivers
+  two 32-bit words; 2 outstanding keeps the BSRAM issuing through decode
+  stalls (DIV/REM, mem-wait). The buffer head feeds decode exactly as the
+  old F/D word did, so decode is unmodified. Branch redirect kills the
+  buffer + the ≤2 in-flight reads (drain FSM).
 - **Decode** — expand-then-decode: RVC (C) expands to 32-bit equivalents,
   then one uniform decoder handles RV32I + M + C + Zilx + Zicsr. Odd-half
   branch targets and word-spanning instructions are stitched. An
@@ -52,8 +55,8 @@ inside the CPU; the board top is pure point-to-point wiring.
 
 | Benchmark | Result |
 |---|---|
-| CoreMark | **1.62 CoreMark/MHz** (615 416 cycles/iteration, 50 iterations) |
-| Quicksort (256 words) | IPC ~0.47, 29 668 retires in 63 238 cycles (print-free) |
+| CoreMark | **1.88 CoreMark/MHz**, IPC 0.561 (531 025 cycles/iteration, 2K, -O3) |
+| Quicksort (256 words) | IPC 0.534, 29 675 retires in 55 617 cycles (print-free) |
 | CoreMark co-sim | PASS — 332 803 retires matched vs Spike |
 | Quicksort co-sim | PASS — 29 632 retires matched vs Spike |
 
@@ -62,12 +65,15 @@ provenance hashed in `eembc/UPSTREAM.md`; `make verify-eembc` fails the
 build on any edit). CRCs match the official 2K performance-seed values
 (`list 0xe714` / `matrix 0x1fd7` / `state 0x8e3a`); a 2000-iteration run
 gives `crcfinal` 0x4983. Built `-O3 -mstrict-align` (the core traps on
-misalignment, no fixup). At 40 MHz a rules-valid run is `ITERATIONS`
-651..6979 (≥10 s, under the 32-bit `mcycle` wrap).
+misalignment, no fixup). At 50 MHz a rules-valid run is `ITERATIONS`
+814..6979 (≥10 s, under the 32-bit `mcycle` wrap; the minimum scales with
+the clock, the wrap maximum is cycle-based).
 
-The bottleneck is the single-outstanding I-mem fetch (~2.2 cycles/instr);
-the LSU request register stage costs one cycle per access, the registered
-CSR read is free (hides in the fetch bubble).
+The 64-bit/2-outstanding fetch rewrite removed the pre-rewrite fetch
+bottleneck (~2.2 → ~1.8 cycles/instr); remaining IPC levers are the RVC
+spanning bubble (a wider F/D), earlier branch redirect (branch target in
+decode), and prediction. The LSU request register stage costs one cycle
+per access; the registered CSR read is free (hides in the fetch bubble).
 
 ## Repository layout
 
@@ -117,23 +123,25 @@ See `CLAUDE.md` for the full remote-build workflow and Gowin CLI quirks.
 ## Roadmap
 
 Done: Harvard split, LSU + forwarding, Zicsr, M-mode traps + all three
-interrupt sources, UART with FIFOs, silicon bring-up, 40 MHz closure,
-CoreMark.
+interrupt sources, UART with FIFOs, silicon bring-up, 40 MHz closure
+(pre-rewrite), CoreMark, 64-bit/2-outstanding fetch + instruction buffer,
+50 MHz PnR re-closure on the fetch-rewrite design.
 
 Remaining, in order:
 
-1. **Pipelined + 64-bit I-mem fetch** — the dominant IPC bottleneck; allow
-   several outstanding fetches and widen the port to deliver 2-4
-   instructions per access.
-2. **Cache over the in-package 8 MiB SDRAM** — write-back set-associative
+1. **Cache over the in-package 8 MiB SDRAM** — write-back set-associative
    I/D cache behind the native interfaces; buys capacity (programs > 16 KiB),
    not speed.
-3. **GPIO** — direction/output/input registers + interrupt.
-4. **PLIC-style interrupt controller** — MEIP is one ORed level with no
+2. **GPIO** — direction/output/input registers + interrupt.
+3. **PLIC-style interrupt controller** — MEIP is one ORed level with no
    cause register; an ISR must poll with >1 external source.
-5. **Illegal-CSR-access trap** — unimplemented CSRs currently read 0 / ignore
+4. **Illegal-CSR-access trap** — unimplemented CSRs currently read 0 / ignore
    writes silently.
-6. **Vectored-mode interrupt co-sim** — direct mode only is co-simulated.
+5. **Vectored-mode interrupt co-sim** — direct mode only is co-simulated.
+6. **RVC spanning bubble** — one cycle per 32-bit instruction straddling a
+   word boundary; needs a wider F/D.
+7. **Co-sim MMIO gap** — the diff stops at the first UART access (Spike has
+   no UART/CLINT/MSIP slave).
 
 Deferred by choice: S/U mode + delegation, PMP, cross-word sub-word accesses.
 

@@ -80,7 +80,7 @@ Environment knobs:
 - `UART_RX_PACED=0` — ship frames back-to-back instead of waiting for RX FIFO
   room. Provokes an overrun; keep in any UART regression (the paced default
   cannot).
-- `UART_BIT_CYCLES=<n>` — clocks/bit in the driver. 347 for the 40 MHz board
+- `UART_BIT_CYCLES=<n>` — clocks/bit in the driver. 434 for the 50 MHz board
   build, 217 for the 25 MHz PLL-bypass one.
 - `NO_VCD=1` — skip the waveform dump (a board-accurate run is millions of
   cycles = multi-GB VCD).
@@ -90,8 +90,8 @@ Environment knobs:
 
 ```
 rm -rf obj_dir
-make VPARAMS="-GUART_CLK_HZ=40000000 -GUART_BAUD=115200"
-NO_VCD=1 UART_BIT_CYCLES=347 UART_RX='2000\r' MAX_CYC=400000 \
+make VPARAMS="-GUART_CLK_HZ=50000000 -GUART_BAUD=115200"
+NO_VCD=1 UART_BIT_CYCLES=434 UART_RX='2000\r' MAX_CYC=400000 \
   ./obj_dir/Vsim_top +IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex
 rm -rf obj_dir && make        # back to the fast default
 ```

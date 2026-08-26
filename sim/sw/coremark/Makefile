@@ -21,14 +21,14 @@
 # i.e. ITERATIONS large enough at the board clock. That is a hardware run,
 # not a simulation one -- one iteration is already a few million cycles.
 # Note also that mcycle here is 32 bits with no mcycleh, so the timed
-# region must stay under 2^32 cycles (107 s at 40 MHz).
+# region must stay under 2^32 cycles (~86 s at 50 MHz).
 #
 # One iteration costs 604704 cycles in a multi-iteration run (2K profile,
 # -O3; a single-iteration run reads 622006, the difference being one-time
 # work inside the timed region that 2000 iterations amortise away). At
-# 40 MHz a run is valid between roughly these bounds:
+# 50 MHz a run is valid between roughly these bounds:
 #
-#   2K: ITERATIONS 662 .. 7102   (10 s .. the 32-bit mcycle wrap)
+#   2K: ITERATIONS 828 .. 7102   (10 s .. the 32-bit mcycle wrap)
 #
 # The 6K profile costs ~7x that per iteration; scale accordingly.
 #
@@ -58,12 +58,12 @@ ITERATIONS ?= 1
 # link before assuming it fits.
 TOTAL_DATA_SIZE ?= 2000
 RUN_TYPE   ?= PERFORMANCE_RUN
-# The core clock: the rPLL makes 25 MHz x 8/5 = 40.000 MHz exactly. (The
-# 40.281 MHz in the timing reports is the Fmax the design closed at, not
-# the frequency it runs at.) This is what the reported seconds and
-# iterations-per-second are computed against; CoreMark/MHz comes from
-# ticks alone and does not depend on it.
-CLK_HZ     ?= 40000000
+# The core clock: the rPLL makes 25 MHz x 10/5 = 50.000 MHz exactly. (The
+# design re-closed PnR at 50 MHz on the fetch-rewrite path, 2026-08-27; the
+# earlier 40.281 MHz was the pre-rewrite Fmax.) This is what the reported
+# seconds and iterations-per-second are computed against; CoreMark/MHz
+# comes from ticks alone and does not depend on it.
+CLK_HZ     ?= 50000000
 # COSIM=1 builds the variant the Spike co-sim runs: it reads no cycle
 # counter (see core_portme.c), because a counter value is the one register
 # write that can never match an instruction-based golden model.

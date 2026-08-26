@@ -136,12 +136,14 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   optional: this core traps on misalignment rather than fixing it up. 11.1 KiB
   `.text` (of 16) / 4.0 KiB D-mem data. gcc 15.1.0 measured ~2% slower, so
   the 14.3.0 default stands.
-  **Score: 615 416 cycles/iteration = 1.62 CoreMark/MHz** (50 iterations; a
-  single iteration reads 611 336 and 1.63). CRCs `list 0xe714` /
+  **Score: 531 025 cycles/iteration = 1.88 CoreMark/MHz, IPC 0.561** (single
+  iteration, 2K, -O3; 339 436 instr / 605 491 sim cyc; a 50-iteration run
+  smooths to a similar figure). CRCs `list 0xe714` /
   `matrix 0x1fd7` / `state 0x8e3a` = the official 2K performance-seed values;
-  `crcfinal` 0x4983 on a 2000-iteration run. At the board's 40 MHz a
+  `crcfinal` 0x4983 on a 2000-iteration run. At the board's 50 MHz a
   rules-valid run (≥10 s, under the 32-bit `mcycle` wrap — there is no
-  `mcycleh`) is `ITERATIONS` 651..6979; 2000 iterations takes ~31 s. A shorter
+  `mcycleh`; the 10-s minimum scales with the clock, the wrap maximum is
+  cycle-based) is `ITERATIONS` 814..6979; 2000 iterations takes ~31 s. A shorter
   run ends in upstream's own "ERROR! Must execute for at least 10 secs" — the
   run rule, not a core failure; the four CRC lines say it computed correctly.
   `TOTAL_DATA_SIZE=6000` (6K profile), `IMEM_PAD_WORDS=2048` (16 KiB / 8,
