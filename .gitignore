@@ -43,6 +43,8 @@ sim/cosim/quicksort/spike.log
 sim/cosim/quicksort/rtl.trace
 sim/cosim/ecall/spike.log
 sim/cosim/ecall/rtl.trace
+sim/cosim/coremark/spike.log
+sim/cosim/coremark/rtl.trace
 
 # Editor / OS
 *.swp

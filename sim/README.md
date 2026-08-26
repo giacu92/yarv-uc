@@ -338,13 +338,43 @@ shared with `make sw`, which builds the printing variant): the first UART
 access is where Spike stops being comparable, so a printing build would end
 the diff before the sort it is meant to check. Pass `RISCV_PREFIX=...` to
 `make cosim` and it is forwarded to the firmware build. Current result:
-**PASS, 29625 retires matched** (256-element sort + verify + setup), then a
+**PASS, 29632 retires matched** (256-element sort + verify + setup), then a
 clean stop at the first UART MMIO access — a harness limit, not a CPU bug.
 
 The Spike source tree, build, install, and per-run logs are gitignored;
 only the harness is committed: `cosim_diff.py` + `build_spike.sh` at
-`cosim/` (shared with the illegal-trap co-sim), and the `Makefile` at
+`cosim/` (shared with the other co-sims), and the `Makefile` at
 `cosim/quicksort/`.
+
+`build_spike.sh` relocates two of Spike's fixed devices out of the way of
+these images, and records the patch set in a stamp file so an install built
+with an older set is rebuilt rather than silently reused: the debug module
+from 0x0 to 0x100000 (it would collide with the `-m0x0` DRAM the ELF links
+into), and the boot ROM from `DEFAULT_RSTVEC` 0x1000 to 0x200000. The boot
+ROM is 4 KiB and no `-m` region may overlap it ("devices at [0, 2000) and
+[1000, 2000) overlap"), which capped a co-simulated `.text` at 4 KiB —
+enough for quicksort, not for CoreMark's 7.2 KiB. With the ROM moved, a
+co-sim maps the images exactly where the hardware has them.
+
+## CoreMark co-sim (`cosim/coremark/`)
+
+The same harness against EEMBC CoreMark — the longest co-sim in the tree
+(~646 k retires against quicksort's ~30 k) and the broadest, since it
+exercises linked lists, a matrix kernel and a state machine over strings
+rather than one sort loop. Runs in about 11 s and writes ~100 MB of logs.
+
+```
+cd cosim/coremark && make cosim   # -> "PASS -- matched 646307 retires"
+```
+
+The firmware is rebuilt with `COSIM=1`, which makes the port read no cycle
+counter: a counter value is the one register write an instruction-based
+golden model can never reproduce (Spike has no notion of this pipeline's
+cycles). CoreMark does all its printing after the last iteration, so the
+whole benchmark is compared before the run reaches the first UART access
+and Spike traps on it. `make cosim ITERATIONS=n` raises the iteration
+count; `SPIKE_MAXINSTR` and `RTL_MAX_CYC` bound the two runs and have to be
+raised with it.
 
 ## Trap oracle (`sw/intr/trap/`)
 
@@ -435,6 +465,8 @@ cd .. && make run RUN_ARGS="+IINIT=sw/intr/wfi_trap/build/imem.hex +DINIT=sw/int
   `build_spike.sh` + the local Spike build/install.
 - `cosim/quicksort/` — RTL vs Spike golden ISA ref co-sim (see
   "Co-sim vs Spike").
+- `cosim/coremark/`  — RTL vs Spike co-sim of CoreMark (see "CoreMark
+  co-sim").
 - `cosim/ecall/`     — Spike co-sim of an illegal-instruction sync trap
   (see "Illegal-trap co-sim").
 - `sw/`           — C → imem.hex + dmem.hex flow (see `sw/README.md`).
