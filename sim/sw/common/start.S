@@ -40,5 +40,16 @@ _start:
     j       1b
 2:
 
+    /* Zero the argc/argv registers before the call. A freestanding _start
+     * is the only thing that ever sets them, and a main() declared
+     * main(int, char **) -- CoreMark's is -- reads whatever they hold.
+     * On this core they come up as whatever the register file powered up
+     * with; under Spike they hold the boot stub's hartid/DTB pointer. That
+     * difference is architectural state, so the co-sim diverges on the
+     * first instruction that touches a1 unless both start from a defined
+     * value. */
+    li      a0, 0                /* argc = 0 */
+    li      a1, 0                /* argv = NULL */
+
     call    main
 1:  j       1b                   /* main returns here; loop forever */
