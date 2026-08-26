@@ -167,7 +167,11 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   headroom below the linked data (measured: the deepest `sp` in a full run
   is 0x3E50, `.bss` ends at 0x3D84), so it fits without margin to spare and
   CoreMark publishes no CoreMark/MHz scaling for it. `IMEM_PAD_WORDS=4096`
-  pads the code image for a board build. `COSIM=1` builds the co-sim
+  pads the code image for a board build. The CoreMark/MHz line is computed
+  by dividing ticks-by-iterations first (`eembc/LOCAL_CHANGES.md`): the
+  upstream expression is 32-bit and overflows at any reportable iteration
+  count — a 2000-iteration board run whose real score was 1.54 printed
+  `0.1`. `COSIM=1` builds the co-sim
   variant, which reads no cycle counter at all — a counter value is the one
   register write Spike can never reproduce; see `sim/cosim/coremark/`,
   which matches 646307 retires. `ee_printf.c` expands `\n` to CR+LF:

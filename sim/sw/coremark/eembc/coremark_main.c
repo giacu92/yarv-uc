@@ -426,7 +426,21 @@ for (i = 0; i < MULTITHREAD; i++)
         if (known_id == 3)
         {
             // Scaling results
-            score100 = total_iterations * 1000000 * 100 / total_time;
+            /* LOCAL CHANGE (yarv-uc): divide first, to keep the whole
+               computation in 32 bits. Upstream evaluates
+               total_iterations * 1000000 * 100 / total_time, which
+               overflows here as soon as the run is long enough to be
+               reportable -- at 2000 iterations the numerator is 2e11
+               against a 4.29e9 ceiling, and a real 1.54 CoreMark/MHz
+               printed as 0.1. Dividing first costs at most one part in
+               ticks-per-iteration (~650k here) and needs no 64-bit
+               division, which this freestanding link has no libgcc to
+               provide. Display only. */
+            {
+                long unsigned ticks_per_iter
+                    = (long unsigned)total_time / total_iterations;
+                score100 = ticks_per_iter ? 100000000UL / ticks_per_iter : 0;
+            }
             ee_printf("CoreMark/MHz 1.0 : %d.%02d / "
                       COMPILER_VERSION " " COMPILER_FLAGS " / "
                       SC_MEM_LOCATION "\n",
