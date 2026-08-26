@@ -4,24 +4,43 @@
  * Supports %d %u %x %s %c %% with an optional zero/width field and any
  * number of `l` length modifiers (CoreMark prints %lu / %04x). No %f:
  * HAS_FLOAT is 0 in core_portme.h, so CoreMark never asks for one.
+ *
+ * Newlines are expanded to CR+LF. CoreMark's format strings end in a bare
+ * "\n", and a serial terminal takes that as line feed only -- the cursor
+ * stays in its column, so every line after the first starts where the
+ * previous one ended and the report comes out as a staircase. Nothing else
+ * in the tree hits this because the other programs write "\r\n" in their
+ * own strings; here the strings are upstream CoreMark's and are not ours to
+ * edit.
  */
 
 #include <stdarg.h>
 #include "uart.h"
+
+static void put_char(char c)
+{
+    if (c == '\n') uart_putc('\r');
+    uart_putc(c);
+}
+
+static void put_str(const char *s)
+{
+    while (*s) put_char(*s++);
+}
 
 static void put_dec(unsigned long v, int is_signed)
 {
     char buf[12];
     int  i = 0;
     if (is_signed && (long)v < 0) {
-        uart_putc('-');
+        put_char('-');
         v = (unsigned long)(-(long)v);
     }
     do {
         buf[i++] = (char)('0' + (v % 10u));
         v /= 10u;
     } while (v);
-    while (i--) uart_putc(buf[i]);
+    while (i--) put_char(buf[i]);
 }
 
 static void put_hex(unsigned long v, int width)
@@ -34,7 +53,7 @@ static void put_hex(unsigned long v, int width)
         v >>= 4;
     } while (v);
     while (i < width && i < (int)sizeof(buf)) buf[i++] = '0';
-    while (i--) uart_putc(buf[i]);
+    while (i--) put_char(buf[i]);
 }
 
 int printf(const char *fmt, ...)
@@ -44,7 +63,7 @@ int printf(const char *fmt, ...)
 
     while (*fmt) {
         if (*fmt != '%') {
-            uart_putc(*fmt++);
+            put_char(*fmt++);
             continue;
         }
         ++fmt;
@@ -55,9 +74,9 @@ int printf(const char *fmt, ...)
             case 'd': put_dec((unsigned long)va_arg(ap, long), 1); break;
             case 'u': put_dec(va_arg(ap, unsigned long), 0); break;
             case 'x': put_hex(va_arg(ap, unsigned long), width); break;
-            case 's': uart_puts(va_arg(ap, const char *)); break;
-            case 'c': uart_putc((char)va_arg(ap, int)); break;
-            case '%': uart_putc('%'); break;
+            case 's': put_str(va_arg(ap, const char *)); break;
+            case 'c': put_char((char)va_arg(ap, int)); break;
+            case '%': put_char('%'); break;
             default: break;
         }
     }

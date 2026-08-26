@@ -3,6 +3,8 @@
 #   make                    build build/imem.hex + build/dmem.hex
 #   make ITERATIONS=10      more iterations (default 1, which is all a
 #                           simulation run can afford)
+#   make TOTAL_DATA_SIZE=6000   the 6K profile instead of the 2K one
+#   make IMEM_PAD_WORDS=4096    pad the I-mem image for a board build
 #   make clean
 #
 # Run in the sim (from sim/), no waveform, generous cycle bound:
@@ -19,10 +21,24 @@
 # not a simulation one -- one iteration is already a few million cycles.
 # Note also that mcycle here is 32 bits with no mcycleh, so the timed
 # region must stay under 2^32 cycles (107 s at 40 MHz).
+#
+# One iteration costs 649378 cycles (2K profile) or 4589357 (6K), so at
+# 40.281 MHz a run is valid between roughly these bounds:
+#
+#   2K: ITERATIONS 620 .. 6613   (10 s .. the 32-bit mcycle wrap)
+#   6K: ITERATIONS  88 ..  935
+#
+# ITERATIONS=1000 (2K) is a good default for the board: ~16 s of run.
 
 ARCH := rv32imac_zicsr_zifencei
 
 ITERATIONS ?= 1
+# TOTAL_DATA_SIZE selects the profile: 2000 is CoreMark's 2K run (the
+# default, and the one whose CRCs the source checks against). 6000 is the
+# 6K run -- it needs 6 KiB of .bss where the 2K run needs 2 KiB, and the
+# D-mem has 8 KiB for .rodata + .data + .bss AND the stack, so check the
+# link before assuming it fits.
+TOTAL_DATA_SIZE ?= 2000
 RUN_TYPE   ?= PERFORMANCE_RUN
 CLK_HZ     ?= 40000000
 # SKIP_TIME_CHECK=1 (default) drops CoreMark's "must run for at least 10
@@ -36,9 +52,18 @@ SKIP_TIME_CHECK ?= 1
 COSIM ?= 0
 
 EXTRA_CFLAGS := -I. -Ieembc -DITERATIONS=$(ITERATIONS) -D$(RUN_TYPE)=1 \
+                -DTOTAL_DATA_SIZE=$(TOTAL_DATA_SIZE) \
                 -DCLK_HZ=$(CLK_HZ) -DHAS_PRINTF=1 \
                 -DSKIP_TIME_CHECK=$(SKIP_TIME_CHECK) -DCOSIM=$(COSIM) \
                 -DCOMPILER_FLAGS='"-O2 -march=$(ARCH) -mabi=ilp32"'
+
+# Board builds pad the I-mem image to the full declared depth, because
+# GowinSynthesis sizes an inferred ROM from its $readmemh content rather
+# than from the declared depth -- an image-sized ROM lets a fetch above the
+# image alias back into real instructions instead of trapping. Simulation
+# does not need it (native_ram is declared 4096 words either way), so the
+# default is off.
+IMEM_PAD_WORDS ?= 0
 
 vpath %.c eembc
 
