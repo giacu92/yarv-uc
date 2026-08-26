@@ -96,56 +96,6 @@ kept only for peripherals. Implemented so far:
   execute) resolves entry / `mret` / interrupt redirect and drives the
   CSR trap-write bundle.
 
-Implemented since: an **instruction access fault** (mcause=1, mtval = the
-unfetchable PC) for a fetch outside the implemented I-mem — before it, the
-memory decoded only its own address bits and the read aliased back into the
-image, so a runaway redirect kept executing plausible code in silence.
-Instruction-address-misaligned stays absent by design: with the C extension
-IALIGN is 16, `jalr` clears bit 0 by definition and branch offsets are
-even, so an odd instruction address cannot occur.
-
-Still deferred: **S/U mode** + delegation (machine mode only, no
-medeleg/mideleg, no PMP), **instruction-access-fault** /
-instruction-address-misaligned traps, an **illegal-CSR-access** trap
-(unimplemented CSR addrs still silently read 0 / ignore writes), and a
-**PLIC-style interrupt controller** (MEIP is a single ORed level with no
-cause register — the ISR must poll). `fence.i` is a nop (Harvard has no
-D->I write path — self-modifying code unsupported). Synth + PnR are **re-confirmed on the build host (2026-08-25)** and the
-design **closes 40 MHz at 40.281 MHz actual Fmax** (rPLL
-`IDIV_SEL=4`/`FBDIV_SEL=7`/`ODIV_SEL=16`, VCO 640 MHz, 25 ns period).
-
-Getting there was a sequence of critical paths, each one measured at
-25 MHz and then removed:
-
-| change | slack @25 MHz | Fmax | limiter afterwards |
-|---|---|---|---|
-| (baseline) | +2.2 ns | ~27.7 MHz | regfile async read → decode forward mux |
-| load byte offset latched | +5.320 ns | ~28.9 MHz | store data path into `mtimecmp` |
-| LSU request registered | +10.152 ns | ~33.5 MHz | CSR-address fan-out into the redirect |
-| CSR read registered | +12.577 ns | ~36.5 MHz | regfile → forward → branch compare/target → PC |
-
-The last row says ~36.5 MHz, and 40 MHz needs 25 ns — but every one of
-those numbers was measured under a **40 ns** constraint, where PnR has no
-reason to push. Constrained at 25 ns it found the rest. Worth remembering
-before concluding a target is unreachable: an Fmax reported under a loose
-constraint understates what the tool will do when actually asked.
-
-The two register stages cost cycles, and the cost was measured rather than
-assumed: the LSU request stage is one cycle per memory access (quicksort
-59318 → 63238 cycles, IPC 0.500 → 0.469), while the registered CSR read is
-**free** — 1600 back-to-back CSR reads take 4432 cycles either way,
-because at 2.2 cycles per instruction the single-outstanding I-mem is the
-bottleneck and the extra execute cycle fits inside a bubble that already
-exists. The mirror stage on the load *return* path was implemented,
-measured (another cycle per load, 68014 cycles) and **not kept**: with the
-request registered the board runs correctly and the critical path is far
-from the LSU.
-
-If more headroom is ever wanted, the next limiter is the branch/redirect
-path: compute PC-relative targets in decode (only `jalr` genuinely needs a
-register operand), or register the redirect at the cost of a cycle on
-taken branches.
-
 ## Roadmap (what is next)
 
 The peripheral/interrupt story is the current active front. **MSIP**
@@ -324,6 +274,57 @@ the `impl/pnr_check.tcl` wrapper (open_project + `run pnr`, which reads
 PnR options from the saved project) — the legacy `gw_sh -pnr -do <file>`
 form silently no-ops in this Gowin version. See `CLAUDE.md` for the full
 remote-build workflow and the Gowin CLI quirks.
+
+## Actual Status/Known Limitations
+Implemented since: an **instruction access fault** (mcause=1, mtval = the
+unfetchable PC) for a fetch outside the implemented I-mem — before it, the
+memory decoded only its own address bits and the read aliased back into the
+image, so a runaway redirect kept executing plausible code in silence.
+Instruction-address-misaligned stays absent by design: with the C extension
+IALIGN is 16, `jalr` clears bit 0 by definition and branch offsets are
+even, so an odd instruction address cannot occur.
+
+Still deferred: **S/U mode** + delegation (machine mode only, no
+medeleg/mideleg, no PMP), **instruction-access-fault** /
+instruction-address-misaligned traps, an **illegal-CSR-access** trap
+(unimplemented CSR addrs still silently read 0 / ignore writes), and a
+**PLIC-style interrupt controller** (MEIP is a single ORed level with no
+cause register — the ISR must poll). `fence.i` is a nop (Harvard has no
+D->I write path — self-modifying code unsupported). Synth + PnR are **re-confirmed on the build host (2026-08-25)** and the
+design **closes 40 MHz at 40.281 MHz actual Fmax** (rPLL
+`IDIV_SEL=4`/`FBDIV_SEL=7`/`ODIV_SEL=16`, VCO 640 MHz, 25 ns period).
+
+Getting there was a sequence of critical paths, each one measured at
+25 MHz and then removed:
+
+| change | slack @25 MHz | Fmax | limiter afterwards |
+|---|---|---|---|
+| (baseline) | +2.2 ns | ~27.7 MHz | regfile async read → decode forward mux |
+| load byte offset latched | +5.320 ns | ~28.9 MHz | store data path into `mtimecmp` |
+| LSU request registered | +10.152 ns | ~33.5 MHz | CSR-address fan-out into the redirect |
+| CSR read registered | +12.577 ns | ~36.5 MHz | regfile → forward → branch compare/target → PC |
+
+The last row says ~36.5 MHz, and 40 MHz needs 25 ns — but every one of
+those numbers was measured under a **40 ns** constraint, where PnR has no
+reason to push. Constrained at 25 ns it found the rest. Worth remembering
+before concluding a target is unreachable: an Fmax reported under a loose
+constraint understates what the tool will do when actually asked.
+
+The two register stages cost cycles, and the cost was measured rather than
+assumed: the LSU request stage is one cycle per memory access (quicksort
+59318 → 63238 cycles, IPC 0.500 → 0.469), while the registered CSR read is
+**free** — 1600 back-to-back CSR reads take 4432 cycles either way,
+because at 2.2 cycles per instruction the single-outstanding I-mem is the
+bottleneck and the extra execute cycle fits inside a bubble that already
+exists. The mirror stage on the load *return* path was implemented,
+measured (another cycle per load, 68014 cycles) and **not kept**: with the
+request registered the board runs correctly and the critical path is far
+from the LSU.
+
+If more headroom is ever wanted, the next limiter is the branch/redirect
+path: compute PC-relative targets in decode (only `jalr` genuinely needs a
+register operand), or register the redirect at the cost of a cycle on
+taken branches.
 
 ## Formatting
 

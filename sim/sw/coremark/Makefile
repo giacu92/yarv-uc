@@ -22,10 +22,12 @@
 # Note also that mcycle here is 32 bits with no mcycleh, so the timed
 # region must stay under 2^32 cycles (107 s at 40 MHz).
 #
-# One iteration costs 622006 cycles (2K profile, -O3), so at 40 MHz a run
-# is valid between roughly these bounds:
+# One iteration costs 604704 cycles in a multi-iteration run (2K profile,
+# -O3; a single-iteration run reads 622006, the difference being one-time
+# work inside the timed region that 2000 iterations amortise away). At
+# 40 MHz a run is valid between roughly these bounds:
 #
-#   2K: ITERATIONS 643 .. 6905   (10 s .. the 32-bit mcycle wrap)
+#   2K: ITERATIONS 662 .. 7102   (10 s .. the 32-bit mcycle wrap)
 #
 # The 6K profile costs ~7x that per iteration; scale accordingly.
 #
@@ -74,7 +76,7 @@ COSIM ?= 0
 # Cycles per iteration, measured on this core. Used only by the banner to
 # say how long the run will take before it starts; nothing measured
 # depends on it.
-CYCLES_PER_ITER ?= 622006
+CYCLES_PER_ITER ?= 604704
 
 EXTRA_CFLAGS := -I. -Ieembc $(PERF_CFLAGS) \
                 -DITERATIONS=$(ITERATIONS) -D$(RUN_TYPE)=1 \

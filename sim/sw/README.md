@@ -152,9 +152,17 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   which is what comparable published rv32 ports quote; `-mstrict-align`
   matters beyond speed here, since this core traps on a misaligned access
   rather than fixing it up. Toolchain is the tree default (the rv32
-  buildroot cross-compiler, gcc 14.3.0). 10.4 KiB of `.text` and 3.6 KiB of
-  D-mem.
-  Result at `ITERATIONS=1`: **1.60 CoreMark/MHz**, 622006 ticks,
+  buildroot cross-compiler, gcc 14.3.0). 10.9 KiB of `.text` (of 16 KiB) and
+  3.8 KiB of D-mem data (of the 8 KiB window). The bleeding-edge gcc 15.1.0
+  toolchain was tried and is ~2% slower here (616866 cycles/iteration at
+  `rv32imc`, 612492 at `rv32imac`, against 604742 for gcc 14.3.0), so the
+  tree default stands.
+  **Board result, 2000 iterations at 40.000 MHz** — the reportable run:
+  1209407360 ticks, 30.23 s, 66.14 iterations/s = **1.65 CoreMark/MHz**,
+  `crcfinal` 0x4983 (the value other cores publish for a 2000-iteration 2K
+  run). Simulating the same image at 50 iterations gives 604742
+  cycles/iteration against the board's 604704 — sim and silicon agree to
+  four digits. Result at `ITERATIONS=1`: 1.60 CoreMark/MHz, 622006 ticks,
   IPC 0.485, CRCs `list 0xe714` / `matrix 0x1fd7` / `state 0x8e3a` — the
   official expected values for the 2K performance seeds. (The same build at
   `-O2` measured 1.53, and the board confirmed that number exactly for the
