@@ -89,11 +89,30 @@ else
 OBJS := $(BUILD)/start.o $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 endif
 
+# Rebuild on a flag change, not only on a source change. Several harnesses
+# are built more than one way from the same directory (quicksort with and
+# without PRINT_ARRAY, coremark with and without COSIM), and make sees only
+# timestamps: after a co-sim build, a plain `make` finds every object newer
+# than its source and reports success while leaving the co-sim variant in
+# place. The stamp file records the varying part of the flags and is
+# rewritten only when it changes, so the objects depend on the
+# configuration as well as on the sources.
+CFG_STAMP := $(BUILD)/.config
+CFG_TEXT  := $(ARCH) $(EXTRA_CFLAGS)
+# The stamp is written with make's $(file ...) rather than through a shell
+# echo: EXTRA_CFLAGS routinely carries quotes and spaces (-DCOMPILER_FLAGS='...'),
+# and passing that through sh mangles it. The shell only ever sees `cmp`.
+$(shell mkdir -p $(BUILD))
+$(file >$(CFG_STAMP).new,$(CFG_TEXT))
+$(shell cmp -s $(CFG_STAMP).new $(CFG_STAMP) || cp $(CFG_STAMP).new $(CFG_STAMP); rm -f $(CFG_STAMP).new)
+
 .PHONY: all clean show
 all: $(IMEM_HEX) $(DMEM_HEX) $(OBJD)
 
 $(BUILD):
 	mkdir -p $(BUILD)
+
+$(OBJS): $(CFG_STAMP)
 
 $(BUILD)/start.o: $(START_S) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
