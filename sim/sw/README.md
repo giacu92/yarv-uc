@@ -17,6 +17,7 @@ sim/sw/
     link.ld          Harvard link script (.text->IMEM 0, .data->DMEM 0x2000)
     bin2hex.py       .bin -> $readmemh word file
   quicksort/        benchmark program (main.c)
+  coremark/         EEMBC CoreMark (eembc/ upstream sources + local port layer)
   isa/              ISA decode/fetch oracles: ifault, isa_probe, rvc_scramble
   intr/             trap + interrupt oracles: trap, timer, wfi_trap
   peri/             peripheral/integration oracles: uart_echo
@@ -87,7 +88,11 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   image, and on hardware its words come up holding power-up BSRAM contents
   while simulation reads them as zero), set `sp` (`0x4000`, top of the 16 KiB
   D-mem — the D-mem decodes only `ADDR_W` bits, so a pointer above the top
-  aliases silently back into the data it is meant to sit clear of), `call main`,
+  aliases silently back into the data it is meant to sit clear of), zero
+  `a0`/`a1` (argc/argv — a `main(int, char **)` reads them, and nothing else
+  sets them: on this core they hold power-up register-file contents, under
+  Spike the boot stub's hartid and DTB pointer, so a co-sim diverges on the
+  first instruction that touches `a1` unless both start defined), `call main`,
   halt loop. C programs link this; standalone `.S` tests carry their own
   `_start`.
 - `link.ld` — Harvard link script: `IMEM (rx) ORIGIN = 0` (16 KiB, code) and
@@ -132,6 +137,27 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   log2(N) deep. Printed before/after the sort; `make PRINT_ARRAY=0` compiles
   the printing out (the co-sim needs that — the first UART access is where
   Spike stops being comparable).
+- `coremark/` — EEMBC CoreMark. `eembc/` holds the unmodified upstream sources
+  (Apache-2.0, `eembc/LICENSE.md`); `core_portme.[ch]` and `ee_printf.c` are
+  this core's port: `MEM_METHOD=MEM_STATIC` (no malloc here, and a 2 KiB stack
+  block would eat most of the stack), `HAS_FLOAT=0`, `HAS_STDIO=0`, timing from
+  the `mcycle` CSR, a ~700-byte integer `printf` over the UART, and local
+  `memcpy`/`memset` (gcc emits calls to both, and there is no libc to link).
+  Builds to 7.1 KiB of `.text` and 3.5 KiB of D-mem (`.rodata`+`.data`+`.bss`),
+  so it fits the 16 KiB/16 KiB memories with the stack clear of it. Defaults:
+  `ITERATIONS=1` (one iteration is already 657 k cycles — a simulation run
+  cannot afford the 10 s an official score needs), `RUN_TYPE=PERFORMANCE_RUN`,
+  `CLK_HZ=40000000`, `SKIP_TIME_CHECK=1` (without it a run whose CRCs all
+  matched still ends in "Errors detected" because it ran under 10 s). The
+  score line is derived from ticks, not from `time_in_secs`, so it is valid
+  even when the seconds count rounds to 0: **1.55 CoreMark/MHz** at
+  `ITERATIONS=1` (gcc 14.3.0, `-O2`), CRCs `list 0xe714` / `matrix 0x1fd7` /
+  `state 0x8e3a` (the official expected values for the 2K performance
+  seeds), 642913 ticks, IPC 0.489. Note `mcycle` is 32 bits here (no
+  `mcycleh`), so a timed region must stay under 2^32 cycles = 107 s at
+  40 MHz. `COSIM=1` builds the co-sim variant, which reads no cycle counter
+  at all — a counter value is the one register write Spike can never
+  reproduce; see `sim/cosim/coremark/`, which matches 646307 retires.
 - `isa/ifault/` — instruction-access-fault oracle (jump outside the I-mem).
 - `isa/isa_probe/` — instruction/memory probe that reports without using the
   hex printer or any instruction under test; board bring-up probe.
