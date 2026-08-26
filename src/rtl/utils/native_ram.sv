@@ -5,47 +5,54 @@
 import rv32_pkg::*;
 
 /**
- * Native mem_req_t / mem_rsp_t RAM slave. Harvard on-die memory for the
- * fetch (read-only I-mem) and LSU (byte-strobed D-mem) ports — no AXI.
+ * Native RAM slave. Harvard on-die memory for the fetch (read-only I-mem,
+ * 64-bit, multi-outstanding) and LSU (byte-strobed D-mem, 32-bit,
+ * single-outstanding) ports — no AXI. One parametric module serves both.
  *
- * The native protocol is the one the pipeline stages already use:
- *   - Request launch : req.wvalid && rsp.wready   (rsp.wready = idle)
- *   - Read response  : rsp.rvalid && req.rready   (held until rready)
- * Single-outstanding: while an unread read response is held (rvalid_q=1
- * and the master has not yet asserted rready) wready stays low, so no
- * second request is accepted until the current response is consumed.
+ * The ports are FLAT parametric logic (sized by DATA_WIDTH / OUTSTANDING),
+ * not the mem_req_t/mem_rsp_t packed structs: those structs are XLEN-wide
+ * (32-bit rdata/wdata/wstrb) and cannot carry the 64-bit fetch word. The
+ * struct types stay on the CPU/LSU side; the top level breaks the struct
+ * into these flat ports at the instantiation site.
  *
- * Timing (mirrors axi4_lite_ram, the protocol-compliant gate):
- *   - Store: commits at the accept cycle (wvalid && wready && we). The
- *     byte-strobed BSRAM write fires that same clock edge. wready stays
- *     high the next cycle (no read pending), so back-to-back stores run
- *     at 1 cyc/store. The LSU's posted store retires on launch-accept
- *     (execute_stage.store_done = mem_launch_hs & we), so bvalid is not
- *     consumed here — mem_rsp_o.bvalid is held low (a native RAM has no
- *     B channel; the LSU does not wait on it).
- *   - Load : on a read accept the BSRAM read launches (registered) and
- *     rvalid is raised the NEXT cycle, then HELD until rready. This is the
- *     "rvalid held under delayed rready" compliance fix proven by ram_tb,
- *     not a one-cycle pulse — a master that is not ready the cycle rvalid
- *     rises does not lose the data. 1-cycle latency when rready is already
- *     high (the LSU holds rready=1 throughout EX_MEM_WAIT).
+ * Native protocol (valid/ready on both sides):
+ *   - Request launch : req_valid_i && rsp_wready_o   (wready = can accept)
+ *   - Read response  : rsp_rvalid_o && req_rready_i  (held until rready)
  *
- * No address latch is needed (unlike axi4_lite_master_bridge): both the
- * read-launch (rdata_q <= mem[word_addr]) and the write-commit happen AT
- * the accept cycle, when req.addr is valid by the launch handshake. The
- * slave never needs addr after accept, so a master that drops its request
- * the cycle after wready (allowed by the native convention, same as the
- * bridge tolerates) cannot corrupt the response.
+ * OUTSTANDING (depth of the read response skid FIFO):
+ *   - 1 (D-mem): single-outstanding. While an unread response is held,
+ *     wready stays low (or high the cycle the master drains it, for
+ *     back-to-back). Bit-matches the former rvalid_q/rdata_q behaviour.
+ *   - 2 (I-mem): a second response can land and be held while the first is
+ *     still queued, so fetch keeps the BSRAM issuing through the decode
+ *     stalls that would otherwise idle a single-outstanding port. The fetch
+ *     side backs this up with its own inflight<2 gate.
+ *
+ * Read timing (1-cycle BSRAM read, mirrors axi4_lite_ram):
+ *   - On a read accept the BSRAM read launches (registered) and rvalid is
+ *     raised the NEXT cycle, then HELD until rready (the "rvalid held under
+ *     delayed rready" compliance fix, not a one-cycle pulse — a master not
+ *     ready the cycle rvalid rises does not lose the data). 1-cycle latency
+ *     when rready is already high.
+ *
+ * Store timing (D-mem only): commits at the accept cycle
+ * (req_valid_i && wready && we). The byte-strobed BSRAM write fires that
+ * same clock edge (posted store; the LSU retires on launch-accept, so
+ * rsp_bvalid_o is held low — a native RAM has no B channel).
  *
  * READ_ONLY gates the write path: an I-mem instance (READ_ONLY=1) ignores
  * we/wdata/wstrb and never writes storage. Fetch never asserts we, so the
  * gate is belt-and-braces. The read path is identical for both modes.
  *
- * Storage uses (* ram_style = "block" *) so Gowin infers a simple
- * dual-port BSRAM (one synchronous write port + one synchronous read
- * port, single clock). Byte-strobed writes use the BSRAM byte enables.
- * Storage contents are NOT reset (BSRAM has no clear); only the response
- * registers (rvalid_q) reset. Simulation preloads via INIT_FILE.
+ * No address latch is needed: the read-launch (rd_d_q <= mem[word_addr])
+ * and the write-commit happen AT the accept cycle, when req_addr_i is valid
+ * by the launch handshake. The slave never needs addr after accept.
+ *
+ * Storage uses (* ram_style = "block" *) so Gowin infers a simple dual-port
+ * BSRAM (one synchronous write port + one synchronous read port, single
+ * clock). Byte-strobed writes use the BSRAM byte enables. Storage contents
+ * are NOT reset (BSRAM has no clear); only the response FIFO / flags reset.
+ * Simulation preloads via INIT_FILE.
  *
  * Naming: ports use *_i/_o; internals no prefix; flops _q.
  */
@@ -53,33 +60,52 @@ import rv32_pkg::*;
 module native_ram #(
     // Address width in bits (depth = 2^ADDR_W bytes).
     parameter int ADDR_W = 16,
-    // Data width in bits (must match XLEN / the mem_req_t width).
+    // Data width in bits (32 for D-mem, 64 for the widened I-mem fetch).
     parameter int DATA_WIDTH = 32,
     // 1 = read-only I-mem (fetch); 0 = read/write D-mem (LSU, byte-strobed).
     parameter int READ_ONLY = 0,
+    // Read response skid depth = max outstanding reads (1 for D-mem, 2 for
+    // the 2-outstanding I-mem fetch). Caps how many responses can be held
+    // while the master is not ready.
+    parameter int OUTSTANDING = 1,
     // Optional $readmemh init file (relative to simulation working dir).
     parameter string INIT_FILE = ""
 ) (
     input wire clk_i,
     input wire rstn_i,
 
-    input  mem_req_t mem_req_i,
-    output mem_rsp_t mem_rsp_o
+    // Request (master -> slave).
+    input wire              req_valid_i,
+    input wire              req_we_i,     // 1 = write, 0 = read
+    input wire [  XLEN-1:0] req_addr_i,   // byte address
+    input wire [DATA_W-1:0] req_wdata_i,  // write data (ignored if !we)
+    input wire [STRB_W-1:0] req_wstrb_i,  // byte strobes (writes)
+    input wire              req_rready_i, // master ready for read data
+
+    // Response (slave -> master).
+    output wire              rsp_wready_o,  // slave accepts the request
+    output wire              rsp_rvalid_o,  // read data valid this cycle
+    output wire [DATA_W-1:0] rsp_rdata_o,   // read data
+    output wire              rsp_bvalid_o   // write-ack (held low: posted)
 );
 
     // -----------------------------------------------------------------
     // Local params
     // -----------------------------------------------------------------
-    localparam int DATA_W = DATA_WIDTH;
-    localparam int STRB_W = DATA_W / 8;  // bytes per word
-    localparam int BYTES_W = $clog2(STRB_W);  // byte-select bits
+    localparam int DATA_W      = DATA_WIDTH;
+    localparam int STRB_W      = DATA_W / 8;               // bytes per word
+    localparam int BYTES_W     = $clog2(STRB_W);           // byte-select bits
     localparam int WORD_ADDR_W = ADDR_W - BYTES_W;
     localparam int DEPTH_WORDS = 1 << WORD_ADDR_W;
+    localparam int CNT_W       = $clog2(OUTSTANDING + 1);  // 0..OUTSTANDING
 
 `ifdef VERILATOR
     initial
-        assert (STRB_WIDTH == $bits(mem_req_i.wstrb))
-        else $fatal(1, "STRB_WIDTH mismatch: package vs mem_req_t.wstrb");
+        assert (STRB_W == $bits(req_wstrb_i))
+        else $fatal(1, "STRB_W mismatch: DATA_WIDTH/8 vs req_wstrb_i width");
+    initial
+        assert (OUTSTANDING >= 1)
+        else $fatal(1, "OUTSTANDING must be >= 1");
 `endif
 
     // -----------------------------------------------------------------
@@ -110,51 +136,95 @@ module native_ram #(
 
     // -----------------------------------------------------------------
     // Address decode (byte address -> word index). Valid only at the
-    // accept cycle (req.wvalid && wready); never sampled after.
+    // accept cycle (req_valid_i && wready); never sampled after.
     // -----------------------------------------------------------------
-    wire  [WORD_ADDR_W-1:0] word_addr = mem_req_i.addr[ADDR_W-1:BYTES_W];
+    wire [WORD_ADDR_W-1:0] word_addr = req_addr_i[ADDR_W-1:BYTES_W];
 
     // -----------------------------------------------------------------
-    // Read response register: rvalid held until rready (compliance).
-    // rvalid_q is also the single-outstanding busy flag for reads.
+    // Read response skid FIFO (depth = OUTSTANDING).
+    //
+    // A read accepts this cycle and the BSRAM data is registered into
+    // rd_d_q, arriving NEXT cycle (rif_q marks "read in flight, data
+    // landing now"). The landing data is exposed the same cycle it arrives
+    // (rvalid includes rif_q, rdata bypasses to rd_d_q when the FIFO is
+    // empty) so a ready master sees 1-cycle read latency — and it is stored
+    // into the shift FIFO for the cycles the master is NOT ready.
+    //
+    // The FIFO is a shift register: slot 0 is the head (read out), new
+    // arrivals fill the first free slot from the head. count_q = occupied.
     // -----------------------------------------------------------------
-    logic                   rvalid_q;
-    logic [     DATA_W-1:0] rdata_q;
+    logic rif_q;  // read launched last cycle -> lands now
+    logic [DATA_W-1:0] rd_d_q;  // registered BSRAM read data (lands now)
 
-    // wready: accept a new request when no unread response is held, OR
-    // while the master is draining the current one (back-to-back). Depends
-    // on the rvalid_q flop and the master's rready only (the master's
-    // rready never depends on this wready -> no combinational loop, same
-    // property axi4_lite_ram's arready relies on).
-    assign mem_rsp_o.wready = !rvalid_q || (rvalid_q && mem_req_i.rready);
-    assign mem_rsp_o.rvalid = rvalid_q;
-    assign mem_rsp_o.rdata  = rdata_q;
-    assign mem_rsp_o.bvalid = 1'b0;  // native RAM: no B channel (LSU posted)
+    logic [CNT_W-1:0] count_q;  // occupied FIFO slots (0..OUTSTANDING)
+    logic [DATA_W-1:0] skid_q[OUTSTANDING];  // shift FIFO, slot 0 = head
+
+    wire land = rif_q;  // data landing this cycle
+    wire skid_pop = (count_q != '0) & req_rready_i;  // consume FIFO head
+    wire land_consumed = land & (count_q == '0) & req_rready_i;  // landing data taken at once
+    wire land_stored = land & ~land_consumed;  // landing data -> FIFO
+
+    // rvalid/rdata: a response is valid if the FIFO holds one OR one lands
+    // now. When the FIFO is empty the landing data is the head (bypass).
+    assign rsp_rvalid_o = (count_q != '0) | land;
+    assign rsp_rdata_o  = (count_q != '0) ? skid_q[0] : rd_d_q;
+    assign rsp_bvalid_o = 1'b0;  // native RAM: no B channel (LSU posted store)
+
+    // wready: accept a new request when, after this cycle's land+pop, there
+    // is a free slot for the new arrival next cycle. new_count = count after
+    // this cycle; a launch sets rif_next so its arrival needs new_count < N.
+    // Uniform for reads and writes (the LSU serializes accesses, so blocking
+    // a write while a read response is held matches the former single-entry
+    // behaviour exactly). Depends only on registers (count_q, rif_q) + the
+    // master's rready -> no combinational loop through the master.
+    wire [CNT_W-1:0] new_count = count_q - skid_pop + land_stored;
+    assign rsp_wready_o = (new_count < OUTSTANDING);
 
     // Launch handshake: req accepted this cycle.
-    wire launch_hs = mem_req_i.wvalid && mem_rsp_o.wready;
-    wire launch_read = launch_hs & ~mem_req_i.we;
-    wire launch_write = launch_hs & mem_req_i.we;
+    wire launch_hs = req_valid_i && rsp_wready_o;
+    wire launch_read = launch_hs & ~req_we_i;
+    wire launch_write = launch_hs & req_we_i;
 
-    // Read response consumed: rvalid held, master ready, no new read
-    // landing this same cycle (a new read overwrites rdata_q safely —
-    // wready was high only because rready was, so the old response is
-    // being drained).
-    wire rsp_done = rvalid_q & mem_req_i.rready & ~launch_read;
+    // Slot the landing data writes (first free from head). With a
+    // simultaneous pop the shift frees slot (count-1); without it the free
+    // slot is `count`. skid_pop is accounted for so pop+push coincide lands
+    // the new item at the right place (see the shift below).
+    wire [CNT_W-1:0] write_idx = count_q - skid_pop;
 
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            rvalid_q <= 1'b0;
-            rdata_q  <= '0;
+            rif_q   <= 1'b0;
+            rd_d_q  <= '0;
+            count_q <= '0;
         end else begin
+            // Read pipeline: on launch_read register the BSRAM word and mark
+            // it in flight. Back-to-back launches keep rif_q high (each
+            // cycle's launch re-arms it); rd_d_q is overwritten with the new
+            // word while the previous landing word is consumed/stored this
+            // same cycle (the push below reads the pre-edge rd_d_q).
             if (launch_read) begin
-                // Launch the BSRAM read; data registered, rvalid next
-                // cycle. Held until rready (rsp_done below clears it).
-                rvalid_q <= 1'b1;
-                rdata_q  <= mem[word_addr];
-            end else if (rsp_done) begin
-                rvalid_q <= 1'b0;
+                rif_q  <= 1'b1;
+                rd_d_q <= mem[word_addr];
+            end else begin
+                rif_q <= 1'b0;
             end
+
+            // Shift FIFO: pop drains the head (shift left); a stored landing
+            // word fills the freed tail slot. land_stored's write_idx is
+            // computed AFTER the pop so a coincident pop+push places the new
+            // item correctly; the land_stored write is emitted after the
+            // shift so it wins the shared slot assignment.
+            if (skid_pop) begin
+                for (int i = 0; i < OUTSTANDING - 1; i++) begin
+                    skid_q[i] <= skid_q[i+1];
+                end
+                skid_q[OUTSTANDING-1] <= '0;
+            end
+            if (land_stored) begin
+                skid_q[write_idx] <= rd_d_q;
+            end
+
+            count_q <= new_count;
         end
     end
 
@@ -169,8 +239,8 @@ module native_ram #(
             always_ff @(posedge clk_i) begin
                 if (launch_write) begin
                     for (integer i = 0; i < STRB_W; i++) begin
-                        if (mem_req_i.wstrb[i]) begin
-                            mem[word_addr][8*i+:8] <= mem_req_i.wdata[8*i+:8];
+                        if (req_wstrb_i[i]) begin
+                            mem[word_addr][8*i+:8] <= req_wdata_i[8*i+:8];
                         end
                     end
                 end

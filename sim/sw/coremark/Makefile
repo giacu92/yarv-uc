@@ -4,7 +4,8 @@
 #   make ITERATIONS=10      more iterations (default 1, which is all a
 #                           simulation run can afford)
 #   make TOTAL_DATA_SIZE=6000   the 6K profile instead of the 2K one
-#   make IMEM_PAD_WORDS=4096    pad the I-mem image for a board build
+#   make IMEM_PAD_WORDS=2048    pad the I-mem image for a board build (16 KiB
+#                              / 8 = 2048 64-bit words)
 #   make clean
 #
 # Run in the sim (from sim/), no waveform, generous cycle bound:
@@ -85,8 +86,8 @@ EXTRA_CFLAGS := -I. -Ieembc $(PERF_CFLAGS) \
 # GowinSynthesis sizes an inferred ROM from its $readmemh content rather
 # than from the declared depth -- an image-sized ROM lets a fetch above the
 # image alias back into real instructions instead of trapping. Simulation
-# does not need it (native_ram is declared 4096 words either way), so the
-# default is off.
+# does not need it (native_ram is declared 2048 64-bit words either way), so
+# the default is off.
 IMEM_PAD_WORDS ?= 0
 
 # `all` (from common/sw_build.mk) stays the default goal: the guard rule

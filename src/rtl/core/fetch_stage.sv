@@ -5,106 +5,80 @@
 import rv32_pkg::*;
 
 /**
- * Fetch stage of the pipeline.
+ * Fetch stage of the pipeline — 64-bit, 2-outstanding, with a 32-bit
+ * instruction buffer.
  *
- * Owns the PC and exposes a small native interface for instruction
- * memory access. The stage does NOT drive any bus protocol — it just
- * publishes a request when it needs an instruction. In the Harvard build
- * that request goes straight to a dedicated read-only native_ram I-mem;
- * no AXI bridge sits in the fetch path.
+ * Owns the PC and drives a 64-bit read-only native I-mem interface
+ * (ifetch_req_t / ifetch_rsp_t). One 8-byte access delivers two 32-bit
+ * words (3-4 with RVC); two reads may be outstanding, so the BSRAM keeps
+ * issuing through the decode stalls (DIV/REM, mem-wait) that would idle a
+ * single-outstanding port. A depth-8 32-bit-word instruction buffer decouples
+ * the 64-bit fetch rate from the 32-bit decode rate: each 64-bit response is
+ * split into one or two 32-bit entries (PC-stamped) and pushed at the tail;
+ * decode pops the head one word per cycle.
  *
  * Native interface (valid/ready on both sides, see rv32_pkg):
- *   - Request launch:  imem_req_o.wvalid && imem_rsp_i.wready.
- *   - Read response:   imem_rsp_i.rvalid && imem_req_o.rready.
+ *   - Request launch : imem_req_o.valid && imem_rsp_i.ready
+ *   - Read response  : imem_rsp_i.rvalid && imem_req_o.rready
  *
- * Single-outstanding overlap-prefetch with a 1-entry skid buffer:
- *   - At most one fetch in flight (busy_q). The bridge is single
- *     outstanding, so this matches it 1:1.
- *   - Fetch runs ahead of decode: it issues the next read as soon as it
- *     is idle, even while the F/D register still holds the previous
- *     instruction for decode. The response lands in the F/D register
- *     if it is empty, otherwise in a 1-entry skid buffer (skid_*_q).
- *     Decode drains the FIFO in order: F/D (head) first, then skid
- *     (tail) promotes to F/D when decode frees it.
- *   - The skid buys overlap: a run-ahead response that lands while F/D
- *     is still held by a stalled decode is captured (rready=1) instead
- *     of sitting on the port, so the next fetch can issue as soon as
- *     decode frees F/D. rready depends only on whether the 2-deep FIFO
- *     has a free slot (fe_valid_q / skid_valid_q) — both registers — so
- *     there is no combinational loop through the slave's rvalid.
- *     (Historically the skid also prevented a starvation deadlock on the
- *     von-Neumann shared bus, where an undrainable fetch response blocked
- *     a pending LSU access. Harvard gives fetch its own I-mem port, so
- *     that failure mode is gone; the overlap win remains.)
- *   - When the FIFO is full (F/D + skid both valid, 2 words) fetch
- *     stops issuing: the bus is idle and fully available to the LSU.
- *   - Steady-state throughput ~2 cycles/instruction (the bridge
- *     round-trip floor: 1 issue + 1 response cycle), with decode
- *     stalls of up to ~2 cycles hidden behind the buffered words.
- *     Measured vs the no-skid "issue only when drainable" gate fix
- *     (which had no run-ahead): the oracle program 143 -> 122 cyc
- *     (-14.7%) and the Zilx quicksort 3586 -> 2865 cyc (-20.1%) — the
- *     skid hides the fetch round-trip behind buffered words so decode
- *     rarely waits on the bus. (Stall cycles rise in the breakdown
- *     because the bubbles removed were fetch-latency idle cycles, not
- *     hazard stalls — decode now hits the real hazards denser, but the
- *     total drops.)
+ * Decode contract UNCHANGED: the buffer head is exported as fe_instr /
+ * fe_pc / fe_valid / fe_fault, 32-bit / 32-bit / 1-bit / 1-bit, exactly as
+ * the old 2-deep F/D+skid FIFO exported them. Decode is a pure consumer of
+ * the head register and cannot tell a 32-bit RAM from a split 64-bit RAM.
+ * The RVC spanning stitch (span_wait) still lives in decode and is
+ * unchanged; eliminating it needs a wider F/D (a separate, later change).
  *
- * Each pipeline stage exposes the PC it is treating, the instruction
- * word, and a valid as outputs (prefixed by a stage sigil: fe = fetch,
- * de = decode, ex = execute, ...). Further debug signals are added on
- * demand. This stage's outputs are the F/D pipeline register, so they
- * carry the `fe_` sigil: fe_pc_o / fe_instr_o / fe_valid_o. The skid
- * buffer is internal and never exported.
+ * PC + split:
+ *   - pc_q advances by 8 in steady state; pc_d = (pc_q & ~7) + 8 after a
+ *     launch/fault. On a redirect pc_q = branch_addr_i (possibly 2-aligned
+ *     for an RVC odd-half target, exactly as before).
+ *   - req_pc_q holds the real (possibly unaligned) PC of the in-flight
+ *     read. The I-mem aligns the address down to 8; fetch splits the
+ *     64-bit word back into 32-bit halves at the right PCs:
+ *       base = req_pc_q & ~7; low word @base, high word @base+4.
+ *       req_pc_q[2]==0 -> push low (pc=req_pc_q, carries unaligned [1:0])
+ *                         then high (pc=base+4).           [2 words]
+ *       req_pc_q[2]==1 -> skip low (before target), push high
+ *                         (pc=req_pc_q, carries unaligned [1]). [1 word]
+ *     This reproduces the old "RAM aligns down, fe_pc carries the unaligned
+ *     req_pc, decode uses fe_pc[1]" contract — traced for redirect->0x2 and
+ *     redirect->0x6.
+ *
+ * 2-outstanding + redirect drain:
+ *   - inflight_q (0..2): outstanding reads (inc on launch, dec on rsp_cap).
+ *   - draining_q: a redirect invalidated all in-flight reads; their stale
+ *     responses are accepted (rready=1) and discarded until inflight reaches
+ *     0, then fetching resumes at branch_addr_i. No buffer push while
+ *     draining. The I-mem's depth-2 response skid backs this up (at most 2
+ *     stale responses to drain).
+ *
+ * Buffer-room gating (overflow-safe): each outstanding read can push up to
+ * 2 words, so issue reserves 2 slots per in-flight read.
+ *   reserved     = count + 2*inflight  (always <= 8 by invariant)
+ *   available    = 8 - reserved
+ *   bus_issue    = inflight<2 && available>=2 && !redirect && !drain && !fault
+ *   fault_push   = pc_fault && available>=1 && !redirect && !drain && !rsp_cap
+ * A fault pushes exactly 1 word and launches no read -> its own >=1 gate,
+ * and it is deferred a cycle when a response is landing the same cycle so
+ * the buffer never pushes more than 2 words in one cycle.
  *
  * Registers:
- *   - pc_q     : next fetch address (runs ahead; redirect overwrites
- *                it with the branch target).
- *   - req_pc_q : address of the in-flight fetch; stamped on the
- *                captured word so the PC carried in the FIFO is EXACT.
- *   - busy_q   : a fetch is in flight.
- *   - flushed_q: a redirect killed the in-flight fetch; the next
- *                response must be drained and discarded.
- *   - fe_*     : F/D pipeline register (FIFO head); fe_valid_o is a
- *                HELD level (high from a fresh capture until decode
- *                consumes it via !stall_i, or a redirect kills it).
- *   - skid_*   : 1-entry skid buffer (FIFO tail); holds a response
- *                that arrived while F/D was full, promoted to F/D
- *                when decode frees it.
+ *   - pc_q / req_pc_q : next fetch address / in-flight read address.
+ *   - inflight_q      : outstanding reads (0..2).
+ *   - draining_q      : draining stale in-flight reads after a redirect.
+ *   - buf_*_q[8]      : depth-8 32-bit-word instruction buffer.
+ *   - head_q/tail_q/count_q : buffer FIFO pointers + occupancy.
  *
- * Redirect (branch_valid_i, highest priority): kills the in-flight
- * fetch (flushed_q) AND any stale F/D + skid content, and points pc_q
- * at the branch target. wvalid is gated by !branch_valid_i so no fetch
- * of the old pc_q issues during the redirect cycle. rready stays high
- * so a flushed in-flight response can still be drained and discarded.
+ * Redirect (branch_valid_i, highest priority): kills the buffer (count=0,
+ * head=tail=0), points pc_q at the target, arms draining for any in-flight
+ * reads. rready is forced so a stale response landing the same cycle is
+ * discarded. No launch, no push, no pop on the redirect cycle.
  *
- * stall_i: downstream hazard back-pressure. While high the F/D
- * register is not consumed (held); fetch keeps running ahead into the
- * skid (up to 2 words buffered), then stops issuing with the bus idle
- * once the FIFO is full. Any in-flight fetch is discarded on redirect.
+ * stall_i: decode back-pressure. While high the head is held (no pop); fetch
+ * keeps running ahead into the buffer (up to 8 words), then stops issuing
+ * once full. Redirects discard the buffered words.
  *
- * Compressed (C) extension is NOT handled here: the stage always
- * fetches 32-bit words and advances to the next word boundary. A
- * compressed instruction in the low half of a word means the next
- * instruction is the upper half of the SAME word (handled by decode),
- * so the next fetch is always the next word. Decode derives
- * is-compressed from fe_instr_o[1:0] itself, so it is not exported
- * here; it also uses fe_pc_o[1] to pick the upper half when a redirect
- * landed on an odd-half target (see decode).
- *
- * Redirect to an odd-half target (RVC: a 16-bit instr at bit[1]=1, e.g.
- * a branch landing at +2) leaves pc_q unaligned for one cycle. The
- * advance aligns down to the next word boundary ((pc_q & ~3) + 4),
- * realigning the stream; req_pc_q still holds the real (possibly
- * unaligned) PC so fe_pc_o is exact and decode can select the half
- * from fe_pc[1].
- *
- * Naming: ports use *_i/_o; internal signals have no prefix (they are
- * neither inputs nor outputs). Flop registers end in _q, their
- * next-state combinational counterparts in _d. The F/D register flops
- * carry the `fe_` sigil to identify them as the fetch stage's output
- * register (and to disambiguate fe_pc_q from pc_q, the next-fetch
- * address).
+ * Naming: ports *_i/_o; internals no prefix; flops _q, next-state _d.
  */
 module fetch_stage #(
     // Implemented I-mem size, in address bits (2**IMEM_ADDR_W bytes). A PC
@@ -126,14 +100,14 @@ module fetch_stage #(
     input wire            branch_valid_i,
     input wire [XLEN-1:0] branch_addr_i,
 
-    // Native instruction-memory interface (consumed by the on-die bridge)
-    output mem_req_t imem_req_o,
-    input  mem_rsp_t imem_rsp_i,
+    // Native 64-bit instruction-memory interface (read-only).
+    output ifetch_req_t imem_req_o,
+    input  ifetch_rsp_t imem_rsp_i,
 
-    // F/D pipeline register outputs: each pipeline stage exposes the PC
-    // it is treating, the instruction word, and a valid (stage sigil
-    // `fe_`). Any further debug is added on demand.
-    output wire [XLEN-1:0] fe_instr_o,  // F/D instruction word
+    // F/D pipeline register outputs (buffer head): each pipeline stage
+    // exposes the PC it is treating, the instruction word, and a valid
+    // (stage sigil `fe_`).
+    output wire [XLEN-1:0] fe_instr_o,  // F/D instruction word (32-bit)
     output wire [XLEN-1:0] fe_pc_o,     // F/D instruction PC (exact)
     output wire            fe_valid_o,  // F/D valid (held level)
     output wire            fe_fault_o   // F/D entry is an access fault, not an instruction
@@ -142,191 +116,154 @@ module fetch_stage #(
     // -----------------------------------------------------------------
     // State
     // -----------------------------------------------------------------
+    localparam int BUF_DEPTH = 8;
+
     logic [XLEN-1:0] pc_q, pc_d;  // next fetch address
-    logic [XLEN-1:0] req_pc_q, req_pc_d;  // address of the in-flight fetch
-    logic busy_q, busy_d;  // fetch in flight
-    logic flushed_q, flushed_d;  // in-flight fetch is to be dropped
+    logic [XLEN-1:0] req_pc_q, req_pc_d;  // address of the in-flight read
+    logic [1:0] inflight_q, inflight_d;  // outstanding reads (0..2)
+    logic draining_q, draining_d;  // discarding stale in-flight reads
 
-    // 2-deep fetch FIFO: head = F/D register, tail = 1-entry skid.
-    // A run-ahead response that arrives while F/D is full lands in the
-    // skid, freeing the single-outstanding bus for the LSU (without it
-    // that undrainable response deadlocks the shared bus — see header).
-    logic fe_valid_q, fe_valid_d;
-    logic [XLEN-1:0] fe_pc_q, fe_pc_d;
-    logic [XLEN-1:0] fe_instr_q, fe_instr_d;
-
-    logic skid_valid_q, skid_valid_d;
-    logic skid_fault_q, skid_fault_d;
-    logic fe_fault_q, fe_fault_d;
-    logic [XLEN-1:0] skid_pc_q, skid_pc_d;
-    logic [XLEN-1:0] skid_instr_q, skid_instr_d;
+    // Depth-8 32-bit-word instruction buffer (FIFO).
+    logic [XLEN-1:0] buf_instr_q[BUF_DEPTH];
+    logic [XLEN-1:0] buf_pc_q   [BUF_DEPTH];
+    logic            buf_fault_q[BUF_DEPTH];
+    logic [2:0] head_q, head_d;
+    logic [2:0] tail_q, tail_d;
+    logic [3:0] count_q, count_d;  // 0..BUF_DEPTH
 
     // -----------------------------------------------------------------
-    // Native interface outputs
-    //
-    // buf_room = the FIFO (F/D + skid) has a free slot. Both rready and
-    // the issue gate use it: a read is issued only when the response
-    // will have somewhere to land, and a response is accepted whenever
-    // there is room (so the bus is never held by an undrainable fetch).
-    // rready depends ONLY on registers (never on rvalid) => no
-    // combinational loop through the bridge's axi.rready forwarding.
+    // Native interface + control wires
     // -----------------------------------------------------------------
-    wire buf_room = !fe_valid_q || !skid_valid_q;
-
-    // PC outside the implemented I-mem. No bus request is issued for it --
-    // there is nothing there to read, and the memory would answer with an
-    // aliased word from inside the image, which is how a runaway redirect
-    // used to keep executing plausible code silently. Instead a FIFO entry
-    // is pushed with fault=1, and decode turns it into a precise
-    // instruction-access-fault trap carrying this PC as mtval.
+    // PC outside the implemented I-mem: no bus request, synthesise a fault
+    // FIFO entry instead (the memory would alias an out-of-range read back
+    // into the image and execute it).
     wire pc_fault = |pc_q[XLEN-1:IMEM_ADDR_W];
 
-    always_comb begin
-        // Accept read data when the FIFO has a free slot, or drain a
-        // flushed (redirected) response to free the bridge.
-        imem_req_o.rready = flushed_q || buf_room;
+    // Read response accepted this cycle.
+    wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready;
 
-        // Issue a fetch when idle, not redirecting this cycle, AND the
-        // FIFO has a free slot for the response. The skid slot lets
-        // fetch run ahead of decode (issue while F/D is full, response
-        // -> skid) while keeping the bus drainable for the LSU.
-        imem_req_o.wvalid = !busy_q && !branch_valid_i && buf_room && !pc_fault;
-        imem_req_o.we     = 1'b0;
+    // Buffer-room accounting. reserved = count + 2*inflight <= 8 (invariant
+    // maintained by the issue gate), so available is non-negative.
+    wire [2:0] twice_inflight = {inflight_q, 1'b0};  // inflight * 2
+    wire [4:0] reserved = {1'b0, count_q} + {2'b0, twice_inflight};
+    wire [4:0] available = 5'd8 - reserved;  // >= 0 by invariant
+
+    // Issue a fetch when idle (inflight<2), not redirecting/draining, the PC
+    // is in range, and the buffer has room for the response (2 words reserved
+    // per in-flight read).
+    wire bus_issue = (inflight_q < 2'd2) && (available >= 5'd2) && !branch_valid_i && !draining_q &&
+        !pc_fault;
+    // A fault pushes 1 word and launches no read -> its own >=1 gate. Hold it
+    // off a cycle when a response is landing the same cycle so the buffer
+    // never pushes more than 2 words in one cycle.
+    wire fault_push = pc_fault && (available >= 5'd1) && !branch_valid_i && !draining_q && !rsp_cap;
+
+    // Read launch accepted this cycle.
+    wire launch = bus_issue && imem_rsp_i.ready;
+
+    always_comb begin
+        // Accept read data when draining stale responses (discard), on a
+        // redirect (discard the one landing now), or whenever the buffer
+        // has room for the two words a response can push. Depends only on
+        // registers (draining_q, count_q) + nothing from the slave's rvalid
+        // -> no combinational loop through the I-mem.
+        imem_req_o.rready = branch_valid_i || draining_q || (count_q <= 4'd6);
+
+        // Issue a fetch when idle (inflight<2), not redirecting/draining, the
+        // PC is in range, and the buffer has room for the response (2 words
+        // reserved per in-flight read).
+        imem_req_o.valid  = bus_issue;
         imem_req_o.addr   = pc_q;
-        imem_req_o.wdata  = '0;
-        imem_req_o.wstrb  = '0;
     end
 
-    wire launch = imem_req_o.wvalid && imem_rsp_i.wready;  // req accepted
-    wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready;  // read data consumed
+    // -----------------------------------------------------------------
+    // 64-bit response split -> 32-bit buffer pushes (0, 1, or 2 words/cycle)
+    // -----------------------------------------------------------------
+    wire            do_rsp = rsp_cap && !draining_q && !branch_valid_i;
+    wire            rsp_two = ~req_pc_q[2];  // target in low half -> push both words
 
-    // A faulting PC enqueues without a bus round trip: nothing is in flight
-    // (the issue gate refused it) and nothing will answer, so the entry is
-    // synthesised here in the same slot a response would have taken. The
-    // instruction word is a don't-care -- decode traps on the flag, not on
-    // the word.
-    wire fault_push = pc_fault && !busy_q && !branch_valid_i && buf_room;
-    wire push = rsp_cap || fault_push;
-    wire [XLEN-1:0] push_pc = rsp_cap ? req_pc_q : pc_q;
-    wire [XLEN-1:0] push_instr = rsp_cap ? imem_rsp_i.rdata : 32'd0;
-    wire push_fault = !rsp_cap;
+    wire [XLEN-1:0] rsp_low_pc = req_pc_q;
+    wire [XLEN-1:0] rsp_high_pc = (req_pc_q & ~32'h7) + 32'd4;
+    wire [    31:0] rsp_low_word = imem_rsp_i.rdata[31:0];
+    wire [    31:0] rsp_high_word = imem_rsp_i.rdata[63:32];
+
+    // First push: the half containing the fetch PC (low if [2]==0, high if
+    // [2]==1). The PC stamp is ALWAYS req_pc_q (rsp_low_pc): it carries the
+    // unaligned target bits ([1:0] for the low half, [1] for the high half)
+    // so decode's fe_pc[1] selects the right halfword. Using rsp_high_pc
+    // (= base+4) for the [2]==1 case would clear bit[1] and make decode pick
+    // the wrong halfword on a 2-aligned redirect into the high half
+    // (e.g. jalr to 0xee stamped 0xec). A fault push fills this slot
+    // (pc=pc_q, fault=1).
+    wire [XLEN-1:0] push0_pc = do_rsp ? rsp_low_pc : pc_q;
+    wire [    31:0] push0_word = do_rsp ? (rsp_two ? rsp_low_word : rsp_high_word) : 32'd0;
+    wire            push0_fault = !do_rsp;  // fault_push case (do_rsp==0)
+
+    // Second push: the high half, only when pushing both words.
+    wire [XLEN-1:0] push1_pc = rsp_high_pc;
+    wire [    31:0] push1_word = rsp_high_word;
+    wire            push1_fault = 1'b0;
+
+    wire [     1:0] push_cnt = do_rsp ? (rsp_two ? 2'd2 : 2'd1) : fault_push ? 2'd1 : 2'd0;
 
     // -----------------------------------------------------------------
-    // Next-state / datapath (combinational)
+    // Buffer pop: decode consumes the head when it is not back-pressuring
+    // and not the redirect cycle.
+    // -----------------------------------------------------------------
+    wire            buf_pop = (count_q != 4'd0) && !stall_i && !branch_valid_i;
+
+    // -----------------------------------------------------------------
+    // Next-state
     // -----------------------------------------------------------------
     always_comb begin
-        // Defaults: hold
-        busy_d       = busy_q;
-        flushed_d    = flushed_q;
-        pc_d         = pc_q;
-        req_pc_d     = req_pc_q;
-        fe_valid_d   = fe_valid_q;
-        fe_pc_d      = fe_pc_q;
-        fe_instr_d   = fe_instr_q;
-        fe_fault_d   = fe_fault_q;
-        skid_valid_d = skid_valid_q;
-        skid_fault_d = skid_fault_q;
-        skid_pc_d    = skid_pc_q;
-        skid_instr_d = skid_instr_q;
+        // Defaults: hold.
+        pc_d       = pc_q;
+        req_pc_d   = req_pc_q;
+        inflight_d = inflight_q;
+        draining_d = draining_q;
+        head_d     = head_q;
+        tail_d     = tail_q;
+        count_d    = count_q;
 
         if (branch_valid_i) begin
             // ---- Redirect (highest priority) ----
-            fe_valid_d   = 1'b0;  // kill stale F/D
-            skid_valid_d = 1'b0;  // kill stale skid (newer than F/D)
-            pc_d         = branch_addr_i;  // next fetch -> target
-            if (busy_q) begin
-                if (rsp_cap) begin
-                    // Flushed response lands this cycle: drain & discard.
-                    flushed_d = 1'b0;
-                    busy_d    = 1'b0;
-                end else begin
-                    // Mark the in-flight fetch to be drained when it lands.
-                    flushed_d = 1'b1;
-                end
-            end else begin
-                flushed_d = 1'b0;  // nothing in flight to drain
-            end
-        end else if (flushed_q) begin
-            // ---- Drain a redirected in-flight response (discard) ----
-            // The FIFO is empty (the redirect killed F/D + skid). Just
-            // drop the stale response when it lands and free the bridge.
-            // No launch here: busy_q is still 1 (the in-flight fetch is
-            // what we are draining), so the issue gate is low.
-            if (rsp_cap) begin
-                flushed_d = 1'b0;
-                busy_d    = 1'b0;
-            end
+            pc_d    = branch_addr_i;
+            head_d  = 3'd0;  // kill the buffer
+            tail_d  = 3'd0;
+            count_d = 4'd0;
+            // No launch/push/pop this cycle; a landing response is stale and
+            // discarded (rready is high). inflight is updated below.
+        end else if (draining_q) begin
+            // ---- Drain stale in-flight responses (discard) ----
+            // No push, no pop, no launch. rready is high so the I-mem skid
+            // drains at max rate. Buffer stays empty (killed on redirect).
         end else begin
-            // ---- Normal: 2-deep FIFO fill/drain + next-issue ----
-            // Launch the next fetch (single outstanding: only when idle).
-            // Mutually exclusive with rsp_cap (launch needs !busy_q,
-            // rsp_cap needs busy_q).
+            // ---- Normal: issue + split-push + buffer drain ----
             if (launch) begin
-                busy_d   = 1'b1;
-                req_pc_d = pc_q;  // remember the in-flight address (real PC)
-                // Advance to the next WORD boundary: pc_q may be unaligned
-                // for one cycle after a redirect to an odd-half target, so
-                // align down before +4 to realign the stream (identical to
-                // +4 when pc_q is already aligned).
-                pc_d     = (pc_q & ~32'h3) + 32'd4;  // pc runs ahead (word-aligned)
+                req_pc_d = pc_q;  // remember the in-flight read address
+                pc_d     = (pc_q & ~32'h7) + 32'd8;  // next 8-byte boundary
             end
-
-            // Enqueue either a read response or a synthesised fault entry.
-            // The two are mutually exclusive (a fault issues no request, so
-            // nothing can be in flight for it) and both are mutually
-            // exclusive with launch (which needs !busy_q and !pc_fault).
-            if (push) begin
-                if (rsp_cap) busy_d = 1'b0;
-                if (fault_push) pc_d = (pc_q & ~32'h3) + 32'd4;
-                if (fe_valid_q && !stall_i) begin
-                    // F/D is being consumed this cycle: load the response
-                    // straight into F/D (no skid, no bubble).
-                    fe_valid_d = 1'b1;
-                    fe_pc_d    = push_pc;
-                    fe_instr_d = push_instr;
-                    fe_fault_d = push_fault;
-                end else if (fe_valid_q) begin
-                    // F/D full and held (stalled): land in the skid. The
-                    // issue gate reserved this slot (buf_room was true at
-                    // issue, and skid_valid_q is 0 here — a read is never
-                    // in flight while the skid is full), so this is safe.
-                    skid_valid_d = 1'b1;
-                    skid_pc_d    = push_pc;
-                    skid_instr_d = push_instr;
-                    skid_fault_d = push_fault;
-                end else begin
-                    // F/D empty: land directly in F/D (head).
-                    fe_valid_d = 1'b1;
-                    fe_pc_d    = push_pc;
-                    fe_instr_d = push_instr;
-                    fe_fault_d = push_fault;
-                end
-            end else if (fe_valid_q && !stall_i) begin
-                // Decode consumes F/D (head). Promote the skid (tail) into
-                // F/D so the next word is ready with no bubble; if the
-                // skid is empty, F/D simply empties.
-                if (skid_valid_q) begin
-                    fe_valid_d   = 1'b1;
-                    fe_pc_d      = skid_pc_q;
-                    fe_instr_d   = skid_instr_q;
-                    fe_fault_d   = skid_fault_q;
-                    skid_valid_d = 1'b0;
-                end else begin
-                    fe_valid_d = 1'b0;
-                end
-            end else if (!fe_valid_q && skid_valid_q) begin
-                // F/D empty, skid full, no response this cycle: promote
-                // the skid into F/D. (rsp_cap cannot coincide with this
-                // state: a read is never in flight while the skid is
-                // full — the issue gate reserved F/D room for the in-flight
-                // word, so it landed in F/D, not the skid.)
-                fe_valid_d   = 1'b1;
-                fe_pc_d      = skid_pc_q;
-                fe_instr_d   = skid_instr_q;
-                fe_fault_d   = skid_fault_q;
-                skid_valid_d = 1'b0;
+            if (fault_push) begin
+                // A fault PC advances past the unfetchable 8-byte word.
+                pc_d = (pc_q & ~32'h7) + 32'd8;
             end
+            // Buffer FIFO advance.
+            head_d  = head_q + (buf_pop ? 3'd1 : 3'd0);
+            tail_d  = tail_q + push_cnt;  // 0/1/2, 3-bit wrap
+            count_d = count_q + push_cnt - (buf_pop ? 4'd1 : 4'd0);
         end
+
+        // inflight tracks outstanding reads: +1 on launch, -1 on rsp_cap.
+        // Both may happen the same cycle (a response retires while a new
+        // read issues) -> net unchanged, so apply incrementally.
+        if (launch) inflight_d = inflight_d + 2'd1;
+        if (rsp_cap) inflight_d = inflight_d - 2'd1;
+
+        // Draining arms on a redirect and persists while any stale read is
+        // still outstanding; it clears the cycle inflight reaches 0 (so a
+        // redirect with nothing in flight costs no drain bubble, matching
+        // the old flushed_q behaviour).
+        draining_d = (branch_valid_i || draining_q) && (inflight_d != 2'd0);
     end
 
     // -----------------------------------------------------------------
@@ -334,38 +271,53 @@ module fetch_stage #(
     // -----------------------------------------------------------------
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            pc_q         <= boot_addr_i;
-            req_pc_q     <= '0;
-            busy_q       <= 1'b0;
-            flushed_q    <= 1'b0;
-            fe_valid_q   <= 1'b0;
-            fe_pc_q      <= '0;
-            fe_instr_q   <= '0;
-            fe_fault_q   <= 1'b0;
-            skid_valid_q <= 1'b0;
-            skid_pc_q    <= '0;
-            skid_instr_q <= '0;
-            skid_fault_q <= 1'b0;
+            pc_q       <= boot_addr_i;
+            req_pc_q   <= '0;
+            inflight_q <= 2'd0;
+            draining_q <= 1'b0;
+            head_q     <= 3'd0;
+            tail_q     <= 3'd0;
+            count_q    <= 4'd0;
         end else begin
-            pc_q         <= pc_d;
-            req_pc_q     <= req_pc_d;
-            busy_q       <= busy_d;
-            flushed_q    <= flushed_d;
-            fe_valid_q   <= fe_valid_d;
-            fe_pc_q      <= fe_pc_d;
-            fe_instr_q   <= fe_instr_d;
-            fe_fault_q   <= fe_fault_d;
-            skid_valid_q <= skid_valid_d;
-            skid_pc_q    <= skid_pc_d;
-            skid_instr_q <= skid_instr_d;
-            skid_fault_q <= skid_fault_d;
+            pc_q       <= pc_d;
+            req_pc_q   <= req_pc_d;
+            inflight_q <= inflight_d;
+            draining_q <= draining_d;
+            head_q     <= head_d;
+            tail_q     <= tail_d;
+            count_q    <= count_d;
+            // Buffer writes: push0 at tail, push1 at tail+1 (3-bit wrap).
+            if (push_cnt >= 2'd1) begin
+                buf_instr_q[tail_q] <= push0_word;
+                buf_pc_q[tail_q]    <= push0_pc;
+                buf_fault_q[tail_q] <= push0_fault;
+            end
+            if (push_cnt >= 2'd2) begin
+                buf_instr_q[tail_q+3'd1] <= push1_word;
+                buf_pc_q[tail_q+3'd1]    <= push1_pc;
+                buf_fault_q[tail_q+3'd1] <= push1_fault;
+            end
         end
     end
 
-    assign fe_pc_o    = fe_pc_q;
-    assign fe_instr_o = fe_instr_q;
-    assign fe_valid_o = fe_valid_q;
-    assign fe_fault_o = fe_fault_q;
+    // -----------------------------------------------------------------
+    // F/D outputs (buffer head). fe_valid is a held level (head stays until
+    // decode consumes it via !stall_i, or a redirect kills the buffer).
+    // -----------------------------------------------------------------
+    assign fe_instr_o = buf_instr_q[head_q];
+    assign fe_pc_o    = buf_pc_q[head_q];
+    assign fe_valid_o = (count_q != 4'd0);
+    assign fe_fault_o = buf_fault_q[head_q];
+
+`ifdef VERILATOR
+    // The split assumes the I-mem aligns the read address down to 8 bytes
+    // (it decodes addr[ADDR_W-1:3]); req_pc_q[2] then selects which 32-bit
+    // half the fetch PC falls in. The buffer invariant count + 2*inflight
+    // <= 8 is what makes the issue gate overflow-safe.
+    initial
+        assert (BUF_DEPTH == 8)
+        else $fatal(1, "BUF_DEPTH width assumptions broken");
+`endif
 
 endmodule
 

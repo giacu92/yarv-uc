@@ -1,8 +1,11 @@
 @00000000
 // Harvard oracle — instruction image (I-mem, read-only, 0-based).
+// 64-bit $readmemh elements: each line is two 32-bit instruction words,
+//   low 32 bits  = instruction at the byte address,
+//   high 32 bits = instruction at +4.
 // Code lives here; data lives in dmem.hex (D-mem, separate 0-based
 // address space). The program writes its own data at 0x100+ via stores,
-// so dmem.hex starts empty. Code 0x00-0x58; data 0x100+ (D-mem word 64+).
+// so dmem.hex starts empty. Code 0x00-0x74 (30 instr words); data 0x100+.
 //
 // RAW-hazard interlock (stall-on-RAW in decode, one bubble) + LSU
 // round-trip / byte+halfword sign-zero extend. Same op sequence as the
@@ -18,37 +21,35 @@
 //   a4=0x00000056 s0=0x00008000 (lui)
 // One bubble (no wb, no ex) precedes each hazard consumer (a0, t4, the
 // bne-resolve path, a4).
-
-00f00293  // 0x00: addi   t0,     zero, 15          t0 = 15
-34129073  // 0x04: csrrw  zero,   mepc, t0          mepc = t0 (CSR warm-up)
-
-00000013  // nop
-00000013  // nop
-00000013  // nop
-00000013  // nop
-00000013  // nop
-
-00f00293  // 0x00: addi   t0, zero, 15          t0 = 15
-04d00313  // 0x04: addi   t1, zero, 77          t1 = 77
-00628533  // 0x08: add    a0, t0, t1            RAW on t1 -> a0 = 92
-00300393  // 0x0c: addi   t2, zero, 3           t2 = 3
-0272ce33  // 0x10: div    t3, t0, t2            RAW on t2 -> t3 = 15/3 = 5
-001e0e93  // 0x14: addi   t4, t3, 1             RAW on div t3 -> t4 = 6
-00100f13  // 0x18: addi   t5, zero, 1           t5 = 1
-000f1463  // 0x1c: bne    t5, zero, +8          RAW on t5 -> taken, skip 0x20
-04200593  // 0x20: addi   a1, zero, 0x42        not-taken marker (skipped)
-00900f93  // 0x24: addi   t6, zero, 9           taken-path marker -> t6 = 9
-// ---- LSU (data @ 0x100 in D-mem, written then read back) ----
-05500613  // 0x28: addi   a2, zero, 0x55        a2 = 0x55
-10c02023  // 0x2c: sw     a2, 0x100(zero)       dmem[0x100] = 0x00000055
-10002683  // 0x30: lw     a3, 0x100(zero)       a3 = 0x55 (load-use next)
-00168713  // 0x34: addi   a4, a3, 1             RAW on load a3 -> a4 = 0x56
-0ab00793  // 0x38: addi   a5, zero, 0xAB        a5 = 0xAB
-10f00023  // 0x3c: sb     a5, 0x100(zero)       dmem[0x100] byte0 = 0xAB
-10000803  // 0x40: lb     a6, 0x100(zero)       a6 = 0xFFFFFFAB (sign-ext)
-10004883  // 0x44: lbu    a7, 0x100(zero)       a7 = 0x000000AB (zero-ext)
-00008437  // 0x48: lui    s0, 0x8               s0 = 0x00008000
-10801123  // 0x4c: sh     s0, 0x102(zero)       dmem[0x102] halfword = 0x8000
-10201483  // 0x50: lh     s1, 0x102(zero)       s1 = 0xFFFF8000 (sign-ext)
-10205403  // 0x54: lhu    s0, 0x102(zero)       s0 = 0x00008000 (zero-ext)
-0000006f  // 0x58: jal    x0, 0                 self-loop halt
+//
+// Word map (byte addr: instruction):
+//   0x00 addi t0,zero,15 | 0x04 csrrw zero,mepc,t0
+//   0x08 nop | 0x0c nop
+//   0x10 nop | 0x14 nop
+//   0x18 nop | 0x1c addi t0,zero,15
+//   0x20 addi t1,zero,77 | 0x24 add a0,t0,t1      (RAW t1 -> a0=92)
+//   0x28 addi t2,zero,3 | 0x2c div t3,t0,t2       (RAW t2 -> t3=5)
+//   0x30 addi t4,t3,1 | 0x34 addi t5,zero,1       (RAW div t3 -> t4=6)
+//   0x38 bne t5,zero,+8 | 0x3c addi a1,zero,0x42  (RAW t5 -> taken, skip 0x40)
+//   0x40 addi t6,zero,9 | 0x44 addi a2,zero,0x55  (taken-path -> t6=9)
+//   0x48 sw a2,0x100(zero) | 0x4c lw a3,0x100(zero)
+//   0x50 addi a4,a3,1 | 0x54 addi a5,zero,0xAB    (RAW load a3 -> a4=0x56)
+//   0x58 sb a5,0x100(zero) | 0x5c lb a6,0x100(zero)
+//   0x60 lbu a7,0x100(zero) | 0x64 lui s0,0x8
+//   0x68 sh s0,0x102(zero) | 0x6c lh s1,0x102(zero)
+//   0x70 lhu s0,0x102(zero) | 0x74 jal x0,0       (self-loop halt)
+3412907300f00293
+0000001300000013
+0000001300000013
+00f0029300000013
+0062853304d00313
+0272ce3300300393
+00100f13001e0e93
+04200593000f1463
+0550061300900f93
+1000268310c02023
+0ab0079300168713
+1000080310f00023
+0000843710004883
+1020148310801123
+0000006f10205403

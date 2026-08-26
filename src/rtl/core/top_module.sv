@@ -185,27 +185,32 @@ module top_module (
     assign axi_bus_uart.aresetn  = rstn_core;
 
     // Debug tap: decode or execute stage stall.
-    wire dbg_stall;
+    wire         dbg_stall;
 
     // -----------------------------------------------------------------
     // Native memory ports. Fetch and the LSU each get a dedicated BSRAM;
     // the LSU steers RAM vs peri on addr[PERI_ADDR_BIT] itself, so the
     // board top needs no crossbar for memory.
     // -----------------------------------------------------------------
-    mem_req_t imem_req;
-    mem_rsp_t imem_rsp;
-    mem_req_t dmem_req;
-    mem_rsp_t dmem_rsp;
+    // Fetch I-mem port is 64-bit read-only (ifetch); the LSU D-mem port stays
+    // on the 32-bit byte-strobed mem_req_t / mem_rsp_t.
+    ifetch_req_t imem_req;
+    ifetch_rsp_t imem_rsp;
+    mem_req_t    dmem_req;
+    mem_rsp_t    dmem_rsp;
+    // The read-only I-mem holds BVALID low (no write-ack); sink it so the
+    // port is connected (a native_ram write-ack only exists for the D-mem).
+    wire         imem_bvalid_unused;
 
     // Interrupt pending bits from the peri MMIO slaves.
-    wire msip;
-    wire mtip;
+    wire         msip;
+    wire         mtip;
 
     // Machine external interrupt: OR of the peripheral level IRQs. Only the
     // UART raises one today; add further peripherals to this term (or swap in
     // a PLIC) as they arrive.
-    wire uart_irq;
-    wire meip = uart_irq;
+    wire         uart_irq;
+    wire         meip = uart_irq;
 
     // -----------------------------------------------------------------
     // CPU. Functional ports only — no debug crosses the CPU boundary
@@ -239,28 +244,40 @@ module top_module (
     // $readmemh in sim_top.
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (14),                              // 16 KiB (see note below)
-        .DATA_WIDTH(32),
-        .READ_ONLY (1),
+        .ADDR_W     (14),                               // 16 KiB (see note below)
+        .DATA_WIDTH (64),                               // one access -> two 32-bit words
+        .READ_ONLY  (1),
+        .OUTSTANDING(2),                                // 2 fetch reads in flight
         // A read-only I-mem with no init and no write port is a zero-ROM:
         // Gowin folds every read to constant 0, the fetch stream becomes
         // all-illegal, and the whole pipeline (regfile/csr/alu/execute)
         // gets swept as dead code -- only fetch+decode survive because
         // they feed dbg_stall_o. So the I-mem MUST carry firmware for any
         // meaningful (or even timing-representative) synthesis. The
-        // default product firmware is YarvMon (sim/sw-yarvmon), a wozmon-
-        // style serial monitor over the UART (115200 8N1 on uart_rxd_i/
-        // uart_txd_o): type hex addresses to examine, ':' to deposit,
-        // '.' for a block dump, 'R' to call an address. Its image is built
-        // by `make` in sim/sw-yarvmon/ (imem.hex = .text/.text.init -> I-mem
-        // 0x0, dmem.hex = .rodata/.data -> D-mem 0x2000). Path is relative
-        // to the Gowin project dir (repo root).
-        .INIT_FILE ("sim/sw-yarvmon/build/imem.hex")
+        // default product firmware is CoreMark (sim/sw/coremark), the EEMBC
+        // benchmark vendored verbatim in eembc/. Its image is built by `make`
+        // in sim/sw/coremark/ (imem.hex = .text/.text.init -> I-mem 0x0,
+        // dmem.hex = .rodata/.data -> D-mem 0x2000). Path is relative to the
+        // Gowin project dir (repo root). The imem.hex is 64-bit-wide
+        // ($readmemh words = 8 bytes each): the low 32 bits are the first
+        // instruction at a word address, the high 32 bits the next (+4).
+        // CoreMark .text is 11.1 KiB (of 16) -> 1423 64-bit words, under the
+        // 2048-deep I-mem; it exercises the fetch/buffer path heavily, which
+        // is what a timing-closure build must stress.
+        .INIT_FILE  ("sim/sw/coremark/build/imem.hex")
     ) u_imem (
-        .clk_i    (clk_core),
-        .rstn_i   (rstn_core),
-        .mem_req_i(imem_req),
-        .mem_rsp_o(imem_rsp)
+        .clk_i       (clk_core),
+        .rstn_i      (rstn_core),
+        .req_valid_i (imem_req.valid),
+        .req_we_i    (1'b0),               // read-only
+        .req_addr_i  (imem_req.addr),
+        .req_wdata_i ({64{1'b0}}),
+        .req_wstrb_i ({8{1'b0}}),
+        .req_rready_i(imem_req.rready),
+        .rsp_wready_o(imem_rsp.ready),
+        .rsp_rvalid_o(imem_rsp.rvalid),
+        .rsp_rdata_o (imem_rsp.rdata),
+        .rsp_bvalid_o(imem_bvalid_unused)
     );
 
     // -----------------------------------------------------------------
@@ -271,15 +288,24 @@ module top_module (
     // power-up; .bss and the stack are zeroed by start.S / runtime use.
     // -----------------------------------------------------------------
     native_ram #(
-        .ADDR_W    (14),                              // 16 KiB (see note below)
-        .DATA_WIDTH(32),
-        .READ_ONLY (0),
-        .INIT_FILE ("sim/sw-yarvmon/build/dmem.hex")
+        .ADDR_W     (14),                               // 16 KiB (see note below)
+        .DATA_WIDTH (32),
+        .READ_ONLY  (0),
+        .OUTSTANDING(1),                                // LSU single-outstanding
+        .INIT_FILE  ("sim/sw/coremark/build/dmem.hex")
     ) u_dmem (
-        .clk_i    (clk_core),
-        .rstn_i   (rstn_core),
-        .mem_req_i(dmem_req),
-        .mem_rsp_o(dmem_rsp)
+        .clk_i       (clk_core),
+        .rstn_i      (rstn_core),
+        .req_valid_i (dmem_req.wvalid),
+        .req_we_i    (dmem_req.we),
+        .req_addr_i  (dmem_req.addr),
+        .req_wdata_i (dmem_req.wdata),
+        .req_wstrb_i (dmem_req.wstrb),
+        .req_rready_i(dmem_req.rready),
+        .rsp_wready_o(dmem_rsp.wready),
+        .rsp_rvalid_o(dmem_rsp.rvalid),
+        .rsp_rdata_o (dmem_rsp.rdata),
+        .rsp_bvalid_o(dmem_rsp.bvalid)
     );
 
     // -----------------------------------------------------------------

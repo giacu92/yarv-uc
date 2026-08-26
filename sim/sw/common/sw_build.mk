@@ -18,10 +18,12 @@
 #                     (empty for C programs, which link the common start.S).
 #   START_S         : start.S path (default $(COMMON_DIR)/start.S).
 #   LINK_LD         : link script (default $(COMMON_DIR)/link.ld).
-#   IMEM_PAD_WORDS  : 0 = no padding (default); 4096 = pad the I-mem image to the
+#   IMEM_PAD_WORDS  : 0 = no padding (default); 2048 = pad the I-mem image to the
 #                     full declared depth with IMEM_PAD_VALUE (ebreak). Board-fw
 #                     images pad so GowinSynthesis sizes the inferred ROM from
-#                     $readmemh content at the right depth.
+#                     $readmemh content at the right depth. COUNT IS IN OUTPUT
+#                     WORDS: the I-mem hex is 64-bit-wide (--word-width 8), so
+#                     16 KiB = 2048 words (was 4096 at the old 32-bit width).
 #   IMEM_PAD_VALUE  : filler word (default 0x00100073 = ebreak).
 #   OPT             : optimisation level (default -O2). CoreMark raises it.
 #   EXTRA_CFLAGS    : extra -D flags, e.g. -DPRINT_ARRAY=$(PRINT_ARRAY).
@@ -131,7 +133,9 @@ $(BUILD)/%.o: %.S | $(BUILD)
 $(ELF): $(OBJS) $(LINK_LD)
 	$(CC) $(LDFLAGS) $(OBJS) -o $@
 
-# Instruction image: .text.init + .text -> IMEM (VMA 0). Fetch's read-only port.
+# Instruction image: .text.init + .text -> IMEM (VMA 0). Fetch's read-only
+# 64-bit port: bin2hex --word-width 8 packs two 32-bit instructions per
+# $readmemh element (low 32 bits = word at the byte address, high = +4).
 $(IMEM_BIN): $(ELF)
 	$(OBJCOPY) -O binary -j .text.init -j .text $< $@
 
@@ -144,7 +148,7 @@ $(DMEM_BIN): $(ELF)
 
 ifeq ($(IMEM_PAD_WORDS),0)
 $(IMEM_HEX): $(IMEM_BIN) $(BIN2HEX)
-	python3 $(BIN2HEX) $< $@
+	python3 $(BIN2HEX) --word-width 8 $< $@
 else
 # Padded so the inferred ROM is built that deep: GowinSynthesis sizes a
 # read-only array from its $readmemh content, not from the declared depth, so an
@@ -152,9 +156,10 @@ else
 # instructions -- a wrong redirect then runs silently instead of faulting. The
 # filler is ebreak, not zero: a run of zero words reads as "no init" and may be
 # dropped again, and breakpoint (mcause=3) distinguishes a wander into the
-# padding from illegal-instruction (mcause=2) on genuine garbage.
+# padding from illegal-instruction (mcause=2) on genuine garbage. The pad value
+# is 32-bit and bin2hex replicates it across the 64-bit element.
 $(IMEM_HEX): $(IMEM_BIN) $(BIN2HEX)
-	python3 $(BIN2HEX) --pad-words $(IMEM_PAD_WORDS) --pad-value $(IMEM_PAD_VALUE) $< $@
+	python3 $(BIN2HEX) --word-width 8 --pad-words $(IMEM_PAD_WORDS) --pad-value $(IMEM_PAD_VALUE) $< $@
 endif
 
 $(DMEM_HEX): $(DMEM_BIN) $(BIN2HEX)

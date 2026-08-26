@@ -58,9 +58,10 @@ module rv32imac_zicsr_zifencei #(
     // the native imem_/dmem_ ports below (no AXI for memory).
     axi4_lite_if.master axi_peri,
 
-    // Native I-mem (fetch, read-only).
-    output mem_req_t imem_req_o,
-    input  mem_rsp_t imem_rsp_i,
+    // Native I-mem (fetch, read-only, 64-bit — one access delivers two
+    // 32-bit words; fetch keeps up to 2 reads outstanding).
+    output ifetch_req_t imem_req_o,
+    input  ifetch_rsp_t imem_rsp_i,
 
     // Native D-mem (LSU data RAM, byte-strobed).
     output mem_req_t dmem_req_o,
@@ -94,25 +95,25 @@ module rv32imac_zicsr_zifencei #(
     // branch-resolve path (redirect + in-flight flush).
     // -----------------------------------------------------------------
     // Fetch owns the I-mem port uncontended (Harvard). fe_* = fetch native
-    // side -> imem_req_o/imem_rsp_i.
+    // side -> imem_req_o/imem_rsp_i (64-bit read-only ifetch interface).
     // -------------------------------------------------------------
-    mem_req_t            fe_req;
-    mem_rsp_t            fe_rsp;
+    ifetch_req_t            fe_req;
+    ifetch_rsp_t            fe_rsp;
     // LSU native peri side -> the peri bridge -> axi_peri.
-    mem_req_t            peri_req;
-    mem_rsp_t            peri_rsp;
+    mem_req_t               peri_req;
+    mem_rsp_t               peri_rsp;
 
     // F/D pipeline-register taps, consumed by the decode stage below.
-    wire      [XLEN-1:0] fe_pc;
-    wire      [XLEN-1:0] fe_instr;
-    wire                 fe_valid;
-    wire                 fe_fault;
+    wire         [XLEN-1:0] fe_pc;
+    wire         [XLEN-1:0] fe_instr;
+    wire                    fe_valid;
+    wire                    fe_fault;
 
     // Decode -> fetch back-pressure (propagates execute's stall).
-    wire                 dec_stall;
+    wire                    dec_stall;
     // Execute -> fetch redirect.
-    wire                 ex_branch_valid;
-    wire      [XLEN-1:0] ex_branch_addr;
+    wire                    ex_branch_valid;
+    wire         [XLEN-1:0] ex_branch_addr;
 
     // -------------------------------------------------------------
     // Register file + decode/execute
@@ -123,31 +124,31 @@ module rv32imac_zicsr_zifencei #(
     // drives the reg-file write port (ALU / PC4 writeback), the fetch
     // redirect, and decode's stall (div) / flush (branch).
     // -------------------------------------------------------------
-    wire      [     4:0] rs1_addr;
-    wire      [     4:0] rs2_addr;
-    wire      [XLEN-1:0] rs1_data;
-    wire      [XLEN-1:0] rs2_data;
+    wire         [     4:0] rs1_addr;
+    wire         [     4:0] rs2_addr;
+    wire         [XLEN-1:0] rs1_data;
+    wire         [XLEN-1:0] rs2_data;
 
-    wire      [     4:0] wb_addr;
-    wire      [XLEN-1:0] wb_data;
-    wire                 wb_en;
+    wire         [     4:0] wb_addr;
+    wire         [XLEN-1:0] wb_data;
+    wire                    wb_en;
 
-    de_t                 de_bus;
+    de_t                    de_bus;
 
     // de_* D/E taps (decode stage outputs). Debug only — left
     // unconnected here; the sim probes them via the Verilator hierarchy.
-    wire      [XLEN-1:0] de_pc;
-    wire      [XLEN-1:0] de_instr;
-    wire                 de_valid;
+    wire         [XLEN-1:0] de_pc;
+    wire         [XLEN-1:0] de_instr;
+    wire                    de_valid;
 
     // Execute -> decode back-pressure / flush.
-    wire                 ex_stall;
-    wire                 ex_flush;
+    wire                    ex_stall;
+    wire                    ex_flush;
 
     // CSR
-    wire      [XLEN-1:0] csr_wdata;
-    wire                 csr_we;
-    wire      [XLEN-1:0] csr_rdata;
+    wire         [XLEN-1:0] csr_wdata;
+    wire                    csr_we;
+    wire         [XLEN-1:0] csr_rdata;
 
     // CSR taps (trap unit reads mtvec / mepc / mstatus / mip / mie).
     wire [XLEN-1:0] csr_mtvec, csr_mepc, csr_mstatus, csr_mip, csr_mie;

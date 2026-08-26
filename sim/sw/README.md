@@ -144,8 +144,8 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   `mcycleh`) is `ITERATIONS` 651..6979; 2000 iterations takes ~31 s. A shorter
   run ends in upstream's own "ERROR! Must execute for at least 10 secs" — the
   run rule, not a core failure; the four CRC lines say it computed correctly.
-  `TOTAL_DATA_SIZE=6000` (6K profile), `IMEM_PAD_WORDS=4096` for a board
-  build. `COSIM=1` builds the co-sim variant: no cycle counter (the one
+  `TOTAL_DATA_SIZE=6000` (6K profile), `IMEM_PAD_WORDS=2048` (16 KiB / 8,
+  the 64-bit I-mem word width) for a board build. `COSIM=1` builds the co-sim variant: no cycle counter (the one
   register write Spike can't reproduce), no banner, and `-O2` — see
   `sim/cosim/coremark/` (332 803 retires matched).
 - **`isa/ifault/`** — instruction-access-fault oracle (jump outside the I-mem).

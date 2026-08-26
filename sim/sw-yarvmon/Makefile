@@ -98,11 +98,11 @@ $(DMEM_BIN): $(ELF)
 # indistinguishable from "no initial value" and may be dropped again, and
 # breakpoint (mcause=3) identifies a wander into the padding as opposed to
 # illegal-instruction (mcause=2) from genuine garbage.
-IMEM_PAD_WORDS ?= 4096   # 16 KiB, the full declared I-mem depth
+IMEM_PAD_WORDS ?= 2048   # 16 KiB / 8 = 2048 64-bit words, the full I-mem depth
 IMEM_PAD_VALUE ?= 0x00100073
 
 $(IMEM_HEX): $(IMEM_BIN) bin2hex.py
-	python3 bin2hex.py --pad-words $(IMEM_PAD_WORDS) --pad-value $(IMEM_PAD_VALUE) $< $@
+	python3 bin2hex.py --word-width 8 --pad-words $(IMEM_PAD_WORDS) --pad-value $(IMEM_PAD_VALUE) $< $@
 
 $(DMEM_HEX): $(DMEM_BIN) bin2hex.py
 	python3 bin2hex.py --base 0x2000 $< $@

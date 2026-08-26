@@ -5,13 +5,17 @@
 import rv32_pkg::*;
 
 /**
- * Focused native mem_req_t / mem_rsp_t RAM compliance testbench wrapper.
+ * Focused native RAM compliance testbench wrapper (32-bit, OUTSTANDING=1).
  *
  * Instantiates two native_ram slaves and exposes the master-side native
  * signals as flat ports so the C++ BFM (native_mem_tb.cpp) can drive them
- * directly:
+ * directly. native_ram's ports are flat parametric logic (sized by
+ * DATA_WIDTH / OUTSTANDING), not the mem_req_t/mem_rsp_t structs, so this
+ * wrapper is plain point-to-point wiring:
  *   - u_dmem : READ_ONLY=0 (the LSU's byte-strobed D-mem).
- *   - u_imem : READ_ONLY=1 (the fetch read-only I-mem).
+ *   - u_imem : READ_ONLY=1 (a 32-bit read-only port — the real I-mem is
+ *     64-bit/2-outstanding and has its own TB, native_ram64_tb; this one
+ *     stays 32-bit/1-outstanding to gate the D-mem-shaped config).
  *
  * This is NOT part of synthesis; it is a protocol-compliance gate for the
  * native interface, analogous to ram_tb for AXI4-Lite. It checks:
@@ -59,63 +63,52 @@ module native_mem_tb (
 );
 
     // -----------------------------------------------------------------
-    // D-mem (read/write, byte-strobed)
+    // D-mem (read/write, byte-strobed, single-outstanding)
     // -----------------------------------------------------------------
-    mem_req_t d_req;
-    mem_rsp_t d_rsp;
-
-    assign d_req.wvalid = d_wvalid;
-    assign d_req.we     = d_we;
-    assign d_req.addr   = d_addr;
-    assign d_req.wdata  = d_wdata;
-    assign d_req.wstrb  = d_wstrb;
-    assign d_req.rready = d_rready;
-
-    assign d_wready     = d_rsp.wready;
-    assign d_rvalid     = d_rsp.rvalid;
-    assign d_rdata      = d_rsp.rdata;
-    assign d_bvalid     = d_rsp.bvalid;
-
     native_ram #(
-        .ADDR_W    (16),
-        .DATA_WIDTH(32),
-        .READ_ONLY (0),
-        .INIT_FILE ("")
+        .ADDR_W     (16),
+        .DATA_WIDTH (32),
+        .READ_ONLY  (0),
+        .OUTSTANDING(1),
+        .INIT_FILE  ("")
     ) u_dmem (
-        .clk_i    (clk_i),
-        .rstn_i   (rstn_i),
-        .mem_req_i(d_req),
-        .mem_rsp_o(d_rsp)
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .req_valid_i (d_wvalid),
+        .req_we_i    (d_we),
+        .req_addr_i  (d_addr),
+        .req_wdata_i (d_wdata),
+        .req_wstrb_i (d_wstrb),
+        .req_rready_i(d_rready),
+        .rsp_wready_o(d_wready),
+        .rsp_rvalid_o(d_rvalid),
+        .rsp_rdata_o (d_rdata),
+        .rsp_bvalid_o(d_bvalid)
     );
 
     // -----------------------------------------------------------------
-    // I-mem (read-only). Preload two known words so reads can be checked.
+    // I-mem (read-only, 32-bit, single-outstanding). Preload two known
+    // words so reads can be checked.
     // -----------------------------------------------------------------
-    mem_req_t i_req;
-    mem_rsp_t i_rsp;
-
-    assign i_req.wvalid = i_wvalid;
-    assign i_req.we     = i_we;
-    assign i_req.addr   = i_addr;
-    assign i_req.wdata  = i_wdata;
-    assign i_req.wstrb  = i_wstrb;
-    assign i_req.rready = i_rready;
-
-    assign i_wready     = i_rsp.wready;
-    assign i_rvalid     = i_rsp.rvalid;
-    assign i_rdata      = i_rsp.rdata;
-    assign i_bvalid     = i_rsp.bvalid;
-
     native_ram #(
-        .ADDR_W    (16),
-        .DATA_WIDTH(32),
-        .READ_ONLY (1),
-        .INIT_FILE ("")
+        .ADDR_W     (16),
+        .DATA_WIDTH (32),
+        .READ_ONLY  (1),
+        .OUTSTANDING(1),
+        .INIT_FILE  ("")
     ) u_imem (
-        .clk_i    (clk_i),
-        .rstn_i   (rstn_i),
-        .mem_req_i(i_req),
-        .mem_rsp_o(i_rsp)
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .req_valid_i (i_wvalid),
+        .req_we_i    (i_we),
+        .req_addr_i  (i_addr),
+        .req_wdata_i (i_wdata),
+        .req_wstrb_i (i_wstrb),
+        .req_rready_i(i_rready),
+        .rsp_wready_o(i_wready),
+        .rsp_rvalid_o(i_rvalid),
+        .rsp_rdata_o (i_rdata),
+        .rsp_bvalid_o(i_bvalid)
     );
 
     // Preload two words for read checks (sim only).

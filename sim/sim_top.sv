@@ -69,18 +69,23 @@ module sim_top #(
     // Native memory ports. Fetch and the LSU each get a dedicated
     // native_ram.
     // -----------------------------------------------------------------
-    mem_req_t imem_req;
-    mem_rsp_t imem_rsp;
-    mem_req_t dmem_req;
-    mem_rsp_t dmem_rsp;
+    // Fetch I-mem port is 64-bit read-only (ifetch); the LSU D-mem port stays
+    // on the 32-bit byte-strobed mem_req_t / mem_rsp_t.
+    ifetch_req_t imem_req;
+    ifetch_rsp_t imem_rsp;
+    mem_req_t    dmem_req;
+    mem_rsp_t    dmem_rsp;
+    // The read-only I-mem holds BVALID low (no write-ack); sink it so the
+    // port is connected (a native_ram write-ack only exists for the D-mem).
+    wire         imem_bvalid_unused;
 
     // Interrupt pending bits (mip.MSIP / mip.MTIP sources).
-    wire msip;
-    wire mtip;
+    wire         msip;
+    wire         mtip;
     // Machine external interrupt: OR of the peripheral level IRQs (UART only
     // today), same term as the board top.
-    wire uart_irq;
-    wire meip = uart_irq;
+    wire         uart_irq;
+    wire         meip = uart_irq;
 
     // -----------------------------------------------------------------
     // CPU. Functional ports only; debug is observed via the Verilator
@@ -88,7 +93,7 @@ module sim_top #(
     // The aggregate stall tap (dbg_stall_o) is sunk to an unused wire —
     // it carries no per-stage debug, just a "pipe stalled" status bit.
     // -----------------------------------------------------------------
-    wire unused_dbg_stall;
+    wire         unused_dbg_stall;
     // IMEM_ADDR_W must match u_imem below: fetch uses it to tell a PC inside
     // the implemented I-mem from one outside it, which is the difference
     // between fetching an instruction and taking an access fault.
@@ -117,16 +122,27 @@ module sim_top #(
         // 16 KiB, same depth as top_module: the GW2AR-18C has 46 BSRAM
         // blocks (828 Kb), so two 64 KiB memories cannot both exist -- and a
         // simulation with different memories stops modelling the board
-        // exactly where it matters.
-        .ADDR_W    (14),
-        .DATA_WIDTH(32),
-        .READ_ONLY (1),
-        .INIT_FILE ("")
+        // exactly where it matters. 64-bit wide: one access delivers two
+        // 32-bit words; 2 outstanding keeps the BSRAM issuing through
+        // decode stalls.
+        .ADDR_W     (14),
+        .DATA_WIDTH (64),
+        .READ_ONLY  (1),
+        .OUTSTANDING(2),
+        .INIT_FILE  ("")
     ) u_imem (
-        .clk_i    (clk_i),
-        .rstn_i   (rstn_i),
-        .mem_req_i(imem_req),
-        .mem_rsp_o(imem_rsp)
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .req_valid_i (imem_req.valid),
+        .req_we_i    (1'b0),               // read-only
+        .req_addr_i  (imem_req.addr),
+        .req_wdata_i ({64{1'b0}}),
+        .req_wstrb_i ({8{1'b0}}),
+        .req_rready_i(imem_req.rready),
+        .rsp_wready_o(imem_rsp.ready),
+        .rsp_rvalid_o(imem_rsp.rvalid),
+        .rsp_rdata_o (imem_rsp.rdata),
+        .rsp_bvalid_o(imem_bvalid_unused)
     );
 
     // -----------------------------------------------------------------
@@ -139,15 +155,24 @@ module sim_top #(
         // blocks (828 Kb), so two 64 KiB memories cannot both exist -- and a
         // simulation with different memories stops modelling the board
         // exactly where it matters.
-        .ADDR_W    (14),
-        .DATA_WIDTH(32),
-        .READ_ONLY (0),
-        .INIT_FILE ("")
+        .ADDR_W     (14),
+        .DATA_WIDTH (32),
+        .READ_ONLY  (0),
+        .OUTSTANDING(1),   // LSU single-outstanding
+        .INIT_FILE  ("")
     ) u_dmem (
-        .clk_i    (clk_i),
-        .rstn_i   (rstn_i),
-        .mem_req_i(dmem_req),
-        .mem_rsp_o(dmem_rsp)
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .req_valid_i (dmem_req.wvalid),
+        .req_we_i    (dmem_req.we),
+        .req_addr_i  (dmem_req.addr),
+        .req_wdata_i (dmem_req.wdata),
+        .req_wstrb_i (dmem_req.wstrb),
+        .req_rready_i(dmem_req.rready),
+        .rsp_wready_o(dmem_rsp.wready),
+        .rsp_rvalid_o(dmem_rsp.rvalid),
+        .rsp_rdata_o (dmem_rsp.rdata),
+        .rsp_bvalid_o(dmem_rsp.bvalid)
     );
 
     string iinit_file;

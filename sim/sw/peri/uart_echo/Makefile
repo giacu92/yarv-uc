@@ -23,6 +23,6 @@ EXTRA_CFLAGS := -DUART_TX_PACED=$(UART_TX_PACED)
 
 C_SRCS := uart_echo.c
 
-IMEM_PAD_WORDS := 4096
+IMEM_PAD_WORDS := 2048   # 16 KiB / 8 = 2048 64-bit words
 
 include ../../common/sw_build.mk

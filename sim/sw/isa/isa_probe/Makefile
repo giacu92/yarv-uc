@@ -20,7 +20,8 @@ EXTRA_CFLAGS := -DUART_TX_PACED=$(UART_TX_PACED)
 
 C_SRCS := isa_probe.c
 
-# Board-fw-style: pad the I-mem image to the full declared depth with ebreak.
-IMEM_PAD_WORDS := 4096
+# Board-fw-style: pad the I-mem image to the full declared depth with ebreak
+# (16 KiB / 8 = 2048 64-bit words).
+IMEM_PAD_WORDS := 2048
 
 include ../../common/sw_build.mk

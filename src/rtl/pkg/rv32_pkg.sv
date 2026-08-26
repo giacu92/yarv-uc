@@ -75,6 +75,29 @@ package rv32_pkg;
     } mem_rsp_t;
 
     // ---------------------------------------------------------------
+    // Instruction-fetch interface — read-only, 64-bit. The I-mem port is
+    // widened to deliver two 32-bit words per access (3-4 with RVC), so it
+    // cannot ride the XLEN-wide mem_req_t/mem_rsp_t (whose rdata is 32-bit).
+    // Fetch issues aligned 8-byte reads; a read has no write side, so the
+    // request carries only valid/addr/rready and the response only
+    // ready/rvalid/rdata. D-mem and the peri bridge keep using mem_req_t /
+    // mem_rsp_t above.
+    // ---------------------------------------------------------------
+    localparam int unsigned IFETCH_DW = 64;  // fetch word width (bytes 0..7)
+
+    typedef struct packed {
+        logic            valid;   // request valid (launch a read)
+        logic [XLEN-1:0] addr;    // byte address (8-byte aligned in steady state)
+        logic            rready;  // master ready to accept read data
+    } ifetch_req_t;
+
+    typedef struct packed {
+        logic                 ready;   // slave accepts the request (skid not full)
+        logic                 rvalid;  // read data valid this cycle
+        logic [IFETCH_DW-1:0] rdata;   // 64-bit read data
+    } ifetch_rsp_t;
+
+    // ---------------------------------------------------------------
     // Decode: opcodes, ALU/branch/source enums, and the D/E control
     // struct. RV32I + M + C + Zilx + Zicsr + Zifencei all decode AND
     // execute; nothing in this list is stubbed out as illegal any more.

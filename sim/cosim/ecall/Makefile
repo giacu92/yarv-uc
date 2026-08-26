@@ -54,7 +54,7 @@ $(ELF): ecall_test.S link.ld | $(BUILD)
 	$(CC) $(LDFLAGS) $(BUILD)/ecall_test.o -o $@
 	$(OBJCOPY) -O binary -j .text.init -j .text $@ $(BUILD)/imem.bin
 	$(OBJCOPY) -O binary -j .rodata -j .data $@ $(BUILD)/dmem.bin
-	python3 bin2hex.py $(BUILD)/imem.bin $(IMEM_HEX)
+	python3 bin2hex.py --word-width 8 $(BUILD)/imem.bin $(IMEM_HEX)
 	python3 bin2hex.py --base 0x2000 $(BUILD)/dmem.bin $(DMEM_HEX)
 	$(OBJDUMP) -d $@ > $(BUILD)/program.elf.objdump
 

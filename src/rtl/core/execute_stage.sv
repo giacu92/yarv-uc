@@ -204,29 +204,25 @@ module execute_stage (
     logic csr_start;
     logic csr_ready;
 
-    // Misaligned access: raises a precise sync trap (LAD_MIS / SAD_MIS)
-    // below; the access never launches.
-    // LH/LHU needs addr[0]=0; LW/SW needs addr[1:0]=00. Because every
-    // misaligned case traps here, no access that reaches the LSU can cross a
-    // word boundary, so the single-beat slaves are always sufficient.
-    // Byte accesses (LB/LBU/SB) are always within a word. Only mem ops
-    // can be misaligned — non-mem ops reuse mem_size as a don't-care
-    // decode default (MS_W) and must NOT be suppressed, so gate on
-    // is_mem_op.
-    logic mem_misaligned;
-    always_comb begin
-        if (!is_mem_op) begin
-            mem_misaligned = 1'b0;
-        end else begin
-            unique case (de_i.mem_size)
-                MS_B:    mem_misaligned = 1'b0;
-                MS_H:    mem_misaligned = alu_result[0];
-                MS_W:    mem_misaligned = |alu_result[1:0];
-                default: mem_misaligned = 1'b1;
-            endcase
-        end
-    end
-
+    // Misaligned access: raises a precise sync trap (LAD_MIS / SAD_MIS); the
+    // access never launches. LH/LHU needs addr[0]=0; LW/SW needs addr[1:0]=00.
+    // Because every misaligned case traps, no access that reaches the LSU can
+    // cross a word boundary, so the single-beat slaves are always sufficient.
+    // Byte accesses (LB/LBU/SB) are always within a word. Only mem ops can be
+    // misaligned — non-mem ops reuse mem_size as a don't-care decode default
+    // (MS_W) and must NOT be suppressed, so the detector gates on is_mem_op.
+    //
+    // The check reads the CAPTURED effective address (mem_addr_q) in
+    // EX_MEM_LAUNCH, not the live alu_result in EX_IDLE. Checking alu_result in
+    // EX_IDLE put the whole regfile-read -> ALU (through the MUL DSP, the
+    // slowest alu_result contributor) -> misaligned -> trap-vectored-entry ->
+    // pc_q chain on a single cycle, which was the 40 MHz limiter (-0.975 ns).
+    // Moving it past the capture flop cuts that chain: the MUL delay only has
+    // to reach mem_addr_q[D] in one cycle (~9 ns, well inside 25), and the
+    // trap -> pc_q redirect becomes flop-launched. Cost: a misaligned access
+    // captures first and traps one cycle later — invisible to the retire trace
+    // (a trapping op never retires) and free on aligned accesses. See the
+    // detector + misaligned_trap below, after the capture flops.
     typedef enum logic [2:0] {
         EX_IDLE,
         EX_MEM_LAUNCH,
@@ -243,11 +239,15 @@ module execute_stage (
     logic            alu_result_valid;
     logic [XLEN-1:0] alu_result;
 
-    // Capture pulse: a valid, aligned mem op in EX_IDLE latches its
-    // address / write data / strobes and moves to EX_MEM_LAUNCH. No bus
-    // activity this cycle — that is the whole point of the stage.
+    // Capture pulse: a valid mem op in EX_IDLE latches its address / write
+    // data / strobes and moves to EX_MEM_LAUNCH. No bus activity this cycle —
+    // that is the whole point of the stage. NOT gated by alignment: a
+    // misaligned access captures too, then the misaligned_trap detector below
+    // suppresses the launch and raises the sync trap from EX_MEM_LAUNCH (so the
+    // detector reads the registered EA, not the live alu_result — see the
+    // comment at the mem_size gate above).
     logic            mem_stage_req;
-    assign mem_stage_req = de_i.valid & is_mem_op & ~mem_misaligned &
+    assign mem_stage_req = de_i.valid & is_mem_op &
         (ex_state_q == EX_IDLE) & ~freeze & ~trap_redirect_req;
 
     // Registered request: address, write data, byte strobes and the peri/
@@ -275,7 +275,38 @@ module execute_stage (
     mem_rsp_t lsu_rsp;
     assign lsu_rsp = is_peri ? peri_rsp_i : mem_rsp_i;
 
-    wire  mem_launch_hs = mem_launch & lsu_rsp.wready;
+    // Misaligned-access detector off the CAPTURED effective address. Valid only
+    // in EX_MEM_LAUNCH (mem_addr_q holds this op's EA the cycle after capture);
+    // in every other state it is stale and no consumer below reads it outside
+    // EX_MEM_LAUNCH. Gated by is_mem_op so a non-mem op reusing mem_size as a
+    // decode don't-care (MS_W) is not falsely flagged.
+    logic mem_misaligned_q;
+    always_comb begin
+        if (!is_mem_op) begin
+            mem_misaligned_q = 1'b0;
+        end else begin
+            unique case (de_i.mem_size)
+                MS_B:    mem_misaligned_q = 1'b0;
+                MS_H:    mem_misaligned_q = mem_addr_q[0];
+                MS_W:    mem_misaligned_q = |mem_addr_q[1:0];
+                default: mem_misaligned_q = 1'b1;
+            endcase
+        end
+    end
+
+    // A misaligned access raises its sync trap from EX_MEM_LAUNCH (one cycle
+    // after capture), not EX_IDLE. Suppresses the bus launch that cycle and
+    // feeds the trap machinery below. The registered source is what cuts the
+    // regfile -> MUL -> alu_result -> trap -> pc_q critical path.
+    wire  misaligned_trap = mem_launch & de_i.valid & mem_misaligned_q;
+
+    // The bus drives the slave only for an aligned launch. A misaligned op in
+    // EX_MEM_LAUNCH holds wvalid low (no access) and traps instead. Gating
+    // mem_launch_hs through this too keeps store_done from falsely pulsing on a
+    // misaligned store when the slave happens to be idle (wready high with
+    // wvalid low must NOT count as a handshake).
+    wire  mem_bus_drive = mem_launch & ~misaligned_trap;
+    wire  mem_launch_hs = mem_bus_drive & lsu_rsp.wready;
 
     // Posted store: once the bridge accepts AW+W (mem_launch_hs on a
     // write), it owns the write->B round trip on its own; the LSU
@@ -320,7 +351,8 @@ module execute_stage (
             end
             EX_CSR_WAIT: ex_state_d = EX_IDLE;
             EX_MEM_LAUNCH:
-            if (mem_launch_hs)
+            if (misaligned_trap) ex_state_d = EX_IDLE;  // misaligned: no launch, trap taken
+            else if (mem_launch_hs)
                 ex_state_d = de_i.mem_read ? EX_MEM_WAIT : EX_IDLE;  // store retires now
             EX_DIV_BUSY: if (alu_result_valid) ex_state_d = EX_IDLE;
             EX_MEM_WAIT: if (mem_done) ex_state_d = EX_IDLE;
@@ -378,18 +410,25 @@ module execute_stage (
     wire wfi_stall = wfi_halt_q & ~int_pending_i;
     wire freeze = stall_i | wfi_stall;
 
-    // Sync trap request: illegal/ecall/ebreak (decode exception) OR a
-    // misaligned load/store detected here (needs the EA). Fires only in
-    // EX_IDLE (misaligned never launches; system traps are single-cycle).
-    wire sync_trap_req = de_i.valid & ~freeze & (ex_state_q == EX_IDLE) &
-        (de_i.exception | mem_misaligned);
+    // Sync trap request: a decode exception (illegal/ecall/ebreak) fires in
+    // EX_IDLE the cycle the faulting op would retire; a misaligned load/store
+    // fires from EX_MEM_LAUNCH via misaligned_trap (one cycle after capture,
+    // off the registered EA — see the detector above). The two never coincide:
+    // a decode exception is never a mem op, and mem_stage_req is suppressed by
+    // trap_redirect_req so an exception in EX_IDLE never captures.
+    wire sync_trap_req = (de_i.valid & ~freeze & (ex_state_q == EX_IDLE) & de_i.exception) |
+        misaligned_trap;
 
     wire mret_req = de_i.valid & ~freeze & (ex_state_q == EX_IDLE) & is_mret_op;
 
     // A normal instruction eligible to be squashed by an interrupt (any
     // non-trap, non-mret, non-wfi valid op in EX_IDLE). WFI is excluded: it
     // retires (commit) then halts; the interrupt is taken on the WFI wake
-    // path (wfi_halt_q) with mepc = wfi.pc + size.
+    // path (wfi_halt_q) with mepc = wfi.pc + size. A misaligned op in EX_IDLE
+    // is eligible: its sync trap fires from EX_MEM_LAUNCH, so a pending
+    // interrupt preempts it in EX_IDLE (RISC-V takes the interrupt between
+    // instructions, before the faulting access executes); it re-runs after
+    // mret and traps then.
     wire normal_int_eligible = de_i.valid & ~is_wfi_op & ~de_i.exception &
         (ex_state_q == EX_IDLE) & ~freeze;
 
@@ -399,12 +438,15 @@ module execute_stage (
     wire trap_redirect_req = sync_trap_req | mret_req | take_interrupt;
 
     // Payload resolved for the trap unit (at the CPU top). A misaligned
-    // access overrides the decode cause/tval (bad EA); an interrupt forces
-    // the MSI cause / tval=0. The trap unit consumes these as cause_i /
-    // tval_i / pc_i and produces the redirect + CSR trap-write bundle.
-    wire [XLEN-1:0] sync_cause = mem_misaligned ?
+    // access overrides the decode cause/tval (bad EA, from the registered
+    // mem_addr_q); an interrupt forces the MSI cause / tval=0. The trap unit
+    // consumes these as cause_i / tval_i / pc_i and produces the redirect +
+    // CSR trap-write bundle. misaligned_trap (not mem_misaligned_q) selects
+    // so an exception in EX_IDLE — where mem_addr_q is stale — reads its own
+    // cause/tval.
+    wire [XLEN-1:0] sync_cause = misaligned_trap ?
         (de_i.mem_write ? MCAUSE_SAD_MIS : MCAUSE_LAD_MIS) : de_i.exception_cause;
-    wire [XLEN-1:0] sync_tval = mem_misaligned ? alu_result : de_i.exception_tval;
+    wire [XLEN-1:0] sync_tval = misaligned_trap ? mem_addr_q : de_i.exception_tval;
     wire [XLEN-1:0] trap_cause = take_interrupt ? int_cause_i : sync_cause;
     wire [XLEN-1:0] trap_tval = take_interrupt ? 32'd0 : sync_tval;
     // mepc: faulting instr pc (sync trap), or the suppressed instr pc
@@ -498,7 +540,7 @@ module execute_stage (
     assign result_ready = is_mem_op ? mem_op_done : (is_csr_op ? csr_ready : alu_result_valid);
 
     assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~freeze &
-        result_ready & ~mem_misaligned & ~trap_redirect_req;
+        result_ready & ~misaligned_trap & ~trap_redirect_req;
 
     // =================================================================
     // CSR read-modify-write (Zicsr). The old CSR value is csr_rdata_i
@@ -525,7 +567,7 @@ module execute_stage (
     // a CSR op). de_i.csr_wren is decode's "CSR op present" flag, already
     // squashed by illegal in decode.
     assign csr_op_valid = de_i.valid & de_i.csr_wren & ~de_i.illegal & ~freeze &
-        result_ready & ~mem_misaligned & ~trap_redirect_req;
+        result_ready & ~misaligned_trap & ~trap_redirect_req;
 
     always_comb begin
         unique case (de_i.csr_op)
@@ -621,14 +663,14 @@ module execute_stage (
         peri_req_o.wstrb  = '0;
         peri_req_o.rready = 1'b0;
         if (is_peri) begin
-            peri_req_o.wvalid = mem_launch;  // held until the slave accepts
+            peri_req_o.wvalid = mem_bus_drive;  // held until the slave accepts
             peri_req_o.we     = de_i.mem_write;
             peri_req_o.addr   = mem_addr_q;  // registered EA
             peri_req_o.wdata  = mem_wdata_q;
             peri_req_o.wstrb  = mem_wstrb_q;
             peri_req_o.rready = (ex_state_q == EX_MEM_WAIT) & de_i.mem_read;
         end else begin
-            mem_req_o.wvalid = mem_launch;  // held until the slave accepts
+            mem_req_o.wvalid = mem_bus_drive;  // held until the slave accepts
             mem_req_o.we     = de_i.mem_write;
             mem_req_o.addr   = mem_addr_q;  // registered EA
             mem_req_o.wdata  = mem_wdata_q;
@@ -692,7 +734,7 @@ module execute_stage (
     // only the retire count is suppressed.
     logic op_commits;
     assign op_commits = take_interrupt ? 1'b0 : sync_trap_req ? 1'b0 :
-        mret_req ? 1'b1 : (de_i.valid & ~de_i.illegal & ~freeze & result_ready & ~mem_misaligned);
+        mret_req ? 1'b1 : (de_i.valid & ~de_i.illegal & ~freeze & result_ready & ~misaligned_trap);
 
     assign ex_pc_d = op_commits ? de_i.pc : ex_pc_q;
     assign ex_instr_d = op_commits ? de_i.instr : ex_instr_q;
