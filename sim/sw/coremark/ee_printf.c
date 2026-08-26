@@ -28,7 +28,7 @@ static void put_str(const char *s)
     while (*s) put_char(*s++);
 }
 
-static void put_dec(unsigned long v, int is_signed)
+static void put_dec(unsigned long v, int is_signed, int width)
 {
     char buf[12];
     int  i = 0;
@@ -40,6 +40,9 @@ static void put_dec(unsigned long v, int is_signed)
         buf[i++] = (char)('0' + (v % 10u));
         v /= 10u;
     } while (v);
+    /* Zero-padded width, not just for looks: the report prints hundredths
+     * as "%u.%02u", and without the padding 0.01 comes out as "0.1". */
+    while (i < width && i < (int)sizeof(buf)) buf[i++] = '0';
     while (i--) put_char(buf[i]);
 }
 
@@ -71,8 +74,8 @@ int printf(const char *fmt, ...)
         while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
         while (*fmt == 'l') ++fmt;
         switch (*fmt++) {
-            case 'd': put_dec((unsigned long)va_arg(ap, long), 1); break;
-            case 'u': put_dec(va_arg(ap, unsigned long), 0); break;
+            case 'd': put_dec((unsigned long)va_arg(ap, long), 1, width); break;
+            case 'u': put_dec(va_arg(ap, unsigned long), 0, width); break;
             case 'x': put_hex(va_arg(ap, unsigned long), width); break;
             case 's': put_str(va_arg(ap, const char *)); break;
             case 'c': put_char((char)va_arg(ap, int)); break;

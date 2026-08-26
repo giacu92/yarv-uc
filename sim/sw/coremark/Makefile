@@ -22,15 +22,30 @@
 # Note also that mcycle here is 32 bits with no mcycleh, so the timed
 # region must stay under 2^32 cycles (107 s at 40 MHz).
 #
-# One iteration costs 649378 cycles (2K profile) or 4589357 (6K), so at
-# 40.281 MHz a run is valid between roughly these bounds:
+# One iteration costs 622006 cycles (2K profile, -O3), so at 40 MHz a run
+# is valid between roughly these bounds:
 #
-#   2K: ITERATIONS 620 .. 6613   (10 s .. the 32-bit mcycle wrap)
-#   6K: ITERATIONS  88 ..  935
+#   2K: ITERATIONS 643 .. 6905   (10 s .. the 32-bit mcycle wrap)
+#
+# The 6K profile costs ~7x that per iteration; scale accordingly.
 #
 # ITERATIONS=1000 (2K) is a good default for the board: ~16 s of run.
 
 ARCH := rv32imac_zicsr_zifencei
+
+# Toolchain: the tree default from common/sw_build.mk (the rv32 buildroot
+# cross-compiler, gcc 14.3.0). Override RISCV_PREFIX like any other
+# harness; nothing here needs a different compiler.
+
+# Optimisation. CoreMark is a compiler benchmark as much as a core
+# benchmark, and published scores are quoted with their flags; these match
+# what the comparable published rv32 ports use, so the numbers are read
+# against a like build. -mstrict-align matters here beyond speed: this core
+# traps on a misaligned load or store, it does not fix them up.
+OPT := -O3
+EXTRA_LDFLAGS := -Wl,--gc-sections
+PERF_CFLAGS := -ffunction-sections -fdata-sections -mstrict-align \
+               -mbranch-cost=10 -ffp-contract=off -mno-fdiv
 
 ITERATIONS ?= 1
 # TOTAL_DATA_SIZE selects the profile: 2000 is CoreMark's 2K run (the
@@ -40,6 +55,11 @@ ITERATIONS ?= 1
 # link before assuming it fits.
 TOTAL_DATA_SIZE ?= 2000
 RUN_TYPE   ?= PERFORMANCE_RUN
+# The core clock: the rPLL makes 25 MHz x 8/5 = 40.000 MHz exactly. (The
+# 40.281 MHz in the timing reports is the Fmax the design closed at, not
+# the frequency it runs at.) This is what the reported seconds and
+# iterations-per-second are computed against; CoreMark/MHz comes from
+# ticks alone and does not depend on it.
 CLK_HZ     ?= 40000000
 # SKIP_TIME_CHECK=1 (default) drops CoreMark's "must run for at least 10
 # secs" gate, which no simulation run can pass -- with it left in, a run
@@ -51,11 +71,18 @@ SKIP_TIME_CHECK ?= 1
 # write that can never match an instruction-based golden model.
 COSIM ?= 0
 
-EXTRA_CFLAGS := -I. -Ieembc -DITERATIONS=$(ITERATIONS) -D$(RUN_TYPE)=1 \
+# Cycles per iteration, measured on this core. Used only by the banner to
+# say how long the run will take before it starts; nothing measured
+# depends on it.
+CYCLES_PER_ITER ?= 622006
+
+EXTRA_CFLAGS := -I. -Ieembc $(PERF_CFLAGS) \
+                -DITERATIONS=$(ITERATIONS) -D$(RUN_TYPE)=1 \
+                -DCYCLES_PER_ITER=$(CYCLES_PER_ITER) \
                 -DTOTAL_DATA_SIZE=$(TOTAL_DATA_SIZE) \
                 -DCLK_HZ=$(CLK_HZ) -DHAS_PRINTF=1 \
                 -DSKIP_TIME_CHECK=$(SKIP_TIME_CHECK) -DCOSIM=$(COSIM) \
-                -DCOMPILER_FLAGS='"-O2 -march=$(ARCH) -mabi=ilp32"'
+                -DCOMPILER_FLAGS='"$(OPT) -march=$(ARCH) -mabi=ilp32 $(PERF_CFLAGS)"'
 
 # Board builds pad the I-mem image to the full declared depth, because
 # GowinSynthesis sizes an inferred ROM from its $readmemh content rather

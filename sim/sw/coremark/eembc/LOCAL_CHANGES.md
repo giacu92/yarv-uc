@@ -28,3 +28,23 @@ other cores' published 2000-iteration runs (0x4983).
 Note the line itself is not in upstream EEMBC CoreMark either: it comes
 from the port this tree was vendored from, which added the CoreMark/MHz
 scaling output for runs whose ticks are cycles.
+
+## `coremark_main.c` — two decimals on the duration and the rate
+
+With `HAS_FLOAT=0` these two report lines are integer divisions:
+
+```c
+ee_printf("Total time (secs): %d\n", total_time_secs);
+ee_printf("Iterations/Sec   : %d\n", total_iterations / total_time_secs);
+```
+
+A 32.24 s run therefore prints `32` and `62` — one significant figure on
+the two lines a reader takes the result from, and unusable for comparing
+against a port that has floating point and prints `21.000000` /
+`95.238095`. They now call `print_secs_x100` / `print_iters_per_sec_x100`
+in `core_portme.c`, which print hundredths computed from the raw tick
+count in 32-bit arithmetic.
+
+Presentation only: `total_time` and `total_iterations` are the same
+values, the timed region is untouched, and the ≥10 s validity check still
+uses CoreMark's own `total_time_secs`.

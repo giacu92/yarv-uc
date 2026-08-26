@@ -385,9 +385,20 @@ for (i = 0; i < MULTITHREAD; i++)
     if (total_time_secs > 0)
         ee_printf("Iterations/Sec   : %f\n", total_iterations / total_time_secs);
 #else
-    ee_printf("Total time (secs): %d\n", total_time_secs);
-    if (total_time_secs > 0)
-        ee_printf("Iterations/Sec   : %d\n", total_iterations / total_time_secs);
+    /* LOCAL CHANGE (yarv-uc): two decimals. With HAS_FLOAT=0 these are
+       integer divisions, so a 32.24 s run prints "32" and its 62.03
+       iterations per second print "62" -- one significant figure on the
+       two lines the result is read off. The port prints hundredths from
+       the raw tick count (see core_portme.c). */
+    ee_printf("Total time (secs): ");
+    print_secs_x100(total_time);
+    ee_printf("\n");
+    if (total_time > 0)
+    {
+        ee_printf("Iterations/Sec   : ");
+        print_iters_per_sec_x100(total_iterations, total_time);
+        ee_printf("\n");
+    }
 #endif
 #if !SKIP_TIME_CHECK
     if (total_time_secs < 10)

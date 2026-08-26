@@ -23,7 +23,9 @@
 #                     images pad so GowinSynthesis sizes the inferred ROM from
 #                     $readmemh content at the right depth.
 #   IMEM_PAD_VALUE  : filler word (default 0x00100073 = ebreak).
+#   OPT             : optimisation level (default -O2). CoreMark raises it.
 #   EXTRA_CFLAGS    : extra -D flags, e.g. -DPRINT_ARRAY=$(PRINT_ARRAY).
+#   EXTRA_LDFLAGS   : extra link flags, e.g. -Wl,--gc-sections.
 #
 # Targets: make (all) -> imem.hex + dmem.hex + objdump; make show; make clean.
 
@@ -63,11 +65,14 @@ START_S ?= $(COMMON_DIR)/start.S
 LINK_LD ?= $(COMMON_DIR)/link.ld
 BIN2HEX := $(COMMON_DIR)/bin2hex.py
 
+OPT ?= -O2
+
 CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-          -fno-builtin -fno-stack-protector -fomit-frame-pointer -O2 -Wall -g -fno-pie \
+          -fno-builtin -fno-stack-protector -fomit-frame-pointer $(OPT) -Wall -g -fno-pie \
           -I$(COMMON_DIR) $(EXTRA_CFLAGS)
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-           -T $(LINK_LD) -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N
+           -T $(LINK_LD) -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N \
+           $(EXTRA_LDFLAGS)
 
 BUILD    := build
 ELF      := $(BUILD)/program.elf
@@ -98,7 +103,7 @@ endif
 # rewritten only when it changes, so the objects depend on the
 # configuration as well as on the sources.
 CFG_STAMP := $(BUILD)/.config
-CFG_TEXT  := $(ARCH) $(EXTRA_CFLAGS)
+CFG_TEXT  := $(ARCH) $(OPT) $(EXTRA_CFLAGS) $(EXTRA_LDFLAGS) $(RISCV_PREFIX)
 # The stamp is written with make's $(file ...) rather than through a shell
 # echo: EXTRA_CFLAGS routinely carries quotes and spaces (-DCOMPILER_FLAGS='...'),
 # and passing that through sh mangles it. The shell only ever sees `cmp`.

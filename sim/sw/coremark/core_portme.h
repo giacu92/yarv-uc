@@ -68,3 +68,11 @@ void portable_fini(core_portable *p);
 /* coremark.h does `#define ee_printf printf` when HAS_PRINTF, so the port
  * has to supply a function actually called printf. ee_printf.c does. */
 int printf(const char *fmt, ...);
+
+/* Report helpers, used by the two lines in coremark_main.c that print a
+ * duration and a rate. With HAS_FLOAT=0 those are integer divisions, and a
+ * run of a few tens of seconds prints "32" and "62" -- one significant
+ * figure at the exact place the result is read off. These print hundredths
+ * from the raw tick count instead, in 32-bit arithmetic. */
+void print_secs_x100(CORE_TICKS ticks);
+void print_iters_per_sec_x100(ee_u32 iterations, CORE_TICKS ticks);

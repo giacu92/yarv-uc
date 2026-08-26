@@ -18,7 +18,17 @@
 #
 #  - COSIM=1 in the firmware build, so the port reads no cycle counter. A
 #    counter value is the one register write an instruction-based golden
-#    model can never reproduce (see sw/coremark/core_portme.c).
+#    model can never reproduce (see sw/coremark/core_portme.c). It also
+#    suppresses the banner, whose first UART write would end the diff
+#    before any benchmark work had been done.
+#  - OPT=-O2 rather than the -O3 the board image is built with. Spike is
+#    one unified address space, so .text has to end below the .data VMA
+#    (0x2000) -- on the RTL the two live in different memories and may
+#    overlap freely, which is why an -O3 .text of 10648 bytes runs on the
+#    board and silently executes .rodata under Spike. The diff checks the
+#    core against the ISA, not the optimisation flags, so the -O2 image
+#    covers what it is meant to cover. Lifting this needs a co-sim link
+#    layout with the data above the code, not a bigger cap.
 #  - The relocated Spike boot ROM. Upstream puts a 4 KiB ROM at
 #    DEFAULT_RSTVEC = 0x1000, leaving a hole no -m region may cover, which
 #    capped a co-simulated .text at 4 KiB -- fine for quicksort, too small
@@ -39,6 +49,7 @@ SPIKE_LOG  := $(SCRIPT_DIR)spike.log
 RTL_LOG    := $(SCRIPT_DIR)rtl.trace
 
 ITERATIONS ?= 1
+COSIM_OPT  ?= -O2
 
 # Bound both runs. One iteration retires ~657 k instructions on the RTL at
 # IPC ~0.48 (~1.37 M cycles); the caps clear that plus Spike's boot stub and
@@ -69,7 +80,21 @@ spike-build:
 # which builds the timed (COSIM=0) variant.
 sw-cosim-build:
 	@$(MAKE) -C $(SW_DIR) clean
-	@$(MAKE) -C $(SW_DIR) COSIM=1 ITERATIONS=$(ITERATIONS) $(TC_ARGS)
+	@$(MAKE) -C $(SW_DIR) COSIM=1 OPT=$(COSIM_OPT) ITERATIONS=$(ITERATIONS) $(TC_ARGS)
+	@$(MAKE) --no-print-directory check-text-fits
+
+# Fail loudly on the one build that cannot be co-simulated. Without this
+# the run reports a register mismatch a couple of thousand retires in,
+# which reads as a core bug and is not one.
+.PHONY: check-text-fits
+check-text-fits:
+	@sz=$$(stat -c %s $(SW_DIR)/build/imem.bin); \
+	 if [ $$sz -gt 8192 ]; then \
+	   echo "cosim: .text is $$sz bytes, past the 0x2000 .data VMA."; \
+	   echo "cosim: Spike is one address space -- the image would execute its own .rodata."; \
+	   echo "cosim: build the co-sim variant smaller (COSIM_OPT), or move the data above the code."; \
+	   exit 1; \
+	 fi
 
 $(ELF) $(IMEM_HEX) $(DMEM_HEX): sw-cosim-build
 

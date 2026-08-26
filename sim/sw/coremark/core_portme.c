@@ -1,5 +1,15 @@
 #include "coremark.h"
 
+#define CM_VERSION "CoreMark 1.0"
+
+#if VALIDATION_RUN
+#define RUN_NAME "validation"
+#elif PROFILE_RUN
+#define RUN_NAME "profile"
+#else
+#define RUN_NAME "performance"
+#endif
+
 ee_u32 default_num_contexts = 1;
 
 /* PERFORMANCE_RUN / VALIDATION_RUN pick the seeds; the Makefile defines one. */
@@ -50,6 +60,32 @@ void portable_init(core_portable *p, int *argc, char *argv[])
     (void)argc;
     (void)argv;
     p->portable_id = 1;
+
+#if !COSIM
+    /* A banner before the run, because the whole benchmark is silent: at
+     * the iteration count a valid score needs, the board prints nothing
+     * for half a minute and looks hung. Suppressed in the co-sim build,
+     * where the first UART access is where Spike stops being comparable
+     * and printing here would end the diff before any work is done.
+     *
+     * The estimate is a compile-time constant (CYCLES_PER_ITER, measured
+     * on this core) divided by the clock -- it says what to expect, it
+     * does not measure anything. */
+    printf("\n");
+    printf("  YARV32-uC  --  RV32IMAC Zicsr Zifencei\n");
+    /* CM_VERSION: the sources carry no version macro of their own -- the
+     * only version the benchmark states about itself is the "CoreMark 1.0"
+     * in its own report lines, so that is what this repeats. */
+    printf("  %s  --  %u-byte %s run\n", CM_VERSION, (unsigned)TOTAL_DATA_SIZE,
+           RUN_NAME);
+    printf("  ------------------------------------------\n");
+    printf("  Core clock : %u Hz\n", (unsigned)CLK_HZ);
+    printf("  Iterations : %u\n", (unsigned)ITERATIONS);
+    printf("  Expected   : ~%u s\n",
+           (unsigned)(((unsigned long long)ITERATIONS * CYCLES_PER_ITER)
+                      / CLK_HZ));
+    printf("\n  running...\n\n");
+#endif
 }
 
 void portable_fini(core_portable *p) { p->portable_id = 0; }
@@ -63,6 +99,35 @@ CORE_TICKS get_time(void) { return stop_ticks - start_ticks; }
  * A short simulation run reports 0 here; the cycle count is the number to
  * read. CLK_HZ is set by the Makefile and must track the build's clock. */
 secs_ret time_in_secs(CORE_TICKS ticks) { return (secs_ret)(ticks / CLK_HZ); }
+
+/* Print a tick count as seconds with two decimals, and an iteration count
+ * over a tick count as iterations per second with two decimals. Both
+ * divide before scaling so nothing overflows 32 bits: ticks can reach
+ * 2^32-1, and multiplying that by 100 first would not fit. */
+static void print_x100(ee_u32 whole, ee_u32 hundredths)
+{
+    printf("%u.%02u", (unsigned)whole, (unsigned)hundredths);
+}
+
+void print_secs_x100(CORE_TICKS ticks)
+{
+    ee_u32 whole = (ee_u32)ticks / (ee_u32)CLK_HZ;
+    ee_u32 rem   = (ee_u32)ticks % (ee_u32)CLK_HZ;
+    /* CLK_HZ/100 is exact for any sane clock and keeps the numerator
+     * small; the alternative (rem * 100) overflows above ~43 MHz. */
+    print_x100(whole, rem / ((ee_u32)CLK_HZ / 100u));
+}
+
+void print_iters_per_sec_x100(ee_u32 iterations, CORE_TICKS ticks)
+{
+    ee_u32 per_iter = iterations ? (ee_u32)ticks / iterations : 0;
+    if (per_iter == 0) {
+        print_x100(0, 0);
+        return;
+    }
+    print_x100((ee_u32)CLK_HZ / per_iter,
+               (((ee_u32)CLK_HZ % per_iter) * 100u) / per_iter);
+}
 
 /* -nostdlib: gcc still emits calls to memcpy/memset for structure copies
  * and array initialisation, so the port has to provide them. */
