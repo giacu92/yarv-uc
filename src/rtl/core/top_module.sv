@@ -65,36 +65,36 @@ module top_module (
     //   clk_i = 25 MHz (MS5351M clock generator, crystal-fed; CLK0 on
     //   PIN10, single-ended LVCMOS33)
     //
-    // Internal CPU clock (rPLL CLKOUT) — target 40 MHz:
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 8 / 5 = 40 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=7 -> FBDIV=8; ODIV_SEL=16 sets
-    //   the VCO = 25*8*16/5 = 640 MHz and does NOT divide CLKOUT).
-    //   Period = 25 ns. Constrained in the SDC as a generated clock.
+    // Internal CPU clock (rPLL CLKOUT) — target 50 MHz:
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 10 / 5 = 50 MHz
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=9 -> FBDIV=10; ODIV_SEL=16 sets
+    //   the VCO = 25*10*16/5 = 800 MHz and does NOT divide CLKOUT).
+    //   Period = 20 ns. Constrained in the SDC as a generated clock.
     //
     // Constraint check for this device: PFD = FCLKIN/IDIV = 5 MHz (range
-    // 3-400 MHz), CLKOUT = 40 MHz (range 3.125-600), VCO = 640 MHz (range
+    // 3-400 MHz), CLKOUT = 50 MHz (range 3.125-600), VCO = 800 MHz (range
     // 500-1250, and ODIV_SEL maxes out at 16 on this primitive — larger
     // values are silently replaced by the default 8, which would drop the
-    // VCO to 320 and trip EX0311).
+    // VCO to 400 and trip EX0311).
     //
-    // 40 MHz is a target, not a verified closure. The last measured build
-    // was 25 MHz PLL-bypass at +10.152 ns slack (~33.5 MHz Fmax) with the
-    // critical path on the CSR-address fan-out, and that fan-out has since
-    // been registered, so whether the remaining paths make 25 ns is what
-    // the next PnR run answers. The fallback recipe is below the rPLL.
+    // 50 MHz is a target, not a verified closure. The pre-fetch-rewrite
+    // design closed at 40.281 MHz actual via the LSU + CSR register stages;
+    // the 64-bit fetch rewrite adds a buffer + room comparator, so whether
+    // the remaining paths make 20 ns is what the next PnR run answers. The
+    // fallback recipe is below the rPLL.
     // clk_core frequency, in Hz. MUST track the clock source below: it is
     // what the UART divides down to hit BAUD_RATE, so editing the clock
     // source without editing this too leaves the UART running at the wrong
     // baud (garbage on the wire).
     //
-    // *** 40 MHz rPLL MODE (active). ***
+    // *** 50 MHz rPLL MODE (active). ***
     // MUST match the rPLL settings below: this is what the UART divides
     // down to hit BAUD_RATE, so changing one without the other puts the
     // serial line at the wrong baud, which on a board looks exactly like a
-    // dead core. At 40 MHz BAUDDIV resets to CLK_FREQ_HZ/BAUD_RATE-1 = 346,
-    // giving 40e6/347 = 115 274 Hz against a nominal 115 200 (+0.06%, well
+    // dead core. At 50 MHz BAUDDIV resets to CLK_FREQ_HZ/BAUD_RATE-1 = 433,
+    // giving 50e6/434 = 115 207 Hz against a nominal 115 200 (+0.006%, well
     // inside RS-232 tolerance).
-    localparam int unsigned CLK_CORE_HZ = 40_000_000;
+    localparam int unsigned CLK_CORE_HZ = 50_000_000;
 
     wire clk_core;
     wire pll_lock;
@@ -102,8 +102,8 @@ module top_module (
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("25"),
         .IDIV_SEL (4),     // -> IDIV = 5,  PFD    =   5 MHz (range 3-400)
-        .FBDIV_SEL(7),     // -> FBDIV = 8, CLKOUT =  40 MHz (range 3.125-600)
-        .ODIV_SEL (16)     // ->            VCO    = 640 MHz (range 500-1250)
+        .FBDIV_SEL(9),     // -> FBDIV = 10, CLKOUT = 50 MHz (range 3.125-600)
+        .ODIV_SEL (16)     // ->            VCO    = 800 MHz (range 500-1250)
     ) pll (
         .CLKOUTP (),
         .CLKOUTD (),
@@ -118,7 +118,7 @@ module top_module (
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
         .CLKIN   (clk_i),     // 25 MHz reference
-        .CLKOUT  (clk_core),  // 40 MHz core clock
+        .CLKOUT  (clk_core),  // 50 MHz core clock
         .LOCK    (pll_lock)
     );
 

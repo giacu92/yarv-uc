@@ -9,11 +9,11 @@
 # this Tcl wrapper is the working CLI path.
 open_project /home/giacomo/gowin_proj/rv32imac_Zicsr_Zifencei/rv32imac_Zicsr_Zifencei.gprj
 set_option -top_module top_module
-# Force the PnR target frequency. *** 40 MHz rPLL MODE (active): clk_core
-# = clk_i * 8/5 (see top_module's rPLL and the SDC generated clock). The
+# Force the PnR target frequency. *** 50 MHz rPLL MODE (active): clk_core
+# = clk_i * 10/5 (see top_module's rPLL and the SDC generated clock). The
 # SDC is the real constraint; this must agree with it so the two never
 # disagree about what the design is being asked to do. To fall back to the
 # 25 MHz PLL-bypass build: comment the rPLL out, re-comment the SDC
 # generated clock, and set this back to 25.000. ***
-set_option -global_freq 40.000
+set_option -global_freq 50.000
 run pnr
