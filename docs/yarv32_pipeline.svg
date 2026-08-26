@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 700" width="1240" height="700"
+     role="img" aria-label="YARV32-uC pipeline: fetch, decode and execute stages with the F/D and D/E pipeline registers, the execute-to-decode bypass, register file and CSR file, trap unit driving the fetch redirect, native I-mem on the fetch port, native D-mem and an AXI4-Lite peripheral bridge on the load-store port.">
+  <title>YARV32-uC pipeline</title>
+  <desc>Three-stage in-order RV32IMAC_Zicsr_Zifencei core with a Harvard memory system: read-only I-mem on the fetch port, byte-strobed D-mem and an AXI4-Lite peripheral bridge on the load/store port, an execute-to-decode bypass, and a redirect path from execute and the trap unit back into fetch.</desc>
+
+  <style>
+    /* Self-contained: no external fonts, no scripts. Light palette by
+       default; the media query only redefines the custom properties, so a
+       viewer that ignores it still gets a complete drawing. */
+    svg {
+      --bg: #ffffff;
+      --fill: #e6ebee;
+      --ink: #141c22;
+      --muted: #5d6e79;
+      --data: #1d5b85;
+      --ctl: #a6421c;
+      --mem: #35664f;
+      --sans: "IBM Plex Sans", "DejaVu Sans", Helvetica, Arial, sans-serif;
+      --mono: "IBM Plex Mono", "DejaVu Sans Mono", Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      svg {
+        --bg: #161e23;
+        --fill: #1e282e;
+        --ink: #e2e9ed;
+        --muted: #90a2ad;
+        --data: #74b0dc;
+        --ctl: #e58a5f;
+        --mem: #78bb9d;
+      }
+    }
+
+    .bg { fill: var(--bg); }
+    .edge { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 7 5; opacity: .75; }
+    .blk { fill: var(--fill); stroke: var(--ink); stroke-width: 1.5; }
+    .blk-mem { fill: var(--fill); stroke: var(--mem); stroke-width: 1.6; }
+    .blk-peri { fill: var(--fill); stroke: var(--data); stroke-width: 1.5; }
+    .blk-ctl { fill: var(--fill); stroke: var(--ctl); stroke-width: 1.6; }
+    .reg { fill: var(--ink); }
+
+    .h1 { fill: var(--ink); font-family: var(--sans); font-size: 17px; font-weight: 600; }
+    .t { fill: var(--ink); font-family: var(--sans); font-size: 14px; font-weight: 600; }
+    .t-mem { fill: var(--mem); font-family: var(--sans); font-size: 14px; font-weight: 600; }
+    .t-ctl { fill: var(--ctl); font-family: var(--sans); font-size: 14px; font-weight: 600; }
+    .t-peri { fill: var(--data); font-family: var(--sans); font-size: 14px; font-weight: 600; }
+    .s { fill: var(--muted); font-family: var(--mono); font-size: 11px; }
+    .w-lbl { fill: var(--muted); font-family: var(--mono); font-size: 11px; }
+    .w-lbl-c { fill: var(--ctl); font-family: var(--mono); font-size: 11px; }
+    .w-lbl-d { fill: var(--data); font-family: var(--mono); font-size: 11px; }
+
+    .w { fill: none; stroke: var(--data); stroke-width: 1.9; }
+    .w-c { fill: none; stroke: var(--ctl); stroke-width: 1.7; }
+    .w-b { fill: none; stroke: var(--ctl); stroke-width: 1.9; stroke-dasharray: 7 4; }
+    .ah-d { fill: var(--data); }
+    .ah-c { fill: var(--ctl); }
+  </style>
+
+  <defs>
+    <marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <polygon class="ah-d" points="0,1 10,5 0,9"/>
+    </marker>
+    <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <polygon class="ah-c" points="0,1 10,5 0,9"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1240" height="700"/>
+
+  <text class="h1" x="24" y="34">YARV32-uC — RV32IMAC_Zicsr_Zifencei, 3 stages, Harvard</text>
+
+  <!-- CPU boundary -->
+  <rect class="edge" x="230" y="58" width="770" height="500"/>
+  <text class="s" x="242" y="78">CPU core</text>
+
+  <!-- stages -->
+  <rect class="blk" x="272" y="150" width="180" height="96"/>
+  <text class="t" x="288" y="178">FETCH</text>
+  <text class="s" x="288" y="200">PC, range check</text>
+  <text class="s" x="288" y="218">2-deep FIFO</text>
+  <text class="s" x="288" y="236">1 outstanding</text>
+
+  <rect class="blk" x="530" y="150" width="180" height="96"/>
+  <text class="t" x="546" y="178">DECODE</text>
+  <text class="s" x="546" y="200">RVC expand</text>
+  <text class="s" x="546" y="218">decoder</text>
+  <text class="s" x="546" y="236">operand select</text>
+
+  <rect class="blk" x="788" y="150" width="180" height="96"/>
+  <text class="t" x="804" y="178">EXECUTE</text>
+  <text class="s" x="804" y="200">ALU, mul, div</text>
+  <text class="s" x="804" y="218">LSU, CSR RMW</text>
+  <text class="s" x="804" y="236">branch resolve</text>
+
+  <!-- pipeline registers -->
+  <rect class="reg" x="486" y="142" width="7" height="112"/>
+  <text class="s" x="474" y="132">F/D</text>
+  <rect class="reg" x="744" y="142" width="7" height="112"/>
+  <text class="s" x="732" y="132">D/E</text>
+
+  <path class="w" d="M452 198 H 482" marker-end="url(#d)"/>
+  <path class="w" d="M497 198 H 526" marker-end="url(#d)"/>
+  <path class="w" d="M710 198 H 740" marker-end="url(#d)"/>
+  <path class="w" d="M755 198 H 784" marker-end="url(#d)"/>
+
+  <!-- I-mem -->
+  <rect class="blk-mem" x="40" y="150" width="150" height="96"/>
+  <text class="t-mem" x="54" y="178">I-mem</text>
+  <text class="s" x="54" y="200">16 KiB, RO</text>
+  <text class="s" x="54" y="218">native port</text>
+
+  <path class="w" d="M194 178 H 268" marker-end="url(#d)"/>
+  <text class="w-lbl-d" x="198" y="170">pc</text>
+  <path class="w" d="M268 218 H 194" marker-end="url(#d)"/>
+  <text class="w-lbl-d" x="198" y="238">instr word (32b)</text>
+
+  <!-- register file -->
+  <rect class="blk" x="530" y="330" width="180" height="76"/>
+  <text class="t" x="546" y="356">Register file</text>
+  <text class="s" x="546" y="378">32 x 32</text>
+  <text class="s" x="546" y="394">2 rd async, 1 wr sync</text>
+
+  <path class="w" d="M590 326 V 250" marker-end="url(#d)"/>
+  <text class="w-lbl-d" x="598" y="290">rs1 / rs2</text>
+
+  <path class="w" d="M878 250 V 368 H 714" marker-end="url(#d)"/>
+  <text class="w-lbl-d" x="726" y="360">rd writeback</text>
+
+  <!-- bypass -->
+  <path class="w-b" d="M912 250 V 288 H 650 V 250" marker-end="url(#c)"/>
+  <text class="w-lbl-c" x="658" y="280">bypass: rd value into operands — distance-1, zero bubble</text>
+
+  <!-- CSR + trap -->
+  <rect class="blk-ctl" x="530" y="446" width="180" height="86"/>
+  <text class="t-ctl" x="546" y="472">CSR file</text>
+  <text class="s" x="546" y="494">11 M-mode CSRs</text>
+  <text class="s" x="546" y="512">registered read</text>
+
+  <rect class="blk-ctl" x="788" y="446" width="180" height="86"/>
+  <text class="t-ctl" x="804" y="472">Trap unit</text>
+  <text class="s" x="804" y="494">traps, mret, IRQ</text>
+  <text class="s" x="804" y="512">MEI &gt; MSI &gt; MTI</text>
+
+  <path class="w-c" d="M714 476 H 784" marker-start="url(#c)" marker-end="url(#c)"/>
+  <path class="w-c" d="M878 442 V 250" marker-start="url(#c)" marker-end="url(#c)"/>
+  <text class="w-lbl-c" x="886" y="330">csr read / write</text>
+  <text class="w-lbl-c" x="886" y="346">trap triggers</text>
+
+  <!-- redirect -->
+  <path class="w-c" d="M968 490 H 986 V 106 H 362 V 146" marker-end="url(#c)"/>
+  <path class="w-c" d="M840 148 V 106"/>
+  <text class="w-lbl-c" x="376" y="98">redirect: branch target / mtvec / mepc — flushes F/D</text>
+
+  <!-- D-mem -->
+  <rect class="blk-mem" x="40" y="330" width="150" height="86"/>
+  <text class="t-mem" x="54" y="356">D-mem</text>
+  <text class="s" x="54" y="378">16 KiB</text>
+  <text class="s" x="54" y="394">byte strobes</text>
+
+  <path class="w" d="M194 372 H 340 V 600 H 940 V 250" marker-start="url(#d)" marker-end="url(#d)"/>
+  <text class="w-lbl-d" x="352" y="592">load / store — addr[28] = 0</text>
+
+  <!-- peripherals -->
+  <rect class="blk-peri" x="1044" y="330" width="164" height="86"/>
+  <text class="t-peri" x="1058" y="356">AXI4-Lite</text>
+  <text class="s" x="1058" y="378">UART, CLINT,</text>
+  <text class="s" x="1058" y="394">MSIP</text>
+
+  <path class="w" d="M962 372 H 1040" marker-start="url(#d)" marker-end="url(#d)"/>
+  <text class="w-lbl-d" x="966" y="364">addr[28] = 1</text>
+
+  <path class="w-c" d="M1126 420 V 490 H 972" marker-end="url(#c)"/>
+  <text class="w-lbl-c" x="990" y="440">irq</text>
+
+  <!-- legend -->
+  <line class="w" x1="40" y1="638" x2="86" y2="638"/>
+  <text class="w-lbl" x="94" y="642">data</text>
+
+  <line class="w-c" x1="150" y1="638" x2="196" y2="638"/>
+  <text class="w-lbl" x="204" y="642">control / trap</text>
+
+  <line class="w-b" x1="320" y1="638" x2="366" y2="638"/>
+  <text class="w-lbl" x="374" y="642">bypass</text>
+
+  <rect class="reg" x="470" y="630" width="7" height="16"/>
+  <text class="w-lbl" x="485" y="642">pipeline register</text>
+</svg>
