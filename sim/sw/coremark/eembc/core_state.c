@@ -16,24 +16,6 @@ limitations under the License.
 Original Author: Shay Gal-on
 */
 
-// Copyright 2020 OpenHW Group
-// Copyright 2020 Silicon Labs, Inc.
-// Copyright 2022 Thales DIS Design Services SAS
-//
-// Licensed under the Solderpad Hardware Licence, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://solderpad.org/licenses/
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// SPDX-License-Identifier:Apache-2.0 WITH SHL-2.0
-
 #include "coremark.h"
 /* local functions */
 enum CORE_STATE core_state_transition(ee_u8 **instr, ee_u32 *transition_count);
@@ -202,9 +184,6 @@ core_init_state(ee_u32 size, ee_s16 seed, ee_u8 *p)
         }
     }
     size++;
-#if CORE_DEBUG
-    ee_printf("core_init_state: total = %d, size = %d\n");
-#endif
     while (total < size)
     { /* fill the rest with 0 */
         *(p + total) = 0;
@@ -227,7 +206,7 @@ ee_isdigit(ee_u8 c)
         Actual state machine.
 
         The state machine will continue scanning until either:
-        1 - an invalid input is detcted.
+        1 - an invalid input is detected.
         2 - a valid number has been detected.
 
         The input pointer is updated to point to the end of the token, and the

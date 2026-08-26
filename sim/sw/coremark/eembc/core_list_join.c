@@ -16,24 +16,6 @@ limitations under the License.
 Original Author: Shay Gal-on
 */
 
-// Copyright 2020 OpenHW Group
-// Copyright 2020 Silicon Labs, Inc.
-// Copyright 2022 Thales DIS Design Services SAS
-//
-// Licensed under the Solderpad Hardware Licence, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://solderpad.org/licenses/
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// SPDX-License-Identifier:Apache-2.0 WITH SHL-2.0
-
 #include "coremark.h"
 /*
 Topic: Description
@@ -49,7 +31,7 @@ library.
 
         Instead, the memory block being passed in is used to create a list,
         and the benchmark takes care not to add more items then can be
-        accomodated by the memory block. The porting layer will make sure
+        accommodated by the memory block. The porting layer will make sure
         that we have a valid memory block.
 
         All operations are done in place, without using any extra memory.
@@ -182,7 +164,7 @@ core_bench_list(core_results *res, ee_s16 finder_idx)
     ee_s16     find_num = res->seed3;
     list_head *this_find;
     list_head *finder, *remover;
-    list_data  info;
+    list_data  info = {0};
     ee_s16     i;
 
     info.idx = finder_idx;
@@ -271,7 +253,7 @@ core_list_init(ee_u32 blksize, list_head *memblock, ee_s16 seed)
     /* calculated pointers for the list */
     ee_u32 per_item = 16 + sizeof(struct list_data_s);
     ee_u32 size     = (blksize / per_item)
-                  - 2; /* to accomodate systems with 64b pointers, and make sure
+                  - 2; /* to accommodate systems with 64b pointers, and make sure
                           same code is executed, set max list elements */
     list_head *memblock_end  = memblock + size;
     list_data *datablock     = (list_data *)(memblock_end);

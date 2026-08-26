@@ -60,3 +60,6 @@ sim/sim_uart_tx.txt
 
 # Generated patch series (regenerate with git format-patch)
 patches-coremark/
+
+# Single combined patch (regenerate with git format-patch)
+coremark-all.patch

@@ -69,10 +69,15 @@ void portable_fini(core_portable *p);
  * has to supply a function actually called printf. ee_printf.c does. */
 int printf(const char *fmt, ...);
 
-/* Report helpers, used by the two lines in coremark_main.c that print a
- * duration and a rate. With HAS_FLOAT=0 those are integer divisions, and a
- * run of a few tens of seconds prints "32" and "62" -- one significant
- * figure at the exact place the result is read off. These print hundredths
- * from the raw tick count instead, in 32-bit arithmetic. */
-void print_secs_x100(CORE_TICKS ticks);
-void print_iters_per_sec_x100(ee_u32 iterations, CORE_TICKS ticks);
+/* Port-side report, printed from portable_fini() after CoreMark's own
+ * output. It exists because the eembc/ sources are vendored verbatim and
+ * nothing in them may be edited:
+ *
+ *   - upstream prints the duration and the rate with %d when HAS_FLOAT=0,
+ *     so a 30.23 s run reports "30" and its 66.14 iterations/s report
+ *     "66" -- one significant figure exactly where the result is read off;
+ *   - upstream prints a CoreMark/MHz figure only under HAS_FLOAT, and
+ *     there is no FPU here.
+ *
+ * Both are computed from the raw tick count in 32-bit arithmetic. */
+void report_port_summary(void);

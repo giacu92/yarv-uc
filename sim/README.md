@@ -359,12 +359,12 @@ co-sim maps the images exactly where the hardware has them.
 ## CoreMark co-sim (`cosim/coremark/`)
 
 The same harness against EEMBC CoreMark — the longest co-sim in the tree
-(~646 k retires against quicksort's ~30 k) and the broadest, since it
+(~333 k retires against quicksort's ~30 k) and the broadest, since it
 exercises linked lists, a matrix kernel and a state machine over strings
-rather than one sort loop. Runs in about 11 s and writes ~100 MB of logs.
+rather than one sort loop. Runs in a few seconds and writes ~50 MB of logs.
 
 ```
-cd cosim/coremark && make cosim   # -> "PASS -- matched 646307 retires"
+cd cosim/coremark && make cosim   # -> "PASS -- matched 332803 retires"
 ```
 
 The firmware is rebuilt with `COSIM=1`, which makes the port read no cycle

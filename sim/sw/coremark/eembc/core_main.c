@@ -16,24 +16,6 @@ limitations under the License.
 Original Author: Shay Gal-on
 */
 
-// Copyright 2020 OpenHW Group
-// Copyright 2020 Silicon Labs, Inc.
-// Copyright 2022 Thales DIS Design Services SAS
-//
-// Licensed under the Solderpad Hardware Licence, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://solderpad.org/licenses/
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// SPDX-License-Identifier:Apache-2.0 WITH SHL-2.0
-
 /* File: core_main.c
         This file contains the framework to acquire a block of memory, seed
    initial parameters, tun t he benchmark and report the results.
@@ -137,8 +119,6 @@ main(int argc, char *argv[])
     ee_s16       known_id = -1, total_errors = 0;
     ee_u16       seedcrc = 0;
     CORE_TICKS   total_time;
-    secs_ret total_time_secs;
-    long unsigned total_iterations, score100;
     core_results results[MULTITHREAD];
 #if (MEM_METHOD == MEM_STACK)
     ee_u8 stack_memblock[TOTAL_DATA_SIZE * MULTITHREAD];
@@ -166,7 +146,7 @@ main(int argc, char *argv[])
     /* put in some default values based on one seed only for easy testing */
     if ((results[0].seed1 == 0) && (results[0].seed2 == 0)
         && (results[0].seed3 == 0))
-    { /* perfromance run */
+    { /* performance run */
         results[0].seed1 = 0;
         results[0].seed2 = 0;
         results[0].seed3 = 0x66;
@@ -281,7 +261,6 @@ for (i = 0; i < MULTITHREAD; i++)
             divisor = 1;
         results[0].iterations *= 1 + 10 / divisor;
     }
-    iterate(&results[0]);
     /* perform actual benchmark */
     start_time();
 #if (MULTITHREAD > 1)
@@ -304,8 +283,6 @@ for (i = 0; i < MULTITHREAD; i++)
 #endif
     stop_time();
     total_time = get_time();
-    total_time_secs = time_in_secs(total_time);
-    total_iterations = ((long unsigned) default_num_contexts) * ((long unsigned) results[0].iterations);
     /* get a function of the input to report */
     seedcrc = crc16(results[0].seed1, seedcrc);
     seedcrc = crc16(results[0].seed2, seedcrc);
@@ -381,41 +358,33 @@ for (i = 0; i < MULTITHREAD; i++)
     ee_printf("CoreMark Size    : %lu\n", (long unsigned)results[0].size);
     ee_printf("Total ticks      : %lu\n", (long unsigned)total_time);
 #if HAS_FLOAT
-    ee_printf("Total time (secs): %f\n", total_time_secs);
-    if (total_time_secs > 0)
-        ee_printf("Iterations/Sec   : %f\n", total_iterations / total_time_secs);
+    ee_printf("Total time (secs): %f\n", time_in_secs(total_time));
+    if (time_in_secs(total_time) > 0)
+        ee_printf("Iterations/Sec   : %f\n",
+                  default_num_contexts * results[0].iterations
+                      / time_in_secs(total_time));
 #else
-    /* LOCAL CHANGE (yarv-uc): two decimals. With HAS_FLOAT=0 these are
-       integer divisions, so a 32.24 s run prints "32" and its 62.03
-       iterations per second print "62" -- one significant figure on the
-       two lines the result is read off. The port prints hundredths from
-       the raw tick count (see core_portme.c). */
-    ee_printf("Total time (secs): ");
-    print_secs_x100(total_time);
-    ee_printf("\n");
-    if (total_time > 0)
-    {
-        ee_printf("Iterations/Sec   : ");
-        print_iters_per_sec_x100(total_iterations, total_time);
-        ee_printf("\n");
-    }
+    ee_printf("Total time (secs): %d\n", time_in_secs(total_time));
+    if (time_in_secs(total_time) > 0)
+        ee_printf("Iterations/Sec   : %d\n",
+                  default_num_contexts * results[0].iterations
+                      / time_in_secs(total_time));
 #endif
-#if !SKIP_TIME_CHECK
-    if (total_time_secs < 10)
+    if (time_in_secs(total_time) < 10)
     {
         ee_printf(
             "ERROR! Must execute for at least 10 secs for a valid result!\n");
         total_errors++;
     }
-#endif
 
-    ee_printf("Iterations       : %lu\n", total_iterations);
-    ee_printf("Compiler version : " COMPILER_VERSION "\n");
-    ee_printf("Compiler flags   : " COMPILER_FLAGS "\n");
+    ee_printf("Iterations       : %lu\n",
+              (long unsigned)default_num_contexts * results[0].iterations);
+    ee_printf("Compiler version : %s\n", COMPILER_VERSION);
+    ee_printf("Compiler flags   : %s\n", COMPILER_FLAGS);
 #if (MULTITHREAD > 1)
     ee_printf("Parallel %s : %d\n", PARALLEL_METHOD, default_num_contexts);
 #endif
-    ee_printf("Memory location  : " MEM_LOCATION "\n");
+    ee_printf("Memory location  : %s\n", MEM_LOCATION);
     /* output for verification */
     ee_printf("seedcrc          : 0x%04x\n", seedcrc);
     if (results[0].execs & ID_LIST)
@@ -434,43 +403,26 @@ for (i = 0; i < MULTITHREAD; i++)
         ee_printf(
             "Correct operation validated. See README.md for run and reporting "
             "rules.\n");
+#if HAS_FLOAT
         if (known_id == 3)
         {
-            // Scaling results
-            /* LOCAL CHANGE (yarv-uc): divide first, to keep the whole
-               computation in 32 bits. Upstream evaluates
-               total_iterations * 1000000 * 100 / total_time, which
-               overflows here as soon as the run is long enough to be
-               reportable -- at 2000 iterations the numerator is 2e11
-               against a 4.29e9 ceiling, and a real 1.54 CoreMark/MHz
-               printed as 0.1. Dividing first costs at most one part in
-               ticks-per-iteration (~650k here) and needs no 64-bit
-               division, which this freestanding link has no libgcc to
-               provide. Display only. */
-            {
-                long unsigned ticks_per_iter
-                    = (long unsigned)total_time / total_iterations;
-                score100 = ticks_per_iter ? 100000000UL / ticks_per_iter : 0;
-            }
-            ee_printf("CoreMark/MHz 1.0 : %d.%02d / "
-                      COMPILER_VERSION " " COMPILER_FLAGS " / "
-                      SC_MEM_LOCATION "\n",
-                      score100 / 100, score100 % 100);
-
-#if HAS_FLOAT
-            ee_printf("CoreMark 1.0 : %f / " COMPILER_VERSION " " COMPILER_FLAGS,
-                      total_iterations / total_time_secs);
+            ee_printf("CoreMark 1.0 : %f / %s %s",
+                      default_num_contexts * results[0].iterations
+                          / time_in_secs(total_time),
+                      COMPILER_VERSION,
+                      COMPILER_FLAGS);
 #if defined(MEM_LOCATION) && !defined(MEM_LOCATION_UNSPEC)
-            ee_printf(" / " MEM_LOCATION);
+            ee_printf(" / %s", MEM_LOCATION);
 #else
             ee_printf(" / %s", mem_name[MEM_METHOD]);
 #endif
+
 #if (MULTITHREAD > 1)
             ee_printf(" / %d:%s", default_num_contexts, PARALLEL_METHOD);
 #endif
             ee_printf("\n");
-#endif
         }
+#endif
     }
     if (total_errors > 0)
         ee_printf("Errors detected\n");

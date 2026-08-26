@@ -138,46 +138,49 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   the printing out (the co-sim needs that — the first UART access is where
   Spike stops being comparable).
 - `coremark/` — EEMBC CoreMark. `eembc/` holds the upstream sources
-  (Apache-2.0, `eembc/LICENSE.md`) with two documented display-only
-  deviations recorded in `eembc/LOCAL_CHANGES.md`; `core_portme.[ch]` and
-  `ee_printf.c` are this core's port: `MEM_METHOD=MEM_STATIC` (no malloc
-  here, and a 2 KiB stack block would eat most of the stack), `HAS_FLOAT=0`,
-  `HAS_STDIO=0`, timing from the `mcycle` CSR, a small integer `printf` over
-  the UART, and local `memcpy`/`memset` (gcc emits calls to both, and there
-  is no libc to link). A banner prints before the run — at a reportable
-  iteration count the benchmark is otherwise silent for half a minute and
-  the board looks hung.
+  **vendored verbatim**, byte-identical to github.com/eembc/coremark at
+  commit 1f483d5 (Apache-2.0, provenance and hashes in
+  `eembc/UPSTREAM.md`); `make verify-eembc` runs before anything compiles
+  and fails the build if a byte in there changed, because a score from a
+  modified workload is not comparable with anyone else's. Everything the
+  port needs sits outside that directory, in `core_portme.[ch]` and
+  `ee_printf.c`: `MEM_METHOD=MEM_STATIC` (no malloc here, and a 2 KiB stack
+  block would eat most of the stack), `HAS_FLOAT=0`, `HAS_STDIO=0`, timing
+  from the `mcycle` CSR, a small integer `printf` over the UART, local
+  `memcpy`/`memset` (gcc emits calls to both, and there is no libc), a
+  banner before the run — at a reportable iteration count the benchmark is
+  otherwise silent for half a minute and the board looks hung — and a
+  summary after CoreMark's own output, since upstream prints the duration
+  and rate as integers with `HAS_FLOAT=0` and no CoreMark/MHz at all
+  without an FPU.
   Built `-O3 -ffunction-sections -fdata-sections -mstrict-align
   -mbranch-cost=10 -ffp-contract=off -mno-fdiv` with `-Wl,--gc-sections`,
   which is what comparable published rv32 ports quote; `-mstrict-align`
   matters beyond speed here, since this core traps on a misaligned access
-  rather than fixing it up. Toolchain is the tree default (the rv32
-  buildroot cross-compiler, gcc 14.3.0). 10.9 KiB of `.text` (of 16 KiB) and
-  3.8 KiB of D-mem data (of the 8 KiB window). The bleeding-edge gcc 15.1.0
-  toolchain was tried and is ~2% slower here (616866 cycles/iteration at
-  `rv32imc`, 612492 at `rv32imac`, against 604742 for gcc 14.3.0), so the
-  tree default stands.
-  **Board result, 2000 iterations at 40.000 MHz** — the reportable run:
-  1209407360 ticks, 30.23 s, 66.14 iterations/s = **1.65 CoreMark/MHz**,
-  `crcfinal` 0x4983 (the value other cores publish for a 2000-iteration 2K
-  run). Simulating the same image at 50 iterations gives 604742
-  cycles/iteration against the board's 604704 — sim and silicon agree to
-  four digits. Result at `ITERATIONS=1`: 1.60 CoreMark/MHz, 622006 ticks,
-  IPC 0.485, CRCs `list 0xe714` / `matrix 0x1fd7` / `state 0x8e3a` — the
-  official expected values for the 2K performance seeds. (The same build at
-  `-O2` measured 1.53, and the board confirmed that number exactly for the
-  image it ran.) At the board's 40.000 MHz — the rPLL's 25 × 8/5, not the
-  40.281 MHz Fmax the timing report quotes — a rules-valid run (≥10 s, and
-  under the 32-bit `mcycle` wrap, there being no `mcycleh`) is `ITERATIONS`
-  643..6905; 2000 iterations takes ~31 s. `TOTAL_DATA_SIZE=6000` selects the 6K profile,
-  which validates too but leaves the stack ~200 bytes of headroom below
+  rather than fixing it up. 11.1 KiB of `.text` (of 16 KiB) and 4.0 KiB of
+  D-mem data (of the 8 KiB window). The bleeding-edge gcc 15.1.0 toolchain
+  was tried and is ~2% slower here, so the tree default stands.
+  **Score: 615416 cycles per iteration = 1.62 CoreMark/MHz** (50
+  iterations; a single iteration reads 611336 and 1.63), CRCs `list
+  0xe714` / `matrix 0x1fd7` / `state 0x8e3a` — the official expected values
+  for the 2K performance seeds, and `crcfinal` 0x4983 on a 2000-iteration
+  run, which is what other cores publish. At the board's 40.000 MHz — the
+  rPLL's 25 × 8/5, not the 40.281 MHz Fmax the timing report quotes — a
+  rules-valid run (≥10 s, and under the 32-bit `mcycle` wrap, there being
+  no `mcycleh`) is `ITERATIONS` 651..6979; 2000 iterations takes ~31 s.
+  A shorter run ends in upstream's own "ERROR! Must execute for at least
+  10 secs" and "Errors detected": that is the CoreMark run rule, not a
+  failure of the core — the four CRC lines are what say the benchmark
+  computed correctly.
+  `TOTAL_DATA_SIZE=6000` selects the 6K profile, which validates too but
+  leaves the stack only a couple of hundred bytes of headroom below
   `.bss`. `IMEM_PAD_WORDS=4096` pads the code image for a board build.
   `COSIM=1` builds the co-sim variant: no cycle counter (a counter value is
   the one register write Spike can never reproduce) and no banner (its
   first UART write would end the diff before any work). That variant is
   also built `-O2`, because Spike is one address space and `.text` has to
   end below the 0x2000 `.data` VMA — see `sim/cosim/coremark/`, which
-  matches 649802 retires.
+  matches 332803 retires.
 - `isa/ifault/` — instruction-access-fault oracle (jump outside the I-mem).
 - `isa/isa_probe/` — instruction/memory probe that reports without using the
   hex printer or any instruction under test; board bring-up probe.

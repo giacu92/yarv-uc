@@ -88,7 +88,13 @@ void portable_init(core_portable *p, int *argc, char *argv[])
 #endif
 }
 
-void portable_fini(core_portable *p) { p->portable_id = 0; }
+void portable_fini(core_portable *p)
+{
+    p->portable_id = 0;
+#if !COSIM
+    report_port_summary();
+#endif
+}
 
 void start_time(void) { start_ticks = rdcycle(); }
 void stop_time(void) { stop_ticks = rdcycle(); }
@@ -100,33 +106,54 @@ CORE_TICKS get_time(void) { return stop_ticks - start_ticks; }
  * read. CLK_HZ is set by the Makefile and must track the build's clock. */
 secs_ret time_in_secs(CORE_TICKS ticks) { return (secs_ret)(ticks / CLK_HZ); }
 
-/* Print a tick count as seconds with two decimals, and an iteration count
- * over a tick count as iterations per second with two decimals. Both
- * divide before scaling so nothing overflows 32 bits: ticks can reach
- * 2^32-1, and multiplying that by 100 first would not fit. */
+/* Two decimals, computed by dividing before scaling so nothing overflows
+ * 32 bits: ticks can reach 2^32-1 and multiplying that by 100 would not
+ * fit. CLK_HZ/100 is exact for any sane clock. */
 static void print_x100(ee_u32 whole, ee_u32 hundredths)
 {
     printf("%u.%02u", (unsigned)whole, (unsigned)hundredths);
 }
 
-void print_secs_x100(CORE_TICKS ticks)
+void report_port_summary(void)
 {
-    ee_u32 whole = (ee_u32)ticks / (ee_u32)CLK_HZ;
-    ee_u32 rem   = (ee_u32)ticks % (ee_u32)CLK_HZ;
-    /* CLK_HZ/100 is exact for any sane clock and keeps the numerator
-     * small; the alternative (rem * 100) overflows above ~43 MHz. */
-    print_x100(whole, rem / ((ee_u32)CLK_HZ / 100u));
-}
+    CORE_TICKS ticks = get_time();
+    ee_u32     iters = (ee_u32)ITERATIONS;
 
-void print_iters_per_sec_x100(ee_u32 iterations, CORE_TICKS ticks)
-{
-    ee_u32 per_iter = iterations ? (ee_u32)ticks / iterations : 0;
-    if (per_iter == 0) {
-        print_x100(0, 0);
-        return;
+    printf("\n");
+    printf("  Ticks (core cycles) : %u\n", (unsigned)ticks);
+
+    if (ticks == 0 || iters == 0) return;
+
+    ee_u32 per_iter = ticks / iters;
+
+    printf("  Cycles / iteration  : %u\n", (unsigned)per_iter);
+
+    printf("  Total time (secs)   : ");
+    print_x100((ee_u32)ticks / (ee_u32)CLK_HZ,
+               ((ee_u32)ticks % (ee_u32)CLK_HZ) / ((ee_u32)CLK_HZ / 100u));
+    printf("\n");
+
+    if (per_iter) {
+        printf("  Iterations / sec    : ");
+        print_x100((ee_u32)CLK_HZ / per_iter,
+                   (((ee_u32)CLK_HZ % per_iter) * 100u) / per_iter);
+        printf("\n");
+
+        /* CoreMark/MHz: iterations per second divided by MHz, which with
+         * ticks measured in core cycles is just 1e6 / cycles-per-iteration
+         * -- no clock frequency involved, so this figure holds whatever
+         * CLK_HZ is set to. */
+        ee_u32 score100 = 100000000UL / per_iter;
+        printf("  CoreMark / MHz      : ");
+        print_x100(score100 / 100u, score100 % 100u);
+        printf("\n");
     }
-    print_x100((ee_u32)CLK_HZ / per_iter,
-               (((ee_u32)CLK_HZ % per_iter) * 100u) / per_iter);
+
+    /* CoreMark's run rules require at least 10 s of run time. Upstream
+     * already prints its own ERROR line and counts an error when the run
+     * is shorter; this says what to do about it. */
+    if ((ee_u32)ticks / (ee_u32)CLK_HZ < 10u)
+        printf("  (short run: not a reportable score -- raise ITERATIONS)\n");
 }
 
 /* -nostdlib: gcc still emits calls to memcpy/memset for structure copies

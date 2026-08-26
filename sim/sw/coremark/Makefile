@@ -63,11 +63,6 @@ RUN_TYPE   ?= PERFORMANCE_RUN
 # iterations-per-second are computed against; CoreMark/MHz comes from
 # ticks alone and does not depend on it.
 CLK_HZ     ?= 40000000
-# SKIP_TIME_CHECK=1 (default) drops CoreMark's "must run for at least 10
-# secs" gate, which no simulation run can pass -- with it left in, a run
-# whose CRCs all matched still ends in "Errors detected". Set it to 0 for a
-# board run long enough to be a reportable score.
-SKIP_TIME_CHECK ?= 1
 # COSIM=1 builds the variant the Spike co-sim runs: it reads no cycle
 # counter (see core_portme.c), because a counter value is the one register
 # write that can never match an instruction-based golden model.
@@ -83,7 +78,7 @@ EXTRA_CFLAGS := -I. -Ieembc $(PERF_CFLAGS) \
                 -DCYCLES_PER_ITER=$(CYCLES_PER_ITER) \
                 -DTOTAL_DATA_SIZE=$(TOTAL_DATA_SIZE) \
                 -DCLK_HZ=$(CLK_HZ) -DHAS_PRINTF=1 \
-                -DSKIP_TIME_CHECK=$(SKIP_TIME_CHECK) -DCOSIM=$(COSIM) \
+                -DCOSIM=$(COSIM) \
                 -DCOMPILER_FLAGS='"$(OPT) -march=$(ARCH) -mabi=ilp32 $(PERF_CFLAGS)"'
 
 # Board builds pad the I-mem image to the full declared depth, because
@@ -94,9 +89,24 @@ EXTRA_CFLAGS := -I. -Ieembc $(PERF_CFLAGS) \
 # default is off.
 IMEM_PAD_WORDS ?= 0
 
+# `all` (from common/sw_build.mk) stays the default goal: the guard rule
+# below is defined first, and make would otherwise take it as the default.
+.DEFAULT_GOAL := all
+
+# Provenance guard. eembc/ is upstream EEMBC CoreMark vendored verbatim
+# (see eembc/UPSTREAM.md); a score from an edited workload is not comparable
+# with anyone else's, so an accidental edit has to fail the build rather than
+# quietly produce a number. Runs before anything is compiled.
+.PHONY: verify-eembc
+verify-eembc:
+	@cd eembc && md5sum -c --quiet VENDORED.md5 \
+	  || { echo "eembc/ differs from upstream CoreMark -- see eembc/UPSTREAM.md"; exit 1; }
+
 vpath %.c eembc
 
 C_SRCS := core_portme.c ee_printf.c \
-          coremark_main.c core_list_join.c core_matrix.c core_state.c core_util.c
+          core_main.c core_list_join.c core_matrix.c core_state.c core_util.c
 
 include ../common/sw_build.mk
+
+$(OBJS): | verify-eembc
