@@ -21,12 +21,17 @@ import rv32_pkg::*;
  *   - Request launch : imem_req_o.valid && imem_rsp_i.ready
  *   - Read response  : imem_rsp_i.rvalid && imem_req_o.rready
  *
- * Decode contract UNCHANGED: the buffer head is exported as fe_instr /
+ * Decode contract: the buffer head is exported as fe_instr /
  * fe_pc / fe_valid / fe_fault, 32-bit / 32-bit / 1-bit / 1-bit, exactly as
  * the old 2-deep F/D+skid FIFO exported them. Decode is a pure consumer of
  * the head register and cannot tell a 32-bit RAM from a split 64-bit RAM.
- * The RVC spanning stitch (span_wait) still lives in decode and is
- * unchanged; eliminating it needs a wider F/D (a separate, later change).
+ * A second read port exports head+1 (fe_next_instr / fe_next_pc /
+ * fe_next_valid = count>=2 / fe_next_fault) so decode can same-cycle stitch
+ * a 32-bit instr at a 2-byte-aligned branch target (offset 2/6) without a
+ * bubble; fe_pop2_i tells fetch to drop both entries on that stitch. The
+ * sequential RVC spanning stitch (span_wait, a 32-bit instr at offset 2
+ * reached by fall-through) still lives in decode and costs 1 bubble --
+ * removing it is dual-issue, a separate change.
  *
  * PC + split:
  *   - pc_q advances by 8 in steady state; pc_d = (pc_q & ~7) + 8 after a
@@ -110,7 +115,19 @@ module fetch_stage #(
     output wire [XLEN-1:0] fe_instr_o,  // F/D instruction word (32-bit)
     output wire [XLEN-1:0] fe_pc_o,     // F/D instruction PC (exact)
     output wire            fe_valid_o,  // F/D valid (held level)
-    output wire            fe_fault_o   // F/D entry is an access fault, not an instruction
+    output wire            fe_fault_o,  // F/D entry is an access fault, not an instruction
+
+    // Buffer head+1 read port (same-cycle RVC spanning stitch). Exposes the
+    // word right behind the head so decode can stitch a 32-bit instr sitting
+    // at a 2-byte-aligned branch target (offset 2 / 6) without a bubble: the
+    // stitch consumes head[31:16] + head+1[15:0] in the cycle the target word
+    // is seen. Gated by fe_next_valid_o (count>=2); decode drives fe_pop2_i
+    // only then, so pop-2 <= count (no underflow).
+    output wire [XLEN-1:0] fe_next_instr_o,  // buffer[head+1] word
+    output wire [XLEN-1:0] fe_next_pc_o,     // buffer[head+1] PC
+    output wire            fe_next_valid_o,  // count >= 2
+    output wire            fe_next_fault_o,  // buffer[head+1] fault flag
+    input  wire            fe_pop2_i         // decode: pop 2 this cycle (target stitch)
 );
 
     // -----------------------------------------------------------------
@@ -179,13 +196,13 @@ module fetch_stage #(
     // -----------------------------------------------------------------
     // 64-bit response split -> 32-bit buffer pushes (0, 1, or 2 words/cycle)
     // -----------------------------------------------------------------
-    wire            do_rsp = rsp_cap && !draining_q && !branch_valid_i;
-    wire            rsp_two = ~req_pc_q[2];  // target in low half -> push both words
+    wire do_rsp = rsp_cap && !draining_q && !branch_valid_i;
+    wire rsp_two = ~req_pc_q[2];  // target in low half -> push both words
 
     wire [XLEN-1:0] rsp_low_pc = req_pc_q;
     wire [XLEN-1:0] rsp_high_pc = (req_pc_q & ~32'h7) + 32'd4;
-    wire [    31:0] rsp_low_word = imem_rsp_i.rdata[31:0];
-    wire [    31:0] rsp_high_word = imem_rsp_i.rdata[63:32];
+    wire [31:0] rsp_low_word = imem_rsp_i.rdata[31:0];
+    wire [31:0] rsp_high_word = imem_rsp_i.rdata[63:32];
 
     // First push: the half containing the fetch PC (low if [2]==0, high if
     // [2]==1). The PC stamp is ALWAYS req_pc_q (rsp_low_pc): it carries the
@@ -196,21 +213,26 @@ module fetch_stage #(
     // (e.g. jalr to 0xee stamped 0xec). A fault push fills this slot
     // (pc=pc_q, fault=1).
     wire [XLEN-1:0] push0_pc = do_rsp ? rsp_low_pc : pc_q;
-    wire [    31:0] push0_word = do_rsp ? (rsp_two ? rsp_low_word : rsp_high_word) : 32'd0;
-    wire            push0_fault = !do_rsp;  // fault_push case (do_rsp==0)
+    wire [31:0] push0_word = do_rsp ? (rsp_two ? rsp_low_word : rsp_high_word) : 32'd0;
+    wire push0_fault = !do_rsp;  // fault_push case (do_rsp==0)
 
     // Second push: the high half, only when pushing both words.
     wire [XLEN-1:0] push1_pc = rsp_high_pc;
-    wire [    31:0] push1_word = rsp_high_word;
-    wire            push1_fault = 1'b0;
+    wire [31:0] push1_word = rsp_high_word;
+    wire push1_fault = 1'b0;
 
-    wire [     1:0] push_cnt = do_rsp ? (rsp_two ? 2'd2 : 2'd1) : fault_push ? 2'd1 : 2'd0;
+    wire [1:0] push_cnt = do_rsp ? (rsp_two ? 2'd2 : 2'd1) : fault_push ? 2'd1 : 2'd0;
 
     // -----------------------------------------------------------------
     // Buffer pop: decode consumes the head when it is not back-pressuring
-    // and not the redirect cycle.
+    // and not the redirect cycle. A same-cycle target-span stitch pops 2
+    // (head + head+1, the stitch word + its consumed low half); fe_pop2_i
+    // is only asserted when fe_next_valid_o (count>=2), so pop-2 <= count
+    // — no underflow. stall_i / branch_valid_i zero the count, matching
+    // the old 1-pop behaviour for every non-stitch case.
     // -----------------------------------------------------------------
-    wire            buf_pop = (count_q != 4'd0) && !stall_i && !branch_valid_i;
+    wire [1:0] buf_pop_cnt = (count_q != 4'd0 && !stall_i && !branch_valid_i) ?
+        (fe_pop2_i ? 2'd2 : 2'd1) : 2'd0;
 
     // -----------------------------------------------------------------
     // Next-state
@@ -247,10 +269,10 @@ module fetch_stage #(
                 // A fault PC advances past the unfetchable 8-byte word.
                 pc_d = (pc_q & ~32'h7) + 32'd8;
             end
-            // Buffer FIFO advance.
-            head_d  = head_q + (buf_pop ? 3'd1 : 3'd0);
+            // Buffer FIFO advance. buf_pop_cnt is 0/1/2 (3-bit wrap on head).
+            head_d  = head_q + buf_pop_cnt;
             tail_d  = tail_q + push_cnt;  // 0/1/2, 3-bit wrap
-            count_d = count_q + push_cnt - (buf_pop ? 4'd1 : 4'd0);
+            count_d = count_q + push_cnt - buf_pop_cnt;
         end
 
         // inflight tracks outstanding reads: +1 on launch, -1 on rsp_cap.
@@ -308,6 +330,16 @@ module fetch_stage #(
     assign fe_pc_o    = buf_pc_q[head_q];
     assign fe_valid_o = (count_q != 4'd0);
     assign fe_fault_o = buf_fault_q[head_q];
+
+    // Buffer head+1 read port (same-cycle target-span stitch). head_next is a
+    // 3-bit wrap, always a valid 0..7 index even when count<2; decode gates on
+    // fe_next_valid_o. A redirect zeros count -> both fe_valid_o and
+    // fe_next_valid_o drop, so no extra kill logic.
+    wire [2:0] head_next = head_q + 3'd1;
+    assign fe_next_instr_o = buf_instr_q[head_next];
+    assign fe_next_pc_o    = buf_pc_q[head_next];
+    assign fe_next_fault_o = buf_fault_q[head_next];
+    assign fe_next_valid_o = (count_q >= 4'd2);
 
 `ifdef VERILATOR
     // The split assumes the I-mem aligns the read address down to 8 bytes
