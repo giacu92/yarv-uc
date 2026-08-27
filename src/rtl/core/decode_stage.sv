@@ -47,10 +47,14 @@ import rv32_pkg::*;
  * address (fe_pc_i[1]=1, a 16-bit compressed target). The low half was
  * branched over and is discarded; the upper half is decoded directly
  * (no hold buffer). If the target is a 32-bit instr (upper half's
- * [1:0]==2'b11), its low halfword is stashed and the stitch proceeds as
- * above (one bubble). fetch realigns pc_q after such a redirect so the
- * following fetch is the next word (low half), not another odd-half
- * address.
+ * [1:0]==2'b11), its low halfword is head[31:16] and its upper halfword is
+ * head+1's low half (fe_next_instr_i[15:0]) -- both buffered, so the stitch
+ * completes in the SAME cycle (target_span_complete, 0 bubbles, pop 2) and
+ * head+1's upper half is re-stashed as the next instr. Offset-6 targets
+ * (where the next fetch has not landed yet, fe_next_valid_i=0) fall back to
+ * target_span_wait: stash the low half, stitch next cycle (1 bubble).
+ * fetch realigns pc_q after such a redirect so the following fetch is the
+ * next word (low half), not another odd-half address.
  *
  * stall_o feeds fetch's stall_i, back-pressuring the pipe only on
  * execute's stall_i (DIV/REM busy / mem-wait) or a compressed-upper
@@ -96,6 +100,15 @@ module decode_stage (
     // it becomes a precise trap with this PC as mtval.
     input wire            fe_fault_i,
 
+    // Buffer head+1 (same-cycle RVC spanning stitch). Exposes the word right
+    // behind the head so a 32-bit instr at a 2-byte-aligned branch target
+    // (offset 2 / 6) stitches in the cycle the target word is seen, no bubble.
+    // fe_next_valid_i = count>=2; fe_pop2_o tells fetch to drop both entries.
+    input wire [XLEN-1:0] fe_next_instr_i,
+    input wire [XLEN-1:0] fe_next_pc_i,
+    input wire            fe_next_valid_i,
+    input wire            fe_next_fault_i,
+
     // Register-file read port (decode drives addresses; data returns
     // combinationally the same cycle).
     output wire [     4:0] rs1_addr_o,
@@ -122,6 +135,11 @@ module decode_stage (
     // Back-pressure to fetch (so the pipe can stall on DIV/REM or a RAW
     // hazard).
     output wire stall_o,
+
+    // Same-cycle target-span stitch: tell fetch to pop 2 (head + head+1) this
+    // cycle. Asserted only on target_span_complete, which requires
+    // fe_next_valid_i (count>=2), so pop-2 <= count.
+    output wire fe_pop2_o,
 
     // D/E pipeline register output: the full decoded control word, consumed
     // by the execute stage.
@@ -568,6 +586,13 @@ module decode_stage (
     wire span_wait = !fetch_fault && span_pending && !fe_valid_i;  // waiting for the word
     wire target_upper = !fetch_fault && !hold_q && fe_valid_i && fe_pc_i[1];  // odd half
     wire target_span = target_upper && (fe_instr_i[17:16] == 2'b11);  // 32-bit at target
+    // Same-cycle stitch: the target word's low half (head[31:16]) is the
+    // 32-bit instr's low half, and head+1's low half (fe_next_instr_i[15:0])
+    // is its upper half — both buffered, so stitch now (no bubble). A fault
+    // at head+1 falls back to wait (stall-and-wait the old way) so the fault
+    // routes through with the faulting word's PC next cycle.
+    wire target_span_complete = target_span && fe_next_valid_i && !fe_next_fault_i;
+    wire target_span_wait = target_span && !target_span_complete;
 
     logic [4:0] rs1_addr_dec;
     logic [4:0] rs2_addr_dec;
@@ -656,11 +681,21 @@ module decode_stage (
             src_pc            = hold_pc_q;
             src_is_compressed = (hold_word_q[1:0] != 2'b11);
         end else if (target_upper) begin
-            if (target_span) begin
-                // Branch target at offset 2 is a 32-bit instr's low half:
-                // stash it (hold next-state) and wait for the upper-half
-                // fetch word. No emit this cycle (bubble); the stitch
-                // completes when word W+1 arrives.
+            if (target_span_complete) begin
+                // Same-cycle stitch: target word's upper half (head[31:16])
+                // is the 32-bit instr's low half; head+1's low half
+                // (fe_next_instr_i[15:0]) is its upper half. PC is the
+                // target PC (fe_pc_i). A real 32-bit word -> bypasses
+                // c_expand. head+1's upper half is re-stashed (hold
+                // next-state) as the next instruction.
+                src_instr32       = {fe_next_instr_i[15:0], fe_instr_i[31:16]};
+                src_pc            = fe_pc_i;
+                src_is_compressed = 1'b0;
+            end else if (target_span_wait) begin
+                // Branch target at offset 2/6 is a 32-bit instr's low half
+                // but head+1 is absent or faults: no emit this cycle (bubble),
+                // stash the low half, stitch completes next cycle (the old
+                // span path). A fault at head+1 lands here -> trap next cycle.
                 src_instr32       = 32'd0;
                 src_pc            = fe_pc_i;
                 src_is_compressed = 1'b0;
@@ -694,12 +729,12 @@ module decode_stage (
         buffer_upper = (!is_hold) && !target_upper && fe_valid_i && fe_is_compressed;
 
         // A COMPLETE instruction is available this cycle: every case
-        // EXCEPT span_wait (upper-half word not here yet) and target_span
+        // EXCEPT span_wait (upper-half word not here yet) and target_span_wait
         // (just stashed the low half, waiting for the stitch). This feeds
         // de_d.valid and the forward-path compare, so neither wait state
         // emits a spurious valid or false-triggers a forward.
-        decoded_valid = fetch_fault | span_complete | is_hold_plain |
-            (target_upper && !target_span) | (fe_valid_i && !hold_q && !target_upper);
+        decoded_valid = fetch_fault | span_complete | is_hold_plain | (target_upper && !target_span)
+            | target_span_complete | (fe_valid_i && !hold_q && !target_upper);
 
         // ---- Field extraction ----
         opcode = src_instr32[6:0];
@@ -1273,9 +1308,21 @@ module decode_stage (
         end else if (is_hold_plain) begin
             // Compressed upper half consumed; clear.
             hold_d = 1'b0;
-        end else if (target_span) begin
-            // Branch target at offset 2 is a 32-bit instr's low half:
-            // stash it and wait for the upper-half word. The spanning
+        end else if (target_span_complete) begin
+            // Same-cycle stitch consumed head (target word: low half branched
+            // over, upper half = 32-bit instr's low half) AND head+1's low half
+            // (the instr's upper half). The next instruction is head+1's upper
+            // half -> stash it (its [1:0] flags compressed vs another spanning
+            // low; consecutive spanning instrs chain here). PC = head+1 PC + 2.
+            // span_complete (needs hold_q) and target_span_complete (needs
+            // !hold_q) are mutually exclusive, so the if-else priority holds.
+            hold_d      = 1'b1;
+            hold_word_d = fe_next_instr_i[31:16];
+            hold_pc_d   = fe_next_pc_i + 32'd2;
+        end else if (target_span_wait) begin
+            // Branch target at offset 2/6 is a 32-bit instr's low half, but
+            // head+1 is absent or faults: stash the low half and wait for the
+            // upper-half word (the old target_span behavior). The spanning
             // instr sits AT the target, so hold_pc = fe_pc (not +2).
             hold_d      = 1'b1;
             hold_word_d = fe_instr_i[31:16];
@@ -1319,6 +1366,12 @@ module decode_stage (
     wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
     wire backpressure_stall = stall_i;
     assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
+
+    // Same-cycle target-span stitch: pop 2 (head + head+1). target_span_complete
+    // has hold_q=0 so resource_stall=0; only stall_i back-pressures, which fetch
+    // already gates out of buf_pop_cnt. Asserted only when fe_next_valid_i
+    // (count>=2) -> pop-2 <= count.
+    assign fe_pop2_o  = target_span_complete;
 
     // Register-read addresses drive the reg file.
     assign rs1_addr_o = rs1_addr_dec;

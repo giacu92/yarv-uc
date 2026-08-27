@@ -4,7 +4,7 @@
 #   make clean      clean all
 #   make ifault     build one test
 
-TESTS := ifault isa_probe rvc_scramble
+TESTS := ifault isa_probe rvc_scramble span_target
 
 .PHONY: all clean $(TESTS)
 all:

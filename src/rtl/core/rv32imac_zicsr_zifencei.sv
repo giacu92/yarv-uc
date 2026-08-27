@@ -108,6 +108,13 @@ module rv32imac_zicsr_zifencei #(
     wire         [XLEN-1:0] fe_instr;
     wire                    fe_valid;
     wire                    fe_fault;
+    // Buffer head+1 taps (same-cycle RVC spanning stitch) + the decode->fetch
+    // pop-2 handshake for the stitch.
+    wire         [XLEN-1:0] fe_next_instr;
+    wire         [XLEN-1:0] fe_next_pc;
+    wire                    fe_next_valid;
+    wire                    fe_next_fault;
+    wire                    fe_pop2;
 
     // Decode -> fetch back-pressure (propagates execute's stall).
     wire                    dec_stall;
@@ -184,18 +191,23 @@ module rv32imac_zicsr_zifencei #(
     fetch_stage #(
         .IMEM_ADDR_W(IMEM_ADDR_W)
     ) fetch_stage_i (
-        .clk_i         (clk_i),
-        .rstn_i        (rstn_i),
-        .boot_addr_i   (boot_addr_i),
-        .stall_i       (dec_stall),
-        .branch_valid_i(ex_branch_valid),
-        .branch_addr_i (ex_branch_addr),
-        .imem_req_o    (fe_req),
-        .imem_rsp_i    (fe_rsp),
-        .fe_instr_o    (fe_instr),
-        .fe_pc_o       (fe_pc),
-        .fe_valid_o    (fe_valid),
-        .fe_fault_o    (fe_fault)
+        .clk_i          (clk_i),
+        .rstn_i         (rstn_i),
+        .boot_addr_i    (boot_addr_i),
+        .stall_i        (dec_stall),
+        .branch_valid_i (ex_branch_valid),
+        .branch_addr_i  (ex_branch_addr),
+        .imem_req_o     (fe_req),
+        .imem_rsp_i     (fe_rsp),
+        .fe_instr_o     (fe_instr),
+        .fe_pc_o        (fe_pc),
+        .fe_valid_o     (fe_valid),
+        .fe_fault_o     (fe_fault),
+        .fe_next_instr_o(fe_next_instr),
+        .fe_next_pc_o   (fe_next_pc),
+        .fe_next_valid_o(fe_next_valid),
+        .fe_next_fault_o(fe_next_fault),
+        .fe_pop2_i      (fe_pop2)
     );
 
     // -------------------------------------------------------------
@@ -291,26 +303,31 @@ module rv32imac_zicsr_zifencei #(
     );
 
     decode_stage u_decode (
-        .clk_i       (clk_i),
-        .rstn_i      (rstn_i),
-        .fe_instr_i  (fe_instr),
-        .fe_pc_i     (fe_pc),
-        .fe_valid_i  (fe_valid),
-        .fe_fault_i  (fe_fault),
-        .rs1_addr_o  (rs1_addr),
-        .rs2_addr_o  (rs2_addr),
-        .rs1_data_i  (rs1_data),
-        .rs2_data_i  (rs2_data),
-        .stall_i     (ex_stall),
-        .flush_i     (ex_flush),
-        .ex_wb_en_i  (wb_en),
-        .ex_wb_addr_i(wb_addr),
-        .ex_wb_data_i(wb_data),
-        .stall_o     (dec_stall),
-        .de_o        (de_bus),
-        .de_pc_o     (de_pc),
-        .de_instr_o  (de_instr),
-        .de_valid_o  (de_valid)
+        .clk_i          (clk_i),
+        .rstn_i         (rstn_i),
+        .fe_instr_i     (fe_instr),
+        .fe_pc_i        (fe_pc),
+        .fe_valid_i     (fe_valid),
+        .fe_fault_i     (fe_fault),
+        .fe_next_instr_i(fe_next_instr),
+        .fe_next_pc_i   (fe_next_pc),
+        .fe_next_valid_i(fe_next_valid),
+        .fe_next_fault_i(fe_next_fault),
+        .rs1_addr_o     (rs1_addr),
+        .rs2_addr_o     (rs2_addr),
+        .rs1_data_i     (rs1_data),
+        .rs2_data_i     (rs2_data),
+        .stall_i        (ex_stall),
+        .flush_i        (ex_flush),
+        .ex_wb_en_i     (wb_en),
+        .ex_wb_addr_i   (wb_addr),
+        .ex_wb_data_i   (wb_data),
+        .stall_o        (dec_stall),
+        .fe_pop2_o      (fe_pop2),
+        .de_o           (de_bus),
+        .de_pc_o        (de_pc),
+        .de_instr_o     (de_instr),
+        .de_valid_o     (de_valid)
     );
 
     execute_stage u_execute (
