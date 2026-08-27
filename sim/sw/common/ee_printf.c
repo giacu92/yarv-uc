@@ -1,16 +1,21 @@
 /*
- * Minimal integer printf over the UART for CoreMark.
+ * Minimal integer printf over the UART. Shared by the harnesses that link a
+ * vendored benchmark whose sources call printf and are not ours to edit
+ * (coremark/, dhrystone/); everything else in the tree writes through
+ * uart.h directly.
  *
  * Supports %d %u %x %s %c %% with an optional zero/width field and any
  * number of `l` length modifiers (CoreMark prints %lu / %04x). No %f:
- * HAS_FLOAT is 0 in core_portme.h, so CoreMark never asks for one.
+ * neither port asks for one -- CoreMark builds with HAS_FLOAT 0, and the
+ * Dhrystone port prints the two float results through a %d cast that
+ * upstream already applies.
  *
- * Newlines are expanded to CR+LF. CoreMark's format strings end in a bare
- * "\n", and a serial terminal takes that as line feed only -- the cursor
- * stays in its column, so every line after the first starts where the
- * previous one ended and the report comes out as a staircase. Nothing else
- * in the tree hits this because the other programs write "\r\n" in their
- * own strings; here the strings are upstream CoreMark's and are not ours to
+ * Newlines are expanded to CR+LF. Both benchmarks' format strings end in a
+ * bare "\n", and a serial terminal takes that as line feed only -- the
+ * cursor stays in its column, so every line after the first starts where
+ * the previous one ended and the report comes out as a staircase. Nothing
+ * else in the tree hits this because the other programs write "\r\n" in
+ * their own strings; here the strings are upstream's and are not ours to
  * edit.
  */
 

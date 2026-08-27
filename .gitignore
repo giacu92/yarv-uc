@@ -41,10 +41,13 @@ sim/cosim/riscv-isa-sim-build/
 sim/cosim/riscv-isa-sim-install/
 sim/cosim/quicksort/spike.log
 sim/cosim/quicksort/rtl.trace
+sim/cosim/quicksort/rtl.stdout
 sim/cosim/ecall/spike.log
 sim/cosim/ecall/rtl.trace
+sim/cosim/ecall/rtl.stdout
 sim/cosim/coremark/spike.log
 sim/cosim/coremark/rtl.trace
+sim/cosim/coremark/rtl.stdout
 
 # Editor / OS
 *.swp

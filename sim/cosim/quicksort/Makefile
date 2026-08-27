@@ -24,6 +24,13 @@ IMEM_HEX   := $(SCRIPT_DIR)../../sw/quicksort/build/imem.hex
 DMEM_HEX   := $(SCRIPT_DIR)../../sw/quicksort/build/dmem.hex
 SPIKE_LOG  := $(SCRIPT_DIR)spike.log
 RTL_LOG    := $(SCRIPT_DIR)rtl.trace
+# The sim's stdout, which the run below would otherwise discard. The diff
+# does not need it (that reads RTL_LOG), but it carries the stall-cause
+# histogram and the CPI decomposition, and throwing those away means the
+# one long run this harness already paid for says nothing about
+# performance. Read the figures as belonging to the CO-SIM build of the
+# firmware, which is not the timed build -- see the notes at the top.
+RTL_STDOUT    := $(SCRIPT_DIR)rtl.stdout
 
 # Bound the Spike run. Spike spins forever on the halt self-loop. Stop it
 # with Spike's own --instructions cap: Spike exits cleanly after N commits
@@ -91,14 +98,16 @@ rtl-run: $(IMEM_HEX) $(DMEM_HEX)
 	@echo "== running RTL sim (RTL_TRACE=$(RTL_LOG)) =="
 	@rm -f $(RTL_LOG)
 	@RTL_TRACE=$(RTL_LOG) MAX_CYC=200000 \
-	  $(MAKE) -C $(SCRIPT_DIR)../.. run \
+	  $(MAKE) --no-print-directory -C $(SCRIPT_DIR)../.. run \
 	    RUN_ARGS="+IINIT=sw/quicksort/build/imem.hex +DINIT=sw/quicksort/build/dmem.hex" \
-	  >/dev/null
+	  > $(RTL_STDOUT)
 	@test -s $(RTL_LOG) || { echo "rtl: no trace produced (RTL_TRACE unset? sim_main.cpp edit missing?)"; exit 1; }
 	@echo "rtl: $$(wc -l < $(RTL_LOG)) retires -> $(RTL_LOG)"
+	@echo "rtl: stdout -> $(RTL_STDOUT)"
+	@sed -n "/^retired /,\$$p" $(RTL_STDOUT)
 
 diff: spike-run rtl-run
 	@python3 $(SCRIPT_DIR)../cosim_diff.py --rtl $(RTL_LOG) --spike $(SPIKE_LOG)
 
 clean:
-	rm -f $(SPIKE_LOG) $(RTL_LOG)
+	rm -f $(SPIKE_LOG) $(RTL_LOG) $(RTL_STDOUT)

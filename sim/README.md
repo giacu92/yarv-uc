@@ -146,16 +146,130 @@ silently alias makes Spike trap instead.
   illegal-instruction sync trap (`.word 0x0000007f`); the faulting instruction
   is not retired in either model. `ecall` itself is not Spike-comparable.
 
+**`sw/dhrystone/` has no co-sim, by construction.** Its `Arr_2_Glob` is
+`int [50][50]` — 10 000 bytes of `.bss` — so `sw/dhrystone/dhry_link.ld`
+takes the whole 16 KiB D-mem with `DMEM ORIGIN = 0`. `.text` has to be at 0
+too (the core boots there), and Spike's one address space cannot hold both.
+The `0x2000` split above exists precisely to avoid that; Dhrystone is the
+one workload that cannot fit inside it.
+
 ```
 cd cosim/quicksort && make cosim   # PASS -- matched 29632 retires
 cd cosim/coremark  && make cosim   # PASS -- matched 332803 retires
 cd cosim/ecall     && make cosim   # PASS -- matched 17 retires
 ```
 
+Each harness saves the sim's stdout to `rtl.stdout` next to `rtl.trace` and
+echoes the performance summary (see **Stall analysis** below) before the
+diff, so the one long run it already paid for is not wasted. **Read those
+figures as belonging to the co-sim build**, which is not the timed build:
+quicksort is `PRINT_ARRAY=0` and CoreMark is `COSIM=1 -O2`, so a co-sim CPI
+will not match the number the timed build reports.
+
 `build_spike.sh` relocates Spike's fixed debug-module and boot-ROM devices out
 of the way of these images and records the patch set in a stamp file so an
 older install is rebuilt rather than silently reused. The Spike source tree,
 build, install, and per-run logs are gitignored; only the harness is committed.
+
+## Stall analysis
+
+Every run ends with a cause histogram over the cycles that retired nothing.
+It exists because the `stalled N/M cycles (X%)` line above it answers a
+narrower question than it looks like: `dbg_stall_o` is `dec_stall |
+ex_stall`, and a **fetch bubble is neither** — decode holding nothing
+because the instruction buffer is empty is a cycle that retires nothing and
+is not counted as a stall. So a change that removes fetch bubbles (the
+64-bit / 2-outstanding rewrite) lowers the cycle count and *raises* that
+percentage at the same time. Never read it as a cross-design or
+cross-program comparison.
+
+The histogram partitions the run instead: retire cycles plus the buckets are
+the whole run, so the columns sum and IPC falls straight out. Each no-retire
+cycle is charged to the first cause that applies, in the order the pipe is
+actually blocked — execute owns the retire slot, then decode's own bubbles,
+then an empty buffer is the fetch path's fault:
+
+| bucket | signal | meaning |
+|---|---|---|
+| `load-wait` | `mem_running` | load issued, waiting for `rvalid` |
+| `lsu-launch` | `mem_launch & ~store_done` | driving the request, slave not yet ready |
+| `lsu-capture` | `mem_stage_req` | the LSU register stage's own capture cycle |
+| `div/rem` | `div_running \| alu_start` | multi-cycle divide |
+| `csr-read` | `csr_start` | the registered CSR read (`EX_CSR_WAIT`) |
+| `wfi-halt` | `wfi_stall` | halted until an interrupt is pending |
+| `rvc-hold` | `resource_stall` | compressed upper half held against a fresh word |
+| `rvc-span` | `span_wait` | 32-bit instruction straddling a word boundary |
+| `redirect` | between `branch_valid_o` and the next retire | flushed D/E + killed buffer + refill |
+| `imem-starve` | buffer empty, no redirect | fetch could not keep up |
+| `decode-bubble` | `~decoded_valid` | words available, no instruction out |
+
+`redirect` deliberately absorbs the flushed D/E slot and the refill together:
+split apart they hide the one number that matters, cycles per taken
+branch/trap/`mret`. Event counters (mem-ops, loads, stores, div/rem, CSR
+ops, redirects) print underneath, so a bucket can be read per operation —
+"load-wait is 20% of the run" is many cheap loads or few expensive ones, and
+only the second is a memory-system problem.
+
+### CPI decomposition
+
+The histogram is also printed divided by retires instead of by cycles, and
+**that is the form to compare**. A bucket's percentage of the run moves when
+any *other* bucket changes; cycles per retired instruction is a
+per-instruction cost that stands on its own. The terms are additive by
+construction — every cycle is either a retire or exactly one bucket — so 1.0
+plus the buckets *is* the CPI, and the 1.0 floor is the retire slot itself
+(one instruction per cycle, in order, is all this pipeline can do). A
+non-empty bucket below the printed resolution shows as `<0.001`, not
+`0.000`, because "present but negligible" is a different claim from "free".
+
+Measured on the three benchmarks (2026-08-27, post-fetch-rewrite):
+
+| cycles per retired instruction | quicksort | CoreMark | Dhrystone |
+|---|---|---|---|
+| retire (floor) | 1.000 | 1.000 | 1.000 |
+| + `redirect` | 0.434 | 0.374 | 0.353 |
+| + `lsu-capture` | 0.279 | 0.234 | 0.314 |
+| + `lsu-launch` | 0.161 | 0.181 | 0.178 |
+| + `div/rem` | — | <0.001 | 0.085 |
+| **= CPI** | **1.874** | **1.790** | **1.930** |
+| (IPC) | 0.534 | 0.559 | 0.518 |
+
+Each term is a per-operation cost times how often the operation occurs, and
+both halves are needed to read it — 3 cycles per redirect is cheap if
+branches are rare and is the whole problem at one taken branch in seven:
+
+| | quicksort | CoreMark | Dhrystone |
+|---|---|---|---|
+| cyc / redirect | 3.10 | 3.20 | 3.16 |
+| 1 redirect per N instr | 7.15 | 8.56 | 8.96 |
+| no-retire cyc / mem-op | 1.58 | 1.78 | 1.57 |
+| mem-ops as % of instr | 27.9% | 23.4% | 31.4% |
+| cyc / divide | — | 33.0 | 33.0 |
+| `imem-starve`, whole run | 2 cyc | 2 cyc | 2 cyc |
+
+Three identities hold in every run, and they are the instrumentation's own
+proof that it is neither losing nor double-counting cycles: `lsu-capture` ==
+mem-ops (one capture cycle per load *and* store), `lsu-launch` == loads (a
+store retires on the launch accept, so that cycle is a retire and never
+enters the histogram), and `div/rem` == 33 × divides (the 32-iteration
+restoring FSM plus one).
+
+Dhrystone has the worst CPI of the three not because the core does worse on
+it but because it has the highest load/store density (31.4% — `strcpy` and
+`strcmp` a byte at a time) plus the only divides. quicksort has the most
+expensive redirect term because it is the branchiest.
+
+Two things to read off it. **The fetch path is no longer a limiter** —
+`imem-starve` is 2 cycles in a 1.5 M-cycle run, so outside a redirect the
+buffer is never empty; that is the fetch rewrite having worked, and it is
+also why the `dbg_stall_o` percentage went up. **The redirect is now the
+biggest single cost**: ~3.1 cycles per taken redirect, 38-50% of all
+no-retire cycles, which is exactly the `regfile -> forward mux -> branch
+compare/target -> PC redirect` path CLAUDE.md names as the next limiter.
+After it comes the LSU at a flat 2 cycles per load and 1 per store (capture
++ launch) — the cost the LSU register stage bought +4.8 ns of timing with.
+`load-wait` is 0 because the BSRAM answers the cycle after the accept, and
+that cycle retires.
 
 ## Firmware oracles (`sw/`)
 

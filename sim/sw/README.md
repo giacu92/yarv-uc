@@ -13,11 +13,13 @@ sim/sw/
   common/           shared assets + build logic (every harness pulls from here)
     sw_build.mk      parameterised build include (toolchain, flags, rules)
     uart.h           UART MMIO register definitions
+    ee_printf.c      minimal integer printf over the UART (coremark, dhrystone)
     start.S          freestanding _start: zero .bss, set sp, call main
     link.ld          Harvard link script (.text->IMEM 0, .data->DMEM 0x2000)
     bin2hex.py       .bin -> $readmemh word file
   quicksort/        benchmark program (main.c)
   coremark/         EEMBC CoreMark (eembc/ upstream + local port layer)
+  dhrystone/        Dhrystone 2.1 (sifive/ upstream + local port layer)
   isa/              ISA oracles: ifault, isa_probe, rvc_scramble
   intr/             trap + interrupt oracles: trap, timer, wfi_trap
   peri/             peripheral oracle: uart_echo
@@ -87,8 +89,10 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   `main(int, char **)` reads them and nothing else sets them), `call main`,
   halt loop. C programs link this; standalone `.S` tests carry their own
   `_start`.
-- `link.ld` — Harvard link script: `IMEM (rx) ORIGIN = 0` (code) and
-  `DMEM (rwx) ORIGIN = 0x2000` (data). Small-data sections
+- `link.ld` — Harvard link script used by every harness but one:
+  `IMEM (rx) ORIGIN = 0` (code) and `DMEM (rwx) ORIGIN = 0x2000` (data).
+  (`dhrystone/` links its own, `dhry_link.ld`, with `DMEM ORIGIN = 0` — its
+  10 KiB `Arr_2_Glob` does not fit in the 8 KiB above 0x2000.) Small-data sections
   (`.srodata*`/`.sdata*`/`.sbss*`) are collected into the same output
   sections — gcc puts any object up to `-msmall-data-limit` (8 bytes) there,
   and the image is extracted with `objcopy -j .rodata -j .data`, so an
@@ -100,13 +104,18 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   I-mem base and break the Harvard split).
 - `bin2hex.py` — raw little-endian `.bin` → `$readmemh` word file
   (`@<word>` + one 8-hex-digit word per line). `--base <byte_addr>` sets the
-  `@` index (`dmem.hex` uses `--base 0x2000` → `@0x800`).
+  `@` index (`dmem.hex` uses `--base $(DMEM_BASE)`, 0x2000 → `@0x800`;
+  `dhrystone/` overrides it to 0).
   `--pad-words N --pad-value W` pads the image to N words with W (ebreak
   default) — board images pad to the full declared I-mem depth so
   GowinSynthesis sizes the inferred ROM from the `$readmemh` content at the
   right depth, else a stray fetch above the image aliases back into real code.
 - `uart.h` — UART MMIO register definitions; `-I$(COMMON_DIR)` makes
   `#include "uart.h"` work from any harness.
+- `ee_printf.c` — minimal integer `printf` over the UART (`%d %u %x %s %c %%`,
+  optional zero-padded width, `\n` → CR+LF). Linked by the two harnesses whose
+  workload is vendored and calls `printf` — `coremark/` and `dhrystone/`;
+  everything else writes through `uart.h` directly.
 - `sw_build.mk` — shared build logic; see the header comment for the variables
   a harness sets.
 
@@ -150,6 +159,43 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   the 64-bit I-mem word width) for a board build. `COSIM=1` builds the co-sim variant: no cycle counter (the one
   register write Spike can't reproduce), no banner, and `-O2` — see
   `sim/cosim/coremark/` (332 803 retires matched).
+- **`dhrystone/`** — Dhrystone 2.1. `sifive/` holds SiFive's
+  `benchmark-dhrystone` tree **vendored verbatim**, byte-identical to
+  github.com/sifive/benchmark-dhrystone at commit 0ddff53 (provenance and
+  hashes in `sifive/UPSTREAM.md`); `make verify-sifive` runs before anything
+  compiles and fails the build on any edit, because `strcpy` and `strcmp` are
+  called from inside the measurement loop, so the loop body *is* the
+  benchmark. The port sits outside that directory, in `dhry_portme.c` (the
+  real `main()`, `time()` over `mcycle`, a bump allocator for the two records
+  Dhrystone mallocs, a word-at-a-time `strcpy`, `memcpy`/`memset`, a banner and
+  a summary), `stdio.h` (a freestanding shadow of the toolchain's, which
+  `dhry.h` includes "for strcpy, strcmp") and `dhry_link.ld`; `printf` is
+  `common/ee_printf.c`.
+  Built `-O3 -std=gnu17 -mstrict-align -fno-common -falign-functions=4`,
+  `-DTIME -DNOENUM` from upstream's own Makefile. Two defines stand in for
+  edits upstream must not receive: `-Dmain=dhry_main` on `dhry_1.c` alone, so
+  the port can print after the report (`start.S` calls `main` once and spins;
+  Dhrystone has no `portable_fini()`), and `-Dfloat=long`, because the seven
+  `float` uses are all in the report block after the timer stops, upstream
+  already prints both results through an `(int)` cast, and this core has no
+  FPU while the toolchain's libgcc is built `ilp32d` — the soft-float helpers
+  do not exist to link against. 5.8 KiB `.text` (of 16) / 1.9 KiB `.rodata` +
+  10.3 KiB `.bss`.
+  **Score: 686 cycles/iteration = 0.82 DMIPS/MHz, 72 886 Dhrystones/s at
+  50 MHz** (`DHRY_ITERS=2000`, -O3; 1 372 041 ticks). All 22 of Dhrystone's
+  own `should be:` final values match at every iteration count tried. The
+  figure is `strcpy`-sensitive by construction — a plain byte loop measures
+  891 cycles/iteration = 0.63 DMIPS/MHz on the same core — which is why the
+  port ships the word-at-a-time version published scores are quoted against
+  and says so in `sifive/UPSTREAM.md`.
+  A run under 2 s ends in upstream's own "Measured time too small to obtain
+  meaningful results"; that is Dhrystone's run rule (`Too_Small_Time`), and it
+  needs `DHRY_ITERS` ≈ 145 772 at 50 MHz (the 32-bit `mcycle` caps the other
+  end at ~6.26 M iterations). The port summary is computed from cycles and has
+  no minimum. **Not co-simulated**: `Arr_2_Glob` is 10 000 bytes of `.bss`, so
+  `dhry_link.ld` needs the whole 16 KiB D-mem with `DMEM ORIGIN = 0` — which
+  is where `.text` must live too, and Spike's single address space cannot hold
+  both.
 - **`isa/ifault/`** — instruction-access-fault oracle (jump outside the I-mem).
 - **`isa/isa_probe/`** — instruction/memory probe that reports without the hex
   printer or any instruction under test; board bring-up probe.

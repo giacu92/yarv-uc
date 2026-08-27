@@ -13,7 +13,8 @@
 #     RUN_ARGS="+IINIT=sw/coremark/build/imem.hex +DINIT=sw/coremark/build/dmem.hex"
 #
 # eembc/ holds the unmodified EEMBC CoreMark sources (Apache-2.0, see
-# eembc/LICENSE.md); core_portme.[ch] and ee_printf.c are this core's port.
+# eembc/LICENSE.md); core_portme.[ch] here and ../common/ee_printf.c are
+# this core's port.
 #
 # ARCH keeps zicsr: the port reads mcycle for the timing.
 #
@@ -103,7 +104,9 @@ verify-eembc:
 	@cd eembc && md5sum -c --quiet VENDORED.md5 \
 	  || { echo "eembc/ differs from upstream CoreMark -- see eembc/UPSTREAM.md"; exit 1; }
 
-vpath %.c eembc
+# eembc/ holds the vendored workload; ../common holds ee_printf.c, which
+# the Dhrystone port links too (both benchmarks print through it).
+vpath %.c eembc ../common
 
 C_SRCS := core_portme.c ee_printf.c \
           core_main.c core_list_join.c core_matrix.c core_state.c core_util.c

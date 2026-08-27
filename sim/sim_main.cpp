@@ -62,6 +62,11 @@
 // Taps inside the execute stage (one level below the CPU top).
 #define XTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_execute__DOT__##field)
 
+// Taps inside the decode and fetch stages. Note the instance names differ:
+// the CPU top instantiates decode as u_decode but fetch as fetch_stage_i.
+#define DTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_decode__DOT__##field)
+#define FTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__fetch_stage_i__DOT__##field)
+
 // Taps inside the UART peripheral (sim_top level).
 #define UTAP(field) (top->rootp->sim_top__DOT__u_uart__DOT__##field)
 
@@ -261,6 +266,64 @@ int main(int argc, char** argv) {
     std::vector<std::string> fe_log, de_log, ex_log;
     int fetched = 0, decoded = 0, retired = 0;
     int stalled = 0;  // cycles the pipe was stalled (dbg_stall_o=1)
+
+    // ---- Stall-cause accounting ---------------------------------------
+    // `stalled` above answers "was dbg_stall_o high", which is only part of
+    // the story: dbg_stall_o is dec_stall | ex_stall, and a fetch bubble --
+    // decode holding nothing because the instruction buffer is empty -- is
+    // neither. It shows up as a non-stall cycle that retires nothing, so
+    // removing fetch bubbles (as the 64-bit/2-outstanding rewrite did)
+    // RAISES the reported stall percentage while lowering the cycle count.
+    // Comparing that percentage across two designs, or across two
+    // programs, therefore says very little.
+    //
+    // This histogram answers the question that does compare: for every
+    // cycle in which no instruction retired, what was holding the pipe.
+    // Retire cycles plus these buckets are exactly the run, so the columns
+    // sum and IPC falls straight out of them.
+    //
+    // The order below is a priority, and it is the order in which a cycle
+    // is actually blocked: execute owns the retire slot, so if execute is
+    // busy nothing else matters; decode's own bubbles come next; and only
+    // if neither is holding anything is an empty buffer the fetch path's
+    // fault.
+    enum {
+        SC_LOAD_WAIT,  // EX_MEM_WAIT: load issued, waiting for rvalid
+        SC_LSU_LAUNCH, // EX_MEM_LAUNCH: driving the request, slave not yet ready
+        SC_LSU_CAPTURE,// EX_IDLE capture cycle (the LSU register stage's own cost)
+        SC_DIV,        // DIV/REM multi-cycle
+        SC_CSR,        // EX_CSR_WAIT: the registered CSR read
+        SC_WFI,        // halted in wfi until an interrupt is pending
+        SC_RVC_HOLD,   // compressed upper half held while a fresh word arrived
+        SC_RVC_SPAN,   // 32-bit instruction straddling a word boundary
+        SC_REDIRECT,   // between a branch/trap redirect and the next retire
+        SC_IMEM,       // buffer empty with no redirect: fetch could not keep up
+        SC_DEC_BUBBLE, // words available but decode produced no instruction
+        SC_OTHER,      // residual: decode produced one, execute retired nothing
+        SC_N
+    };
+    static const char *const sc_name[SC_N] = {
+        "load-wait     (EX_MEM_WAIT)", "lsu-launch    (bus accept)",
+        "lsu-capture   (reg stage)",   "div/rem       (multi-cycle)",
+        "csr-read      (EX_CSR_WAIT)", "wfi-halt",
+        "rvc-hold      (upper half)",  "rvc-span      (word straddle)",
+        "redirect      (flush + refill)", "imem-starve   (fetch behind)",
+        "decode-bubble (no instr out)",  "other"
+    };
+    long sc_count[SC_N] = {0};
+    // Cycles actually executed. NOT the same as the loop's `cyc`: park
+    // detection breaks out mid-body, so the run is cyc+1 iterations long
+    // and a histogram totalled from `cyc` would be one short of the sum of
+    // its own buckets.
+    long counted_cyc = 0;
+    int  sc_this = SC_OTHER;    // cause classified for the current cycle
+    bool post_redirect = false; // a redirect fired and nothing has retired since
+
+    // Event counters, so a bucket can be read per operation rather than
+    // only as a total (e.g. load-wait cycles divided by loads).
+    long n_mem_ops = 0, n_loads = 0, n_divs = 0, n_csrs = 0, n_redirects = 0;
+    bool pv_mem_req = false, pv_mem_done = false, pv_div = false;
+    bool pv_csr = false, pv_redir = false;
     uint32_t prev_fe_pc = 0;
     bool have_prev_fe = false;
     int fe_pc_checked = 0, fe_pc_ok = 0, fe_pc_bad = 0;
@@ -322,6 +385,66 @@ int main(int argc, char** argv) {
         bool     wb_en  = TAP(wb_en);
         uint32_t wb_addr = TAP(wb_addr);
         uint32_t wb_data = TAP(wb_data);
+
+        // ---- classify this cycle's blocking cause ----
+        // Sampled here, in the low half, on purpose: ex_state_q / count_q
+        // and the combinational stall terms derived from them hold THIS
+        // cycle's values before the edge. Post-edge they would already be
+        // the next cycle's, which is fine for a yes/no aggregate but wrong
+        // for attributing a cycle to a cause. Whether the cycle counts at
+        // all is decided after the edge, from ex_valid.
+        bool ev_redir_now = false;
+        {
+            const bool ev_mem_req  = XTAP(mem_stage_req) != 0;
+            const bool ev_mem_done = XTAP(mem_done) != 0;
+            const bool ev_div      = XTAP(alu_start) != 0;
+            const bool ev_csr      = XTAP(csr_start) != 0;
+            const bool ev_redir    = XTAP(branch_valid_o) != 0;
+
+            // Rising edges only: these are one-cycle pulses by construction
+            // (all are gated on ex_state_q == EX_IDLE), but counting edges
+            // keeps the totals right if that ever stops being true.
+            if (ev_mem_req && !pv_mem_req) ++n_mem_ops;
+            if (ev_mem_done && !pv_mem_done) ++n_loads;   // only loads reach EX_MEM_WAIT
+            if (ev_div && !pv_div) ++n_divs;
+            if (ev_csr && !pv_csr) ++n_csrs;
+            if (ev_redir && !pv_redir) ++n_redirects;
+            pv_mem_req = ev_mem_req; pv_mem_done = ev_mem_done; pv_div = ev_div;
+            pv_csr = ev_csr; pv_redir = ev_redir;
+
+            // NOT applied here: the redirect cycle is normally the branch's
+            // own retire, and the post-edge retire test below would clear
+            // the flag again in the same cycle. It is set after that test.
+            ev_redir_now = ev_redir;
+
+            const bool buf_empty = (FTAP(count_q) == 0);
+
+            if (XTAP(mem_running))                       sc_this = SC_LOAD_WAIT;
+            // A store retires on the launch accept, so that cycle is a
+            // retire and never reaches the histogram; a load's accept
+            // cycle does, and belongs to the launch bucket.
+            else if (XTAP(mem_launch) && !XTAP(store_done)) sc_this = SC_LSU_LAUNCH;
+            else if (ev_mem_req)                         sc_this = SC_LSU_CAPTURE;
+            else if (XTAP(div_running) || ev_div)        sc_this = SC_DIV;
+            else if (ev_csr)                             sc_this = SC_CSR;
+            else if (XTAP(wfi_stall))                    sc_this = SC_WFI;
+            else if (DTAP(resource_stall))               sc_this = SC_RVC_HOLD;
+            else if (DTAP(span_wait))                    sc_this = SC_RVC_SPAN;
+            // An empty buffer is charged to the redirect that emptied it
+            // until something retires again -- the drain AND the refill are
+            // both the branch's cost, not the I-mem's.
+            // Everything between a redirect and the next retire is the
+            // redirect's cost, whatever it looks like locally: the flushed
+            // D/E slot, the killed buffer, and the refill. Splitting those
+            // hides the number that matters, which is cycles per taken
+            // branch / trap / mret.
+            else if (post_redirect)                      sc_this = SC_REDIRECT;
+            else if (buf_empty)                          sc_this = SC_IMEM;
+            // Words are in the buffer but decode emitted nothing: odd-half
+            // realignment, or a spanning stitch waiting on its second word.
+            else if (!DTAP(decoded_valid))               sc_this = SC_DEC_BUBBLE;
+            else                                         sc_this = SC_OTHER;
+        }
 
         // High half: the posedge commits the writeback and updates the
         // stage registers. fe/de/ex valid are sampled post-edge.
@@ -406,6 +529,21 @@ int main(int argc, char** argv) {
             snprintf(line, sizeof(line), "%3d  wb    x%-2u = 0x%08x", cyc, wb_addr, wb_data);
             ex_log.push_back(line);
         }
+        // A cycle either retires an instruction or it does not; the
+        // no-retire ones go to the cause classified above. The two
+        // together are the whole run.
+        ++counted_cyc;
+        if (TAP(ex_valid)) {
+            post_redirect = false;
+        } else {
+            ++sc_count[sc_this];
+        }
+        // Set after the retire test, not before it: a taken branch retires
+        // in the very cycle it asserts the redirect, so setting the flag
+        // earlier would have it cleared again immediately and the refill
+        // bubble charged to the I-mem instead of to the branch.
+        if (ev_redir_now) post_redirect = true;
+
         if (TAP(ex_valid)) {
             uint32_t pc    = TAP(ex_pc);
             uint32_t instr = TAP(ex_instr);
@@ -483,6 +621,89 @@ int main(int argc, char** argv) {
     if (cyc > 0) {
         printf("stalled %d/%d cycles (%.1f%%)\n",
                stalled, cyc, 100.0 * stalled / cyc);
+    }
+
+    // Cause histogram over the cycles that retired nothing. Read this and
+    // not the percentage above when comparing designs: dbg_stall_o does not
+    // see a fetch bubble, so a change that removes fetch bubbles lowers the
+    // cycle count and raises that percentage at the same time.
+    if (counted_cyc > 0) {
+        const long nonretire = counted_cyc - retired;
+        printf("\nno-retire cycles %ld/%ld (%.1f%%)  --  retired %d (%.1f%%)\n",
+               nonretire, counted_cyc, 100.0 * nonretire / counted_cyc,
+               retired, 100.0 * retired / counted_cyc);
+        for (int i = 0; i < SC_N; ++i) {
+            if (!sc_count[i]) continue;
+            printf("  %-30s %8ld  %5.1f%% of run  %5.1f%% of no-retire\n",
+                   sc_name[i], sc_count[i], 100.0 * sc_count[i] / counted_cyc,
+                   nonretire ? 100.0 * sc_count[i] / nonretire : 0.0);
+        }
+        printf("  %-30s %8ld\n", "TOTAL", nonretire);
+
+        // Per-operation cost, which is what a bucket total does not say:
+        // "load-wait is 20% of the run" could be many cheap loads or few
+        // expensive ones, and only the second is a memory-system problem.
+        printf("events: mem-ops %ld (loads %ld, stores %ld), div/rem %ld, "
+               "csr %ld, redirects %ld\n",
+               n_mem_ops, n_loads, n_mem_ops - n_loads, n_divs, n_csrs, n_redirects);
+        if (n_mem_ops)
+            printf("        %.2f no-retire cyc per mem-op, %.2f per load "
+                   "(wait only)\n",
+                   1.0 * (sc_count[SC_LOAD_WAIT] + sc_count[SC_LSU_LAUNCH]
+                          + sc_count[SC_LSU_CAPTURE]) / n_mem_ops,
+                   n_loads ? 1.0 * sc_count[SC_LOAD_WAIT] / n_loads : 0.0);
+        if (n_redirects)
+            printf("        %.2f no-retire cyc per redirect\n",
+                   1.0 * sc_count[SC_REDIRECT] / n_redirects);
+
+        // The buckets are a partition of the no-retire cycles by
+        // construction (one increment per non-retiring cycle), so this can
+        // only fire if a cycle was classified twice or the run length and
+        // the classification loop disagree. It is a self-check on the
+        // instrumentation, not on the core.
+        long sum = 0;
+        for (int i = 0; i < SC_N; ++i) sum += sc_count[i];
+        if (sum != nonretire)
+            printf("  (INTERNAL: buckets sum to %ld, expected %ld)\n", sum, nonretire);
+    }
+
+    // CPI decomposition. Same data as the histogram, divided by retires
+    // instead of by cycles, which is the form that compares: a percentage
+    // of the run moves when any *other* bucket changes, while cycles per
+    // retired instruction is a per-instruction cost that stands on its own.
+    // The terms are additive by construction -- every cycle is either a
+    // retire or exactly one bucket -- so 1.0 plus the buckets IS the CPI,
+    // and the floor of 1.0 is the retire slot itself (one instruction per
+    // cycle, in order, is all this pipeline can do).
+    if (retired > 0) {
+        printf("\nCPI decomposition (cycles per retired instruction):\n");
+        printf("    %-31s %7.3f\n", "retire (floor)", 1.0);
+        for (int i = 0; i < SC_N; ++i) {
+            if (!sc_count[i]) continue;
+            const double cpi = 1.0 * sc_count[i] / retired;
+            // A non-empty bucket printed as 0.000 reads as "this costs
+            // nothing", which is a different claim from "this is present
+            // and below the resolution shown".
+            if (cpi < 0.0005)
+                printf("  + %-31s  <0.001\n", sc_name[i]);
+            else
+                printf("  + %-31s %7.3f\n", sc_name[i], cpi);
+        }
+        printf("  = %-31s %7.3f   (IPC %.3f)\n", "CPI",
+               1.0 * counted_cyc / retired, 1.0 * retired / counted_cyc);
+
+        // What generates those costs: a per-operation cost times how often
+        // the operation occurs. Both halves are needed to read a term --
+        // 3 cycles per redirect is cheap if branches are rare and is the
+        // whole problem if one instruction in seven is a taken branch.
+        printf("density: ");
+        if (n_redirects)
+            printf("1 redirect per %.2f instr", 1.0 * retired / n_redirects);
+        if (n_mem_ops)
+            printf(", mem-ops %.1f%% of instr", 100.0 * n_mem_ops / retired);
+        if (n_divs)
+            printf(", div/rem %.2f%%", 100.0 * n_divs / retired);
+        printf("\n");
     }
 
     if (wfi_fail_cyc >= 0) {

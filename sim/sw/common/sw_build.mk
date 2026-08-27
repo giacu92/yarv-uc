@@ -14,8 +14,10 @@
 #                     rv32imac; anything that emits CSR / mret / wfi / fence.i
 #                     keeps the default.
 #   C_SRCS          : C source filenames in the harness dir (empty for pure asm).
-#   S_SRCS          : standalone assembly filenames with their own _start
-#                     (empty for C programs, which link the common start.S).
+#   S_SRCS          : assembly filenames. With C_SRCS empty they are a
+#                     standalone program carrying its own _start; alongside
+#                     C_SRCS they are library assembly (dhrystone's strcmp)
+#                     linked after the C objects, and start.S is still used.
 #   START_S         : start.S path (default $(COMMON_DIR)/start.S).
 #   LINK_LD         : link script (default $(COMMON_DIR)/link.ld).
 #   IMEM_PAD_WORDS  : 0 = no padding (default); 2048 = pad the I-mem image to the
@@ -25,9 +27,21 @@
 #                     WORDS: the I-mem hex is 64-bit-wide (--word-width 8), so
 #                     16 KiB = 2048 words (was 4096 at the old 32-bit width).
 #   IMEM_PAD_VALUE  : filler word (default 0x00100073 = ebreak).
+#   DMEM_BASE       : byte address of the first word of the data image
+#                     (default 0x2000, the DMEM ORIGIN in common/link.ld).
+#                     Must equal the ORIGIN of the DMEM region in whatever
+#                     LINK_LD the harness uses -- objcopy -j starts the
+#                     binary at the lowest kept VMA, and bin2hex turns this
+#                     into the @ element index the D-mem hex loads at. Only
+#                     dhrystone/ overrides it (0x0: its 10 KiB Arr_2_Glob
+#                     does not fit in the 8 KiB above 0x2000).
 #   OPT             : optimisation level (default -O2). CoreMark raises it.
 #   EXTRA_CFLAGS    : extra -D flags, e.g. -DPRINT_ARRAY=$(PRINT_ARRAY).
-#   EXTRA_LDFLAGS   : extra link flags, e.g. -Wl,--gc-sections.
+#   EXTRA_LDFLAGS   : extra link flags, e.g. -Wl,--gc-sections. Placed
+#                     BEFORE the objects, so it is not the place for -l.
+#   EXTRA_LDLIBS    : libraries, placed AFTER the objects, where the linker
+#                     will actually resolve them (dhrystone needs -lgcc for
+#                     the soft-float helpers -nostdlib drops).
 #
 # Targets: make (all) -> imem.hex + dmem.hex + objdump; make show; make clean.
 
@@ -86,14 +100,21 @@ OBJD     := $(BUILD)/program.elf.objdump
 
 IMEM_PAD_WORDS ?= 0
 IMEM_PAD_VALUE ?= 0x00100073
+DMEM_BASE      ?= 0x2000
 
 # Object list: C programs link the common start.o first (so _start / .text.init
 # is the first thing linked -> IMEM 0x0); standalone .S programs carry their own
 # _start and link alone.
+#
+# A C program may still name S_SRCS -- assembly that is a *library*, not an
+# entry point (dhrystone/ links a hand-written strcmp). Those objects are
+# appended after the C ones; only the pure-assembly case (no C_SRCS) treats
+# S_SRCS as carrying its own _start.
 ifeq ($(strip $(C_SRCS)),)
 OBJS := $(patsubst %.S,$(BUILD)/%.o,$(S_SRCS))
 else
-OBJS := $(BUILD)/start.o $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+OBJS := $(BUILD)/start.o $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
+        $(patsubst %.S,$(BUILD)/%.o,$(S_SRCS))
 endif
 
 # Rebuild on a flag change, not only on a source change. Several harnesses
@@ -105,7 +126,7 @@ endif
 # rewritten only when it changes, so the objects depend on the
 # configuration as well as on the sources.
 CFG_STAMP := $(BUILD)/.config
-CFG_TEXT  := $(ARCH) $(OPT) $(EXTRA_CFLAGS) $(EXTRA_LDFLAGS) $(RISCV_PREFIX)
+CFG_TEXT  := $(ARCH) $(OPT) $(EXTRA_CFLAGS) $(EXTRA_LDFLAGS) $(EXTRA_LDLIBS) $(RISCV_PREFIX) $(LINK_LD) $(DMEM_BASE)
 # The stamp is written with make's $(file ...) rather than through a shell
 # echo: EXTRA_CFLAGS routinely carries quotes and spaces (-DCOMPILER_FLAGS='...'),
 # and passing that through sh mangles it. The shell only ever sees `cmp`.
@@ -130,8 +151,11 @@ $(BUILD)/%.o: %.c | $(BUILD)
 $(BUILD)/%.o: %.S | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# EXTRA_LDLIBS comes after the objects: ld resolves an archive against the
+# undefined symbols it has seen so far, so a -l ahead of them contributes
+# nothing and the link fails on the symbol the archive holds.
 $(ELF): $(OBJS) $(LINK_LD)
-	$(CC) $(LDFLAGS) $(OBJS) -o $@
+	$(CC) $(LDFLAGS) $(OBJS) $(EXTRA_LDLIBS) -o $@
 
 # Instruction image: .text.init + .text -> IMEM (VMA 0). Fetch's read-only
 # 64-bit port: bin2hex --word-width 8 packs two 32-bit instructions per
@@ -139,10 +163,11 @@ $(ELF): $(OBJS) $(LINK_LD)
 $(IMEM_BIN): $(ELF)
 	$(OBJCOPY) -O binary -j .text.init -j .text $< $@
 
-# Data image: .rodata + .data -> DMEM (VMA 0x2000). .bss is NOBITS (no file
+# Data image: .rodata + .data -> DMEM (VMA DMEM_BASE). .bss is NOBITS (no file
 # content) and placed last, so it does not punch a gap. objcopy -j starts the
-# binary at the lowest kept-section VMA (0x2000, the DMEM ORIGIN), so bin2hex
-# --base 0x2000 emits @0x800 and the words land at D-mem 0x2000.
+# binary at the lowest kept-section VMA (the DMEM ORIGIN), so bin2hex
+# --base $(DMEM_BASE) emits the matching @ index and the words land at that
+# D-mem offset -- @0x800 for the default 0x2000.
 $(DMEM_BIN): $(ELF)
 	$(OBJCOPY) -O binary -j .rodata -j .data $< $@
 
@@ -163,7 +188,7 @@ $(IMEM_HEX): $(IMEM_BIN) $(BIN2HEX)
 endif
 
 $(DMEM_HEX): $(DMEM_BIN) $(BIN2HEX)
-	python3 $(BIN2HEX) --base 0x2000 $< $@
+	python3 $(BIN2HEX) --base $(DMEM_BASE) $< $@
 
 $(OBJD): $(ELF)
 	$(OBJDUMP) -d $< > $@
