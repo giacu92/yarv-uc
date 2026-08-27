@@ -46,7 +46,13 @@ module rv32imac_zicsr_zifencei #(
     // outside it raises an instruction access fault instead of aliasing
     // back into the image. Must match the I-mem instantiated at the top
     // level (native_ram's ADDR_W).
-    parameter int IMEM_ADDR_W = 14
+    parameter int IMEM_ADDR_W = 14,
+    // Branch-predictor enable. 1 = prediction-at-decode active (gshare PHT +
+    // direct pc+imm target + RAS); 0 = predictor disabled, decode emits no
+    // predicted redirect and zeroes de_t.pred_* -> execute resolves every
+    // control-flow instr with a taken redirect exactly as before the
+    // predictor existed. The A/B measurement knob and a safety fallback.
+    parameter int BP_EN = 1
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -121,6 +127,19 @@ module rv32imac_zicsr_zifencei #(
     // Execute -> fetch redirect.
     wire                    ex_branch_valid;
     wire         [XLEN-1:0] ex_branch_addr;
+    // Decode -> fetch predicted redirect (branch predictor). Lower priority
+    // than the execute redirect (priority-merged inside fetch).
+    wire                    pred_redirect_valid;
+    wire         [XLEN-1:0] pred_redirect_addr;
+
+    // Branch predictor lookup (decode -> predictor) + training (execute ->
+    // predictor). Decode queries the PHT/RAS for the control-flow instr at the
+    // buffer head; execute trains on every resolved control-flow instr. The
+    // three bundles live in rv32_pkg (bp_lookup_req_t / bp_lookup_rsp_t /
+    // bp_train_t), split by direction like mem_req_t / mem_rsp_t.
+    bp_lookup_req_t        bp_lookup_req;
+    bp_lookup_rsp_t        bp_lookup_rsp;
+    bp_train_t             bp_train;
 
     // -------------------------------------------------------------
     // Register file + decode/execute
@@ -197,6 +216,8 @@ module rv32imac_zicsr_zifencei #(
         .stall_i        (dec_stall),
         .branch_valid_i (ex_branch_valid),
         .branch_addr_i  (ex_branch_addr),
+        .pred_valid_i   (pred_redirect_valid),
+        .pred_addr_i    (pred_redirect_addr),
         .imem_req_o     (fe_req),
         .imem_rsp_i     (fe_rsp),
         .fe_instr_o     (fe_instr),
@@ -302,7 +323,9 @@ module rv32imac_zicsr_zifencei #(
         .int_cause_o     (int_cause)
     );
 
-    decode_stage u_decode (
+    decode_stage #(
+        .BP_EN(BP_EN)
+    ) u_decode (
         .clk_i          (clk_i),
         .rstn_i         (rstn_i),
         .fe_instr_i     (fe_instr),
@@ -324,6 +347,10 @@ module rv32imac_zicsr_zifencei #(
         .ex_wb_data_i   (wb_data),
         .stall_o        (dec_stall),
         .fe_pop2_o      (fe_pop2),
+        .bp_lookup_o        (bp_lookup_req),
+        .bp_lookup_i        (bp_lookup_rsp),
+        .pred_redirect_valid_o (pred_redirect_valid),
+        .pred_redirect_addr_o  (pred_redirect_addr),
         .de_o           (de_bus),
         .de_pc_o        (de_pc),
         .de_instr_o     (de_instr),
@@ -345,6 +372,7 @@ module rv32imac_zicsr_zifencei #(
         .wb_en_o             (wb_en),
         .branch_valid_o      (ex_branch_valid),
         .branch_addr_o       (ex_branch_addr),
+        .bp_train_o          (bp_train),
         .mem_req_o           (dmem_req_o),
         .mem_rsp_i           (dmem_rsp_i),
         .peri_req_o          (peri_req),
@@ -367,6 +395,22 @@ module rv32imac_zicsr_zifencei #(
         .ex_pc_o             (ex_pc),
         .ex_instr_o          (ex_instr),
         .ex_valid_o          (ex_valid)
+    );
+
+    // Branch predictor (gshare PHT + GHR + RAS). Decode queries it for the
+    // control-flow instr at the buffer head (combinational, PC+GHR only — off
+    // the regfile->forward->compare critical path); execute trains it on every
+    // resolved control-flow instr. Training at resolve, not at predict, means
+    // squashed wrong-path instructions never train it (in-order single-issue).
+    // When BP_EN=0 the decode side still queries (harmless) but emits no
+    // predicted redirect and zeroes de_t.pred_*, so execute's mispredict logic
+    // reduces to the legacy taken-redirect.
+    branch_predictor u_bp (
+        .clk_i          (clk_i),
+        .rstn_i         (rstn_i),
+        .lookup_req_i   (bp_lookup_req),
+        .lookup_rsp_o   (bp_lookup_rsp),
+        .train_i        (bp_train)
     );
 
     // ===================================================================

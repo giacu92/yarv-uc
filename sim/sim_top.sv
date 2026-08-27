@@ -35,7 +35,10 @@ module sim_top #(
     // (25_000_000 / 115_200 -> 217 clocks per bit) to check the RX
     // sampling phase at the divisor the hardware actually uses.
     parameter int unsigned UART_CLK_HZ = 50_000_000,
-    parameter int unsigned UART_BAUD   = 10_000_000
+    parameter int unsigned UART_BAUD   = 10_000_000,
+    // Branch-predictor enable A/B knob: -GBP_EN=0 disables prediction and
+    // reproduces the pre-predictor core exactly (the baseline). Default 1.
+    parameter int          BP_EN       = 1
 ) (
     input  wire       clk_i,
     input  wire       rstn_i,
@@ -98,7 +101,8 @@ module sim_top #(
     // the implemented I-mem from one outside it, which is the difference
     // between fetching an instruction and taking an access fault.
     rv32imac_zicsr_zifencei #(
-        .IMEM_ADDR_W(14)
+        .IMEM_ADDR_W(14),
+        .BP_EN(BP_EN)
     ) u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),

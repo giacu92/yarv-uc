@@ -67,6 +67,9 @@
 #define DTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_decode__DOT__##field)
 #define FTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__fetch_stage_i__DOT__##field)
 
+// Tap inside the branch predictor (u_bp).
+#define BTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_bp__DOT__##field)
+
 // Taps inside the UART peripheral (sim_top level).
 #define UTAP(field) (top->rootp->sim_top__DOT__u_uart__DOT__##field)
 
@@ -324,6 +327,13 @@ int main(int argc, char** argv) {
     long n_mem_ops = 0, n_loads = 0, n_divs = 0, n_csrs = 0, n_redirects = 0;
     bool pv_mem_req = false, pv_mem_done = false, pv_div = false;
     bool pv_csr = false, pv_redir = false;
+    // Branch-predictor event counters (rising-edge of execute's resolve/train
+    // pulses). n_bp_resolved = every resolved control-flow instr; n_bp_predt =
+    // those predicted taken at decode; n_bp_mispred = mispredict redirects.
+    // RAS hit/miss come from the predictor's own free-running counters
+    // (sampled once at the end).
+    long n_bp_resolved = 0, n_bp_predt = 0, n_bp_mispred = 0;
+    bool pv_bp_resolved = false;
     uint32_t prev_fe_pc = 0;
     bool have_prev_fe = false;
     int fe_pc_checked = 0, fe_pc_ok = 0, fe_pc_bad = 0;
@@ -400,6 +410,15 @@ int main(int argc, char** argv) {
             const bool ev_div      = XTAP(alu_start) != 0;
             const bool ev_csr      = XTAP(csr_start) != 0;
             const bool ev_redir    = XTAP(branch_valid_o) != 0;
+            // Branch predictor: cf_resolving pulses for every resolved
+            // control-flow instr (the denominator); pred_t is the prediction
+            // decode carried (valid & taken); mispredict is the execute-
+            // internal redirect-that-was-a-mispred wire. All three are flat
+            // internal wires (tapping the packed bp_train_o struct port would
+            // mean slicing a QData by hand).
+            const bool ev_bp_res   = XTAP(cf_resolving) != 0;
+            const bool ev_bp_predt = XTAP(pred_t) != 0;
+            const bool ev_bp_mis   = XTAP(mispredict) != 0;
 
             // Rising edges only: these are one-cycle pulses by construction
             // (all are gated on ex_state_q == EX_IDLE), but counting edges
@@ -409,8 +428,11 @@ int main(int argc, char** argv) {
             if (ev_div && !pv_div) ++n_divs;
             if (ev_csr && !pv_csr) ++n_csrs;
             if (ev_redir && !pv_redir) ++n_redirects;
+            if (ev_bp_res && !pv_bp_resolved) ++n_bp_resolved;
+            if (ev_bp_predt && ev_bp_res) ++n_bp_predt;   // predicted-taken, at resolve
+            if (ev_bp_mis && !pv_bp_resolved) ++n_bp_mispred;  // mispred coincides w/ resolve
             pv_mem_req = ev_mem_req; pv_mem_done = ev_mem_done; pv_div = ev_div;
-            pv_csr = ev_csr; pv_redir = ev_redir;
+            pv_csr = ev_csr; pv_redir = ev_redir; pv_bp_resolved = ev_bp_res;
 
             // NOT applied here: the redirect cycle is normally the branch's
             // own retire, and the post-edge retire test below would clear
@@ -704,6 +726,28 @@ int main(int argc, char** argv) {
         if (n_divs)
             printf(", div/rem %.2f%%", 100.0 * n_divs / retired);
         printf("\n");
+
+        // Branch-predictor stats. n_bp_resolved = every control-flow instr
+        // that reached execute's resolve (the denominator for accuracy and
+        // MPKI); n_bp_predt = those decode predicted taken; n_bp_mispred =
+        // mispredict redirects. RAS hit/miss are the predictor's own
+        // free-running counters (returns looked up at decode vs RAS
+        // non-empty). With BP_EN=0 these are all zero (no prediction).
+        if (n_bp_resolved > 0) {
+            const long correct = n_bp_resolved - n_bp_mispred;
+            printf("branch predictor: %ld resolved, %ld predicted-taken, "
+                   "%ld mispredicts (%.2f%% accuracy, %.2f MPKI)\n",
+                   n_bp_resolved, n_bp_predt, n_bp_mispred,
+                   100.0 * correct / n_bp_resolved,
+                   1000.0 * n_bp_mispred / retired);
+            const long ras_hits   = (long)BTAP(ras_hit_q);
+            const long ras_misses = (long)BTAP(ras_miss_q);
+            const long ras_tot    = ras_hits + ras_misses;
+            if (ras_tot > 0)
+                printf("  RAS: %ld returns, %ld hits / %ld misses (%.1f%% hit)\n",
+                       ras_tot, ras_hits, ras_misses,
+                       100.0 * ras_hits / ras_tot);
+        }
     }
 
     if (wfi_fail_cyc >= 0) {

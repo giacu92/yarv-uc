@@ -24,6 +24,7 @@ RTL := \
 	../src/rtl/core/decode_stage.sv \
 	../src/rtl/core/trap_unit.sv \
 	../src/rtl/core/alu.sv \
+	../src/rtl/core/branch_predictor.sv \
 	../src/rtl/core/execute_stage.sv \
 	../src/rtl/core/rv32imac_zicsr_zifencei.sv \
 	../src/rtl/utils/native_ram.sv \

@@ -8,8 +8,12 @@ built with Claude Code assistance. Implemented and sim-verified (Verilator +
 Spike co-sim) and **brought up on silicon**.
 
 A 25 MHz MS5351M reference feeds an on-chip rPLL that drives the fabric at
-**50 MHz** (`clk_core = 25 × 10/5`). Synthesis + PnR re-close at **50 MHz** on
-the 64-bit fetch-rewrite design (the pre-rewrite design closed at 40.281 MHz).
+**50 MHz** (`clk_core = 25 × 10/5`). Synthesis + PnR re-close at **50.017 MHz**
+on the 64-bit fetch-rewrite + target-span design (the pre-rewrite design closed
+at 40.281 MHz). A **branch predictor** (gshare PHT + RAS, prediction-at-decode)
+is integrated and sim-verified with a +2–4% IPC gain; its 50 MHz re-closure is
+in progress (currently 47.4 MHz — predictor-flop congestion on the forward
+path; `BP_EN=0` is the 50 MHz-clean fallback).
 
 ## Core
 
@@ -33,6 +37,13 @@ for the LSU, and AXI4-Lite kept only for peripherals.
   unified LSU FSM for loads/stores/Zilx. The LSU steers
   `addr[PERI_ADDR_BIT]` internally: `0` → native D-mem, `1` → AXI4-Lite
   peripheral bridge. Misaligned accesses trap (suppressed, not launched).
+- **Branch predictor** — gshare 2-bit PHT (64 entries) + 6-bit GHR + 8-entry
+  RAS, **prediction-at-decode**, execute as the golden resolver. JAL and
+  conditional-branch targets are direct `pc+imm` (no BTB); conditional
+  direction comes from the PHT; JALR returns use the RAS. Training fires at
+  resolve only, so wrong-path instructions never contaminate it. A correct
+  prediction issues no execute redirect (the win); a mispredict reuses the
+  existing flush/drain. `BP_EN` (default 1) is the A/B knob and fallback.
 - **CSR file (Zicsr)** — machine-mode subset (mstatus/misa/mie/mtvec/
   mscratch/mepc/mcause/mtval/mip) plus `mcycle`/`minstret`. CSRRW/S/C
   retire with `rd ← old CSR`; field semantics enforced; a dedicated
@@ -55,10 +66,20 @@ inside the CPU; the board top is pure point-to-point wiring.
 
 | Benchmark | Result |
 |---|---|
-| CoreMark | **1.88 CoreMark/MHz**, IPC 0.561 (531 025 cycles/iteration, 2K, -O3) |
-| Quicksort (256 words) | IPC 0.534, 29 675 retires in 55 617 cycles (print-free) |
+| CoreMark (`BP_EN=1`) | **~1.95 CoreMark/MHz**, IPC 0.585 (predictor on) |
+| CoreMark (`BP_EN=0`) | 1.88 CoreMark/MHz, IPC 0.563 (531 025 cycles/iteration, 2K, -O3) |
+| Dhrystone (`BP_EN=1` / `=0`) | ~0.85 / 0.82 DMIPS/MHz (IPC 0.535 / 0.519) |
+| Quicksort (256 words, print-free) | IPC 0.549 (`BP_EN=1`) / 0.538 (`BP_EN=0`), 29 675 retires |
 | CoreMark co-sim | PASS — 332 803 retires matched vs Spike |
 | Quicksort co-sim | PASS — 29 632 retires matched vs Spike |
+
+The branch predictor (`BP_EN=1`) adds **+2–4% IPC**: CoreMark +3.9%,
+Dhrystone +3.1%, quicksort +2.0%. The win is entirely **fewer redirects**
+(correct predictions cost 0 cycles; a mispredict still pays the full
+~3.1-cycle flush+refill) — redirect CPI drops ~3× (CoreMark 0.383→0.102).
+Predictor accuracy 74/84/79% (quicksort/CoreMark/Dhrystone), RAS hit
+98–100%. The architectural retire stream is identical predictor on or off
+(verified). Reproduce the A/B with the recipe in `sim/bench_ipc_ab.md`.
 
 CoreMark runs on **verbatim upstream EEMBC sources** (commit 1f483d5,
 provenance hashed in `eembc/UPSTREAM.md`; `make verify-eembc` fails the
@@ -70,10 +91,14 @@ misalignment, no fixup). At 50 MHz a rules-valid run is `ITERATIONS`
 the clock, the wrap maximum is cycle-based).
 
 The 64-bit/2-outstanding fetch rewrite removed the pre-rewrite fetch
-bottleneck (~2.2 → ~1.8 cycles/instr); remaining IPC levers are the RVC
-spanning bubble (a wider F/D), earlier branch redirect (branch target in
-decode), and prediction. The LSU request register stage costs one cycle
-per access; the registered CSR read is free (hides in the fetch bubble).
+bottleneck (~2.2 → ~1.8 cycles/instr); the branch predictor then cut the
+redirect cost (the next-largest item) ~3×. Remaining IPC levers, in yield
+order: remove the LSU request register stage (one cycle per access —
+gated on re-closing 50 MHz without it), hide the predicted-taken refill
+bubble the predictor introduced, and a finer PHT / BTB for indirect
+JALR. Together those reach ~2.5 CoreMark/MHz (CPI ~1.33); see `CLAUDE.md`
+Open work for the lever analysis. The registered CSR read is free (hides
+in the fetch bubble).
 
 ## Repository layout
 
@@ -125,22 +150,31 @@ See `CLAUDE.md` for the full remote-build workflow and Gowin CLI quirks.
 Done: Harvard split, LSU + forwarding, Zicsr, M-mode traps + all three
 interrupt sources, UART with FIFOs, silicon bring-up, 40 MHz closure
 (pre-rewrite), CoreMark, 64-bit/2-outstanding fetch + instruction buffer,
-50 MHz PnR re-closure on the fetch-rewrite design.
+50 MHz PnR re-closure on the fetch-rewrite + target-span design, **branch
+predictor (gshare PHT + GHR + RAS, prediction-at-decode)** — sim-verified,
++2–4% IPC.
 
 Remaining, in order:
 
-1. **Cache over the in-package 8 MiB SDRAM** — write-back set-associative
+1. **Predictor: 50 MHz re-closure + hide the predicted-taken refill bubble**
+   — the predictor is integrated but PnR is 47.4 MHz (predictor-flop
+   congestion on the forward path; `BP_EN=0` is the 50 MHz-clean fallback).
+   Re-close 50 MHz with `BP_EN=1`, then recover the ~0.21 CPI refill bubble
+   the predictor introduced. Together with a finer PHT/BTB this is the path
+   to ~2.5 CoreMark/MHz.
+2. **Cache over the in-package 8 MiB SDRAM** — write-back set-associative
    I/D cache behind the native interfaces; buys capacity (programs > 16 KiB),
    not speed.
-2. **GPIO** — direction/output/input registers + interrupt.
-3. **PLIC-style interrupt controller** — MEIP is one ORed level with no
+3. **GPIO** — direction/output/input registers + interrupt.
+4. **PLIC-style interrupt controller** — MEIP is one ORed level with no
    cause register; an ISR must poll with >1 external source.
-4. **Illegal-CSR-access trap** — unimplemented CSRs currently read 0 / ignore
+5. **Illegal-CSR-access trap** — unimplemented CSRs currently read 0 / ignore
    writes silently.
-5. **Vectored-mode interrupt co-sim** — direct mode only is co-simulated.
-6. **RVC spanning bubble** — one cycle per 32-bit instruction straddling a
-   word boundary; needs a wider F/D.
-7. **Co-sim MMIO gap** — the diff stops at the first UART access (Spike has
+6. **Vectored-mode interrupt co-sim** — direct mode only is co-simulated.
+7. **RVC spanning bubble** — the branch-target case is zero-bubble; the
+   sequential case (a 32-bit instr straddling a word boundary reached by
+   fall-through) still costs one cycle and needs a wider F/D / dual-issue.
+8. **Co-sim MMIO gap** — the diff stops at the first UART access (Spike has
    no UART/CLINT/MSIP slave).
 
 Deferred by choice: S/U mode + delegation, PMP, cross-word sub-word accesses.
