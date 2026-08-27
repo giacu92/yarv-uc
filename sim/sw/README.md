@@ -20,7 +20,8 @@ sim/sw/
   quicksort/        benchmark program (main.c)
   coremark/         EEMBC CoreMark (eembc/ upstream + local port layer)
   dhrystone/        Dhrystone 2.1 (sifive/ upstream + local port layer)
-  isa/              ISA oracles: ifault, isa_probe, rvc_scramble
+  isa/              ISA oracles: ifault, isa_probe, rvc_scramble,
+                    span_target, bp_pred
   intr/             trap + interrupt oracles: trap, timer, wfi_trap
   peri/             peripheral oracle: uart_echo
 ```
@@ -147,7 +148,9 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   the 14.3.0 default stands.
   **Score: 531 025 cycles/iteration = 1.88 CoreMark/MHz, IPC 0.561** (single
   iteration, 2K, -O3; 339 436 instr / 605 491 sim cyc; a 50-iteration run
-  smooths to a similar figure). CRCs `list 0xe714` /
+  smooths to a similar figure). **With the branch predictor (`BP_EN=1`,
+  2026-08-28): ~1.95 CoreMark/MHz, IPC 0.585** (+3.9% — the redirect CPI
+  drops 0.383→0.102). A/B reproduce recipe in `sim/bench_ipc_ab.md`. CRCs `list 0xe714` /
   `matrix 0x1fd7` / `state 0x8e3a` = the official 2K performance-seed values;
   `crcfinal` 0x4983 on a 2000-iteration run. At the board's 50 MHz a
   rules-valid run (≥10 s, under the 32-bit `mcycle` wrap — there is no
@@ -182,7 +185,9 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   do not exist to link against. 5.8 KiB `.text` (of 16) / 1.9 KiB `.rodata` +
   10.3 KiB `.bss`.
   **Score: 686 cycles/iteration = 0.82 DMIPS/MHz, 72 886 Dhrystones/s at
-  50 MHz** (`DHRY_ITERS=2000`, -O3; 1 372 041 ticks). All 22 of Dhrystone's
+  50 MHz** (`DHRY_ITERS=2000`, -O3; 1 372 041 ticks). **With the branch
+  predictor (`BP_EN=1`, 2026-08-28): ~0.85 DMIPS/MHz, IPC 0.535** (+3.1%).
+  All 22 of Dhrystone's
   own `should be:` final values match at every iteration count tried. The
   figure is `strcpy`-sensitive by construction — a plain byte loop measures
   891 cycles/iteration = 0.63 DMIPS/MHz on the same core — which is why the
@@ -201,6 +206,14 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   printer or any instruction under test; board bring-up probe.
 - **`isa/rvc_scramble/`** — per-scramble-bit RVC decode oracle for
   `c_expand()`.
+- **`isa/span_target/`** — same-cycle target-span stitch oracle (a 32-bit
+  instr at a 2-byte-aligned branch target); guards the zero-bubble
+  `target_span_complete` path.
+- **`isa/bp_pred/`** — branch-predictor correctness oracle (2026-08-28): 9
+  cases over every predictor path, self-checking the architectural result.
+  Guards that a prediction may mispredict freely but never alter
+  architectural state; caught the hold-buffer-survives-predicted-redirect
+  bug. Pure assembly, own `_start`, `mtvec` handler.
 - **`intr/trap/`** — standalone M-mode trap-exercise program (ecall /
   load-misaligned / illegal / MSIP + WFI).
 - **`intr/timer/`** — standalone M-mode timer-interrupt program.

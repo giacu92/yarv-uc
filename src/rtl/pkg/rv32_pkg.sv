@@ -98,6 +98,47 @@ package rv32_pkg;
     } ifetch_rsp_t;
 
     // ---------------------------------------------------------------
+    // Branch-predictor interface. Three bundles, split by direction (the
+    // same convention as mem_req_t/mem_rsp_t and ifetch_req_t/ifetch_rsp_t):
+    // one struct port per direction/source instead of a fan of individual
+    // wires on decode / execute / the predictor. The predictor is a
+    // combinational-lookup, resolve-trained block (see branch_predictor.sv).
+    //
+    //   bp_lookup_req_t : decode  -> predictor  (the CF instr at the head)
+    //   bp_lookup_rsp_t : predictor -> decode   (PHT direction + RAS top)
+    //   bp_train_t      : execute -> predictor  (one resolved CF instr)
+    // ---------------------------------------------------------------
+    // Decode -> predictor: what is at the buffer head this cycle.
+    typedef struct packed {
+        logic [XLEN-1:0] pc;    // PC of the control-flow instr (gshare index src)
+        logic            cond;  // conditional branch -> consult the PHT
+        logic            ret;   // JALR return -> consult the RAS
+    } bp_lookup_req_t;
+
+    // Predictor -> decode: the looked-up prediction.
+    typedef struct packed {
+        logic            pht_taken;   // PHT[counter].MSB (predict taken)
+        logic            ras_valid;   // RAS non-empty
+        logic [XLEN-1:0] ras_top;     // RAS top (predicted return target)
+        logic [5:0]      pht_index;   // pc[7:2]^ghr snapshot (carried in de_t)
+    } bp_lookup_rsp_t;
+
+    // Execute -> predictor: training at resolve. Kind bits are mutually
+    // exclusive; exactly the state for that kind updates. train_pht_index is
+    // the de_t snapshot so the PHT update uses the history the branch was
+    // predicted with. train_push_pc is pc-link, the return address for a push.
+    typedef struct packed {
+        logic            valid;
+        logic            cond;      // conditional -> PHT sat-update + GHR shift
+        logic            call;      // call -> RAS push push_pc
+        logic            ret;       // return -> RAS pop
+        logic            indirect;  // non-return JALR (no prediction; count only)
+        logic            taken;     // resolved taken outcome
+        logic [5:0]      pht_index;
+        logic [XLEN-1:0] push_pc;
+    } bp_train_t;
+
+    // ---------------------------------------------------------------
     // Decode: opcodes, ALU/branch/source enums, and the D/E control
     // struct. RV32I + M + C + Zilx + Zicsr + Zifencei all decode AND
     // execute; nothing in this list is stubbed out as illegal any more.
@@ -204,6 +245,21 @@ package rv32_pkg;
         CSR_RCI
     } csr_op_t;
 
+    // Branch-prediction source (which predictor produced a prediction). Rides
+    // the D/E register so execute can compare the predicted direction/target
+    // against the resolved one (mispredict) and so the sim counters attribute
+    // hits/misses. PRED_NONE = no prediction was made (decode left it to
+    // execute, the legacy path); PRED_DIRECT = unconditional JAL/c.j/c.jal or
+    // a not-taken conditional (target computed in decode as pc+imm);
+    // PRED_PHT = a conditional branch whose direction came from the gshare
+    // PHT; PRED_RAS = a JALR return whose target came from the RAS.
+    typedef enum logic [1:0] {
+        PRED_NONE,
+        PRED_DIRECT,
+        PRED_PHT,
+        PRED_RAS
+    } pred_source_t;
+
     // System-op kind (OPC_SYSTEM funct3=0 + OPC_MISC_MEM fence/fence.i).
     // Rides the D/E register so execute can pick the trap-entry / return /
     // halt / nop behaviour. SYS_NONE = not a system op.
@@ -291,6 +347,19 @@ package rv32_pkg;
         logic [XLEN-1:0] exception_cause;  // mcause for the sync trap
         logic [XLEN-1:0] exception_tval;   // mtval for the sync trap (illegal=instr, else 0)
         logic            illegal;          // opcode/encoding not decoded this phase
+        // Branch-prediction metadata (prediction-at-decode). pred_valid marks
+        // a control-flow instr decode attempted to predict; pred_taken is the
+        // speculated direction; pred_target is the taken target (valid when
+        // pred_taken); pred_source attributes the hit; pred_pht_index is the
+        // gshare index snapshot (pc[7:2]^ghr) taken at decode, carried so the
+        // PHT update at resolve uses the history the branch was predicted with
+        // (an older branch may have shifted the GHR in between). Execute
+        // compares these against the resolved outcome -> mispredict.
+        logic            pred_valid;
+        logic            pred_taken;
+        logic [XLEN-1:0] pred_target;
+        pred_source_t    pred_source;
+        logic [5:0]      pred_pht_index;
     } de_t;
 
 endpackage

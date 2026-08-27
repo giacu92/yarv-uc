@@ -247,6 +247,41 @@ branches are rare and is the whole problem at one taken branch in seven:
 | cyc / divide | — | 33.0 | 33.0 |
 | `imem-starve`, whole run | 2 cyc | 2 cyc | 2 cyc |
 
+### With the branch predictor (`BP_EN=1`)
+
+The table above is the pre-predictor core (`BP_EN=0`). The branch predictor
+(gshare PHT + GHR + RAS, prediction-at-decode, 2026-08-28) is gated by the
+sim parameter `BP_EN` (default 1) — toggle it with a clean rebuild:
+
+```
+rm -rf obj_dir && make VPARAMS="-GBP_EN=0"     # predictor off (A/B baseline)
+rm -rf obj_dir && make                          # predictor on (default)
+```
+
+With the predictor on, the **`redirect` bucket drops ~3×** (a correct
+prediction issues no execute redirect) but a new **`imem-starve` + `other`
+~0.21 CPI** appears — the kill+refill bubble on every *correct* predicted-taken
+branch, charged to `imem-starve` (no mispredict fires) instead of `redirect`.
+So the gross redirect saving (~0.28) nets to ~+0.06 CPI. CoreMark `BP_EN=1`:
+
+| cycles per retired instruction | CoreMark `BP=1` | CoreMark `BP=0` |
+|---|---|---|
+| retire (floor) | 1.000 | 1.000 |
+| + `lsu-launch` | 0.171 | 0.171 |
+| + `lsu-capture` | 0.221 | 0.221 |
+| + `redirect` | 0.102 | 0.383 |
+| + `imem-starve` | 0.105 | <0.001 |
+| + `other` | 0.105 | <0.001 |
+| + `decode-bubble` | 0.006 | — |
+| **= CPI** | **1.711** | **1.775** |
+| (IPC) | 0.585 | 0.563 |
+
+The LSU and div buckets are unchanged (memory cost is prediction-independent).
+A `branch predictor:` line prints underneath the histogram: resolved /
+predicted-taken / mispredicts / accuracy / MPKI, plus a `RAS:` hit/miss line.
+The full A/B (quicksort/CoreMark/Dhrystone, `BP=1` vs `BP=0`) and the
+copy-paste reproduce recipe are in [`bench_ipc_ab.md`](bench_ipc_ab.md).
+
 Three identities hold in every run, and they are the instrumentation's own
 proof that it is neither losing nor double-counting cycles: `lsu-capture` ==
 mem-ops (one capture cycle per load *and* store), `lsu-launch` == loads (a
@@ -298,6 +333,20 @@ cd .. && make run RUN_ARGS="+IINIT=sw/<group>/<name>/build/imem.hex +DINIT=sw/<g
 - **`sw/isa/rvc_scramble/`** — per-scramble-bit RVC decode oracle for
   `c_expand()`: every RVC immediate form with each bit set in isolation, a
   `mtvec` handler turning a mis-decoded jump into FAIL.
+- **`sw/isa/span_target/`** — same-cycle target-span stitch oracle: branches
+  to a 32-bit instr at offset 2/6 of a fetch word and self-checks; a `mtvec`
+  handler catches a mis-stitch as FAIL. Guards the zero-bubble branch-target
+  stitch path no cosim/oracle exercised.
+- **`sw/isa/bp_pred/`** — branch-predictor correctness oracle (2026-08-28):
+  9 cases (always-taken / always-NT / loop-exit mispredict / alternating /
+  correlated / RVC `c.bnez` / nested JAL+JALR call-return for RAS /
+  mispredict-with-2-reads-outstanding / ecall-trap-vs-predicted-branch
+  priority), each self-checking a known result. Guards the invariant a
+  predictor must never alter — a prediction may mispredict freely but must
+  never change architectural state; a flush/hold-buffer bug that lets a
+  wrong-path instr retire fails a `CHECK`. A `mtvec` handler resumes the one
+  expected ecall and fails any stray trap. Pass = park @ `park`, probe
+  0x800 = 0x600D. Caught the hold-buffer-survives-predicted-redirect bug.
 - **`sw/intr/trap/`** — standalone M-mode: ecall / load-misaligned / illegal /
   MSIP+WFI, self-checking @0x2000.
 - **`sw/intr/timer/`** — arms `mtimecmp=200`, `wfi`s, wakes on MTIP, handler

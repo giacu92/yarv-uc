@@ -116,6 +116,14 @@ module execute_stage (
     output wire            branch_valid_o,
     output wire [XLEN-1:0] branch_addr_o,
 
+    // Branch-predictor training (at resolve). Execute is the golden resolver:
+    // it drives the PHT/GHR/RAS update for the one control-flow instruction
+    // resolving this cycle. Kind is re-derived from branch_type + rd + rs1
+    // (call = JAL/JALR writing x1/x5; return = JALR reading x1/x5 with rd=x0;
+    // indirect = JALR otherwise). pred_pht_index is the de_t snapshot so the
+    // PHT update uses the history the branch was predicted with.
+    output wire bp_train_t bp_train_o,
+
     // Native memory interface (LSU): loads/stores/Zilx launch here.
     output mem_req_t mem_req_o,
     input  mem_rsp_t mem_rsp_i,
@@ -680,7 +688,17 @@ module execute_stage (
     end
 
     // =================================================================
-    // Branch resolve + redirect
+    // Branch resolve + redirect (with prediction check)
+    //
+    // Execute remains the golden resolver: branch_taken / branch_target are
+    // computed exactly as before. What changes is the redirect condition: a
+    // control-flow instruction that was correctly predicted taken at decode
+    // has already steered fetch, so execute does NOT redirect. execute
+    // redirects only on MISPREDICT — the predicted direction/target disagrees
+    // with the resolved one — or when there was no taken prediction (the legacy
+    // taken-redirect path, which is the BP_EN=0 behaviour). A trap / mret /
+    // interrupt always wins (trap_redirect_req) and suppresses both training
+    // and the branch redirect.
     // =================================================================
     logic branch_taken;
     always_comb begin
@@ -697,21 +715,65 @@ module execute_stage (
         endcase
     end
 
-    // Normal branch target / request (a taken JAL/JALR/branch). Gated by
-    // ~trap_redirect_req: a branch squashed by an interrupt re-runs after
-    // mret instead of redirecting now.
+    // Resolved target (unchanged): pc+imm for JAL/branch, (rs1+imm)&~1 for JALR.
     wire [XLEN-1:0] branch_target = (de_i.branch_type == BR_JALR) ?
         (de_i.rs1_data + de_i.imm) & 32'hFFFF_FFFE : (de_i.pc + de_i.imm);
 
-    wire branch_redirect_req = de_i.valid & ~de_i.illegal & (de_i.branch_type != BR_NONE) &
-        branch_taken & ~freeze & alu_result_valid & ~trap_redirect_req;
+    // A control-flow instruction is resolving this cycle (eligible to train
+    // and to mispredict-check). ~trap_redirect_req: a branch squashed by an
+    // interrupt re-runs after mret instead of resolving now.
+    wire cf_resolving = de_i.valid & ~de_i.illegal & (de_i.branch_type != BR_NONE) &
+        ~freeze & alu_result_valid & ~trap_redirect_req;
 
-    // Combined fetch redirect: a normal branch OR a trap / mret / interrupt.
-    // The trap unit's redirect_addr (from the CPU top) wins when a
-    // trap/mret/interrupt fires.
-    assign branch_valid_o = branch_redirect_req | trap_redirect_req;
-    assign branch_addr_o  = trap_redirect_req ? trap_redirect_addr_i : branch_target;
+    // Predicted-taken flag carried from decode. pred_t=0 covers both "predicted
+    // not-taken" and "no prediction" (BP_EN=0 / unpredicted JALR) — both reduce
+    // to the legacy taken-redirect when the branch is actually taken.
+    wire pred_t = de_i.pred_valid & de_i.pred_taken;
+
+    // Mispredict: predicted taken but actually not-taken (redirect to pc_link,
+    // the sequential fall-through); predicted taken with the wrong target
+    // (redirect to the resolved target — e.g. a wrong RAS return); or not
+    // predicted taken but actually taken (redirect to the resolved target —
+    // the legacy path, including every JALR call/indirect which is never
+    // target-predicted). A correct taken prediction produces no redirect.
+    wire mispredict = cf_resolving & (
+        (pred_t & ~branch_taken) |
+        (pred_t &  branch_taken & (branch_target != de_i.pred_target)) |
+        (~pred_t &  branch_taken) );
+
+    // Combined fetch redirect: a mispredict OR a trap / mret / interrupt. The
+    // trap unit's redirect_addr wins when a trap/mret/interrupt fires; else the
+    // resolved target (taken) or the sequential pc_link (a predicted-taken
+    // branch that turned out not-taken).
+    assign branch_valid_o = mispredict | trap_redirect_req;
+    assign branch_addr_o  = trap_redirect_req ? trap_redirect_addr_i
+                            : (branch_taken ? branch_target : pc_link);
     assign flush_o        = branch_valid_o;
+
+    // =================================================================
+    // Predictor training (at resolve). Drives the PHT sat-update + GHR shift
+    // (conditional), the RAS push (call) / pop (return). Kind re-derived from
+    // branch_type + rd + rs1. Trains on every resolved control-flow instr,
+    // mispredicted or not — a misprediction is exactly the outcome to learn
+    // from. Gated by cf_resolving (so a trap-squashed branch does not train).
+    // =================================================================
+    wire ex_is_cond = (de_i.branch_type inside {BR_BEQ, BR_BNE, BR_BLT,
+                                               BR_BGE, BR_BLTU, BR_BGEU});
+    wire ex_is_jalr = (de_i.branch_type == BR_JALR);
+    wire ex_is_call = ((de_i.branch_type == BR_JAL) | ex_is_jalr) &
+        (de_i.rd == 5'd1 || de_i.rd == 5'd5);
+    wire ex_is_return = ex_is_jalr &
+        (de_i.rs1_addr == 5'd1 || de_i.rs1_addr == 5'd5) & (de_i.rd == 5'd0);
+    wire ex_is_indirect = ex_is_jalr & ~ex_is_call & ~ex_is_return;
+
+    assign bp_train_o.valid    = cf_resolving;
+    assign bp_train_o.cond     = cf_resolving & ex_is_cond;
+    assign bp_train_o.call     = cf_resolving & ex_is_call;
+    assign bp_train_o.ret      = cf_resolving & ex_is_return;
+    assign bp_train_o.indirect = cf_resolving & ex_is_indirect;
+    assign bp_train_o.taken    = branch_taken;
+    assign bp_train_o.pht_index = de_i.pred_pht_index;
+    assign bp_train_o.push_pc  = pc_link;  // return address for a RAS push
 
     // =================================================================
     // E/M debug taps (retired instruction)

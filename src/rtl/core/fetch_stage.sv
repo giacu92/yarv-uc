@@ -105,6 +105,18 @@ module fetch_stage #(
     input wire            branch_valid_i,
     input wire [XLEN-1:0] branch_addr_i,
 
+    // Decode-time predicted redirect (branch predictor). Lower priority than
+    // the execute redirect: a mispredict / trap / mret / interrupt resolved in
+    // execute overrides whatever decode speculated. Routed through the same
+    // kill path as branch_valid_i — kills the buffer, points pc_q at the
+    // predicted target, arms draining for any in-flight reads. The predicted
+    // branch itself sits at the buffer head this cycle and is consumed into
+    // decode's de_q combinationally, so killing the buffer only discards the
+    // younger wrong-path entries behind it (same net effect as an execute
+    // redirect, one cycle earlier).
+    input wire            pred_valid_i,
+    input wire [XLEN-1:0] pred_addr_i,
+
     // Native 64-bit instruction-memory interface (read-only).
     output ifetch_req_t imem_req_o,
     input  ifetch_rsp_t imem_rsp_i,
@@ -159,6 +171,13 @@ module fetch_stage #(
     // Read response accepted this cycle.
     wire rsp_cap = imem_rsp_i.rvalid && imem_req_o.rready;
 
+    // Redirect priority: execute (trap/mret/mispredict, branch_valid_i) is
+    // highest; the decode prediction is subordinate and suppressed when an
+    // execute redirect fires the same cycle. Both share one kill path.
+    wire pred_redirect = pred_valid_i & ~branch_valid_i;
+    wire redirect = branch_valid_i | pred_redirect;
+    wire [XLEN-1:0] redirect_addr = branch_valid_i ? branch_addr_i : pred_addr_i;
+
     // Buffer-room accounting. reserved = count + 2*inflight <= 8 (invariant
     // maintained by the issue gate), so available is non-negative.
     wire [2:0] twice_inflight = {inflight_q, 1'b0};  // inflight * 2
@@ -168,12 +187,12 @@ module fetch_stage #(
     // Issue a fetch when idle (inflight<2), not redirecting/draining, the PC
     // is in range, and the buffer has room for the response (2 words reserved
     // per in-flight read).
-    wire bus_issue = (inflight_q < 2'd2) && (available >= 5'd2) && !branch_valid_i && !draining_q &&
+    wire bus_issue = (inflight_q < 2'd2) && (available >= 5'd2) && !redirect && !draining_q &&
         !pc_fault;
     // A fault pushes 1 word and launches no read -> its own >=1 gate. Hold it
     // off a cycle when a response is landing the same cycle so the buffer
     // never pushes more than 2 words in one cycle.
-    wire fault_push = pc_fault && (available >= 5'd1) && !branch_valid_i && !draining_q && !rsp_cap;
+    wire fault_push = pc_fault && (available >= 5'd1) && !redirect && !draining_q && !rsp_cap;
 
     // Read launch accepted this cycle.
     wire launch = bus_issue && imem_rsp_i.ready;
@@ -184,7 +203,7 @@ module fetch_stage #(
         // has room for the two words a response can push. Depends only on
         // registers (draining_q, count_q) + nothing from the slave's rvalid
         // -> no combinational loop through the I-mem.
-        imem_req_o.rready = branch_valid_i || draining_q || (count_q <= 4'd6);
+        imem_req_o.rready = redirect || draining_q || (count_q <= 4'd6);
 
         // Issue a fetch when idle (inflight<2), not redirecting/draining, the
         // PC is in range, and the buffer has room for the response (2 words
@@ -196,7 +215,7 @@ module fetch_stage #(
     // -----------------------------------------------------------------
     // 64-bit response split -> 32-bit buffer pushes (0, 1, or 2 words/cycle)
     // -----------------------------------------------------------------
-    wire do_rsp = rsp_cap && !draining_q && !branch_valid_i;
+    wire do_rsp = rsp_cap && !draining_q && !redirect;
     wire rsp_two = ~req_pc_q[2];  // target in low half -> push both words
 
     wire [XLEN-1:0] rsp_low_pc = req_pc_q;
@@ -231,7 +250,7 @@ module fetch_stage #(
     // — no underflow. stall_i / branch_valid_i zero the count, matching
     // the old 1-pop behaviour for every non-stitch case.
     // -----------------------------------------------------------------
-    wire [1:0] buf_pop_cnt = (count_q != 4'd0 && !stall_i && !branch_valid_i) ?
+    wire [1:0] buf_pop_cnt = (count_q != 4'd0 && !stall_i && !redirect) ?
         (fe_pop2_i ? 2'd2 : 2'd1) : 2'd0;
 
     // -----------------------------------------------------------------
@@ -247,9 +266,15 @@ module fetch_stage #(
         tail_d     = tail_q;
         count_d    = count_q;
 
-        if (branch_valid_i) begin
+        if (redirect) begin
             // ---- Redirect (highest priority) ----
-            pc_d    = branch_addr_i;
+            // Execute (trap/mret/mispredict) wins over a decode prediction;
+            // redirect_addr selects accordingly. Kills the buffer, points pc_q
+            // at the target, arms draining for any in-flight reads. The
+            // predicted branch at the head is consumed into decode's de_q this
+            // cycle (combinational read), so zeroing the buffer only discards
+            // the younger wrong-path entries behind it.
+            pc_d    = redirect_addr;
             head_d  = 3'd0;  // kill the buffer
             tail_d  = 3'd0;
             count_d = 4'd0;
@@ -285,7 +310,7 @@ module fetch_stage #(
         // still outstanding; it clears the cycle inflight reaches 0 (so a
         // redirect with nothing in flight costs no drain bubble, matching
         // the old flushed_q behaviour).
-        draining_d = (branch_valid_i || draining_q) && (inflight_d != 2'd0);
+        draining_d = (redirect || draining_q) && (inflight_d != 2'd0);
     end
 
     // -----------------------------------------------------------------
