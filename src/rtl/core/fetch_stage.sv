@@ -250,8 +250,8 @@ module fetch_stage #(
     // — no underflow. stall_i / branch_valid_i zero the count, matching
     // the old 1-pop behaviour for every non-stitch case.
     // -----------------------------------------------------------------
-    wire [1:0] buf_pop_cnt = (count_q != 4'd0 && !stall_i && !redirect) ?
-        (fe_pop2_i ? 2'd2 : 2'd1) : 2'd0;
+    wire [1:0]
+        buf_pop_cnt = (count_q != 4'd0 && !stall_i && !redirect) ? (fe_pop2_i ? 2'd2 : 2'd1) : 2'd0;
 
     // -----------------------------------------------------------------
     // Next-state

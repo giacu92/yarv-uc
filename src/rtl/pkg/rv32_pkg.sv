@@ -117,10 +117,10 @@ package rv32_pkg;
 
     // Predictor -> decode: the looked-up prediction.
     typedef struct packed {
-        logic            pht_taken;   // PHT[counter].MSB (predict taken)
-        logic            ras_valid;   // RAS non-empty
-        logic [XLEN-1:0] ras_top;     // RAS top (predicted return target)
-        logic [5:0]      pht_index;   // pc[7:2]^ghr snapshot (carried in de_t)
+        logic            pht_taken;  // PHT[counter].MSB (predict taken)
+        logic            ras_valid;  // RAS non-empty
+        logic [XLEN-1:0] ras_top;    // RAS top (predicted return target)
+        logic [5:0]      pht_index;  // pc[7:2]^ghr snapshot (carried in de_t)
     } bp_lookup_rsp_t;
 
     // Execute -> predictor: training at resolve. Kind bits are mutually
@@ -129,11 +129,11 @@ package rv32_pkg;
     // predicted with. train_push_pc is pc-link, the return address for a push.
     typedef struct packed {
         logic            valid;
-        logic            cond;      // conditional -> PHT sat-update + GHR shift
-        logic            call;      // call -> RAS push push_pc
-        logic            ret;       // return -> RAS pop
-        logic            indirect;  // non-return JALR (no prediction; count only)
-        logic            taken;     // resolved taken outcome
+        logic            cond;       // conditional -> PHT sat-update + GHR shift
+        logic            call;       // call -> RAS push push_pc
+        logic            ret;        // return -> RAS pop
+        logic            indirect;   // non-return JALR (no prediction; count only)
+        logic            taken;      // resolved taken outcome
         logic [5:0]      pht_index;
         logic [XLEN-1:0] push_pc;
     } bp_train_t;

@@ -102,7 +102,7 @@ module sim_top #(
     // between fetching an instruction and taking an access fault.
     rv32imac_zicsr_zifencei #(
         .IMEM_ADDR_W(14),
-        .BP_EN(BP_EN)
+        .BP_EN      (BP_EN)
     ) u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
