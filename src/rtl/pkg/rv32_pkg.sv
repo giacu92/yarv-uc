@@ -108,11 +108,17 @@ package rv32_pkg;
     //   bp_lookup_rsp_t : predictor -> decode   (PHT direction + RAS top)
     //   bp_train_t      : execute -> predictor  (one resolved CF instr)
     // ---------------------------------------------------------------
-    // Decode -> predictor: what is at the buffer head this cycle.
+    // Decode -> predictor: the control-flow instruction decode is looking at
+    // this cycle. The
+    // predictor needs no kind bits to answer: the PHT entry and the RAS top
+    // are both exported unconditionally and decode selects between them, so
+    // the only other field is the return-lookup event used by the sim-only
+    // RAS counters. It carries decode's consume condition (~stall & ~flush)
+    // because lookup_req is a held level: a return sitting at the head across
+    // an execute stall would otherwise be counted once per stall cycle.
     typedef struct packed {
-        logic [XLEN-1:0] pc;    // PC of the control-flow instr (gshare index src)
-        logic            cond;  // conditional branch -> consult the PHT
-        logic            ret;   // JALR return -> consult the RAS
+        logic [XLEN-1:0] pc;           // PC of the control-flow instr (gshare index src)
+        logic            ret_consume;  // a return lookup is consumed this cycle (stats only)
     } bp_lookup_req_t;
 
     // Predictor -> decode: the looked-up prediction.
@@ -120,7 +126,7 @@ package rv32_pkg;
         logic            pht_taken;  // PHT[counter].MSB (predict taken)
         logic            ras_valid;  // RAS non-empty
         logic [XLEN-1:0] ras_top;    // RAS top (predicted return target)
-        logic [5:0]      pht_index;  // pc[7:2]^ghr snapshot (carried in de_t)
+        logic [5:0]      pht_index;  // pc[6:1]^ghr snapshot (carried in de_t)
     } bp_lookup_rsp_t;
 
     // Execute -> predictor: training at resolve. Kind bits are mutually
@@ -132,7 +138,6 @@ package rv32_pkg;
         logic            cond;       // conditional -> PHT sat-update + GHR shift
         logic            call;       // call -> RAS push push_pc
         logic            ret;        // return -> RAS pop
-        logic            indirect;   // non-return JALR (no prediction; count only)
         logic            taken;      // resolved taken outcome
         logic [5:0]      pht_index;
         logic [XLEN-1:0] push_pc;
@@ -351,7 +356,7 @@ package rv32_pkg;
         // a control-flow instr decode attempted to predict; pred_taken is the
         // speculated direction; pred_target is the taken target (valid when
         // pred_taken); pred_source attributes the hit; pred_pht_index is the
-        // gshare index snapshot (pc[7:2]^ghr) taken at decode, carried so the
+        // gshare index snapshot (pc[6:1]^ghr) taken at decode, carried so the
         // PHT update at resolve uses the history the branch was predicted with
         // (an older branch may have shifted the GHR in between). Execute
         // compares these against the resolved outcome -> mispredict.

@@ -120,7 +120,7 @@ module execute_stage (
     // it drives the PHT/GHR/RAS update for the one control-flow instruction
     // resolving this cycle. Kind is re-derived from branch_type + rd + rs1
     // (call = JAL/JALR writing x1/x5; return = JALR reading x1/x5 with rd=x0;
-    // indirect = JALR otherwise). pred_pht_index is the de_t snapshot so the
+    // JALR with rs1 in {x1,x5} and rd=x0). pred_pht_index is the de_t snapshot so the
     // PHT update uses the history the branch was predicted with.
     output wire bp_train_t bp_train_o,
 
@@ -762,13 +762,11 @@ module execute_stage (
         (de_i.rd == 5'd1 || de_i.rd == 5'd5);
     wire ex_is_return = ex_is_jalr & (de_i.rs1_addr == 5'd1 || de_i.rs1_addr == 5'd5) &
         (de_i.rd == 5'd0);
-    wire ex_is_indirect = ex_is_jalr & ~ex_is_call & ~ex_is_return;
 
     assign bp_train_o.valid     = cf_resolving;
     assign bp_train_o.cond      = cf_resolving & ex_is_cond;
     assign bp_train_o.call      = cf_resolving & ex_is_call;
     assign bp_train_o.ret       = cf_resolving & ex_is_return;
-    assign bp_train_o.indirect  = cf_resolving & ex_is_indirect;
     assign bp_train_o.taken     = branch_taken;
     assign bp_train_o.pht_index = de_i.pred_pht_index;
     assign bp_train_o.push_pc   = pc_link;  // return address for a RAS push
