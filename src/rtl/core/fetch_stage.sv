@@ -62,10 +62,22 @@ import rv32_pkg::*;
  *   reserved     = count + 2*inflight  (always <= 8 by invariant)
  *   available    = 8 - reserved
  *   bus_issue    = inflight<2 && available>=2 && !redirect && !drain && !fault
- *   fault_push   = pc_fault && available>=1 && !redirect && !drain && !rsp_cap
+ *   fault_push   = pc_fault && available>=1 && !drain && !rsp_cap
  * A fault pushes exactly 1 word and launches no read -> its own >=1 gate,
  * and it is deferred a cycle when a response is landing the same cycle so
  * the buffer never pushes more than 2 words in one cycle.
+ *
+ * Timing rule -- `redirect` stays OFF the buffer write path: with a decode
+ * predictor, `redirect` is no longer a pure flop output. pred_valid_i is
+ * combinational in the buffer head (head_q -> read mux -> c_expand -> decode
+ * -> PHT -> pred_target), so every signal `redirect` feeds inherits that
+ * whole path. It is therefore kept out of `rready`, `do_rsp`, `fault_push`,
+ * `push_cnt` (the buf_*_q write enables) and `buf_pop_cnt`, and used only on
+ * `bus_issue` (one module output + the 2-bit inflight counter) and in the
+ * next-state `if (redirect)` branch that already muxed pc_d. That is not a
+ * relaxation of correctness -- see "Redirect" below for why each term was
+ * redundant. Putting it back cost ~1.5 ns of setup slack at 50 MHz: 17 of
+ * the 25 worst PnR paths ran head_q -> buf_fault_q/D through the decoder.
  *
  * Registers:
  *   - pc_q / req_pc_q : next fetch address / in-flight read address.
@@ -76,8 +88,22 @@ import rv32_pkg::*;
  *
  * Redirect (branch_valid_i, highest priority): kills the buffer (count=0,
  * head=tail=0), points pc_q at the target, arms draining for any in-flight
- * reads. rready is forced so a stale response landing the same cycle is
- * discarded. No launch, no push, no pop on the redirect cycle.
+ * reads. No launch on the redirect cycle (bus_issue is gated).
+ *
+ * A push or a pop may still *happen* on the redirect cycle, and both are
+ * harmless -- which is what lets `redirect` stay off those paths:
+ *   - Push: the redirect branch forces head_d = tail_d = count_d = 0, so a
+ *     stale word written at the old tail_q lands in a slot that is
+ *     unreachable. Refilling restarts at slot 0 and the FIFO invariant is
+ *     "a slot is written before it becomes readable", so the stale word is
+ *     always overwritten before head can reach it.
+ *   - Pop: buf_pop_cnt feeds head_d/count_d only inside the non-redirect
+ *     else branch, which the redirect branch overrides wholesale.
+ *   - Held response: rready no longer forces high on a redirect, so a
+ *     response landing while count_q >= 7 is left in the I-mem skid instead
+ *     of being discarded. inflight then stays non-zero, draining_q arms, and
+ *     it is consumed one cycle later under the drain -- count_q is 0 by then,
+ *     so rready is high anyway. Same net effect, one cycle later.
  *
  * stall_i: decode back-pressure. While high the head is held (no pop); fetch
  * keeps running ahead into the buffer (up to 8 words), then stops issuing
@@ -192,18 +218,19 @@ module fetch_stage #(
     // A fault pushes 1 word and launches no read -> its own >=1 gate. Hold it
     // off a cycle when a response is landing the same cycle so the buffer
     // never pushes more than 2 words in one cycle.
-    wire fault_push = pc_fault && (available >= 5'd1) && !redirect && !draining_q && !rsp_cap;
+    wire fault_push = pc_fault && (available >= 5'd1) && !draining_q && !rsp_cap;
 
     // Read launch accepted this cycle.
     wire launch = bus_issue && imem_rsp_i.ready;
 
     always_comb begin
-        // Accept read data when draining stale responses (discard), on a
-        // redirect (discard the one landing now), or whenever the buffer
-        // has room for the two words a response can push. Depends only on
-        // registers (draining_q, count_q) + nothing from the slave's rvalid
-        // -> no combinational loop through the I-mem.
-        imem_req_o.rready = redirect || draining_q || (count_q <= 4'd6);
+        // Accept read data when draining stale responses (discard) or
+        // whenever the buffer has room for the two words a response can
+        // push. Depends only on registers (draining_q, count_q) + nothing
+        // from the slave's rvalid -> no combinational loop through the I-mem,
+        // and deliberately NOT on redirect (see the timing rule in the header:
+        // pred_valid_i drags the whole decoder onto anything redirect feeds).
+        imem_req_o.rready = draining_q || (count_q <= 4'd6);
 
         // Issue a fetch when idle (inflight<2), not redirecting/draining, the
         // PC is in range, and the buffer has room for the response (2 words
@@ -215,7 +242,7 @@ module fetch_stage #(
     // -----------------------------------------------------------------
     // 64-bit response split -> 32-bit buffer pushes (0, 1, or 2 words/cycle)
     // -----------------------------------------------------------------
-    wire do_rsp = rsp_cap && !draining_q && !redirect;
+    wire do_rsp = rsp_cap && !draining_q;
     wire rsp_two = ~req_pc_q[2];  // target in low half -> push both words
 
     wire [XLEN-1:0] rsp_low_pc = req_pc_q;
@@ -243,15 +270,15 @@ module fetch_stage #(
     wire [1:0] push_cnt = do_rsp ? (rsp_two ? 2'd2 : 2'd1) : fault_push ? 2'd1 : 2'd0;
 
     // -----------------------------------------------------------------
-    // Buffer pop: decode consumes the head when it is not back-pressuring
-    // and not the redirect cycle. A same-cycle target-span stitch pops 2
-    // (head + head+1, the stitch word + its consumed low half); fe_pop2_i
-    // is only asserted when fe_next_valid_o (count>=2), so pop-2 <= count
-    // — no underflow. stall_i / branch_valid_i zero the count, matching
-    // the old 1-pop behaviour for every non-stitch case.
+    // Buffer pop: decode consumes the head when it is not back-pressuring.
+    // A same-cycle target-span stitch pops 2 (head + head+1, the stitch word
+    // + its consumed low half); fe_pop2_i is only asserted when
+    // fe_next_valid_o (count>=2), so pop-2 <= count — no underflow.
+    // No !redirect term: buf_pop_cnt is read only inside the non-redirect
+    // else branch below, which the redirect branch overrides wholesale, so
+    // the term was dead logic on the pred_valid_i path.
     // -----------------------------------------------------------------
-    wire [1:0]
-        buf_pop_cnt = (count_q != 4'd0 && !stall_i && !redirect) ? (fe_pop2_i ? 2'd2 : 2'd1) : 2'd0;
+    wire [1:0] buf_pop_cnt = (count_q != 4'd0 && !stall_i) ? (fe_pop2_i ? 2'd2 : 2'd1) : 2'd0;
 
     // -----------------------------------------------------------------
     // Next-state
@@ -278,8 +305,10 @@ module fetch_stage #(
             head_d  = 3'd0;  // kill the buffer
             tail_d  = 3'd0;
             count_d = 4'd0;
-            // No launch/push/pop this cycle; a landing response is stale and
-            // discarded (rready is high). inflight is updated below.
+            // No launch this cycle (bus_issue is gated on !redirect). A
+            // push may still land at the old tail_q and a pop may still be
+            // computed: both are harmless because head/tail/count are zeroed
+            // here (see the header). inflight is updated below.
         end else if (draining_q) begin
             // ---- Drain stale in-flight responses (discard) ----
             // No push, no pop, no launch. rready is high so the I-mem skid
