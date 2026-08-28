@@ -669,13 +669,13 @@ module decode_stage #(
     // (data-dependent) so they are not predicted here -- returns use the RAS,
     // calls/indirect fall to execute (a call still pushes the RAS at resolve,
     // where execute re-derives the kind from branch_type/rd).
-    logic          is_cf, is_cond_cf, is_return_cf;
-    logic          pred_valid;
-    logic          pred_taken;
-    logic [XLEN-1:0] pred_target;
-    pred_source_t  pred_source;
-    logic [5:0]    pred_pht_index;
-    logic [XLEN-1:0] pred_dir_target;  // src_pc + imm (PC-relative target)
+    logic is_cf, is_cond_cf, is_return_cf;
+    logic                    pred_valid;
+    logic                    pred_taken;
+    logic         [XLEN-1:0] pred_target;
+    pred_source_t            pred_source;
+    logic         [     5:0] pred_pht_index;
+    logic         [XLEN-1:0] pred_dir_target;  // src_pc + imm (PC-relative target)
 
     // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
     // and driven with a default every cycle in the decode always_comb below:
@@ -1276,11 +1276,11 @@ module decode_stage #(
         // Classify the control-flow instruction at the head. branch_type is
         // BR_NONE for a fault (the don't-care word decodes to no opcode) and is
         // squashed to BR_NONE for an illegal below, so is_cf gates both out.
-        is_cf        = decoded_valid & ~dec_illegal & (branch_type != BR_NONE);
-        is_cond_cf   = is_cf & (branch_type inside {BR_BEQ, BR_BNE, BR_BLT,
-                                                    BR_BGE, BR_BLTU, BR_BGEU});
-        is_return_cf = is_cf & (branch_type == BR_JALR) &
-            (rs1_field == 5'd1 || rs1_field == 5'd5) & (rd_field == 5'd0);
+        is_cf = decoded_valid & ~dec_illegal & (branch_type != BR_NONE);
+        is_cond_cf = is_cf &
+            (branch_type inside {BR_BEQ, BR_BNE, BR_BLT, BR_BGE, BR_BLTU, BR_BGEU});
+        is_return_cf = is_cf & (branch_type == BR_JALR) & (rs1_field == 5'd1 || rs1_field == 5'd5) &
+            (rd_field == 5'd0);
 
         // Direct PC-relative target for JAL and conditional branches (imm is
         // imm_j / imm_b respectively, set above). JALR targets are rs1+imm --
@@ -1291,18 +1291,18 @@ module decode_stage #(
         // instruction (records NT predictions and unpredicted JALR for uniform
         // mispredict accounting in execute); pred_taken is the speculated
         // direction; pred_target is the taken target (valid when pred_taken).
-        pred_valid     = is_cf;
-        pred_source    = PRED_NONE;
-        pred_taken     = 1'b0;
-        pred_target    = '0;
+        pred_valid = is_cf;
+        pred_source = PRED_NONE;
+        pred_taken = 1'b0;
+        pred_target = '0;
         pred_pht_index = 6'd0;
         if (is_cf) begin
             if (is_return_cf) begin
                 // Return: target from the RAS; taken only if the RAS has an
                 // entry (else fall back to execute, the legacy path).
-                pred_source    = PRED_RAS;
-                pred_taken     = bp_lookup_i.ras_valid;
-                pred_target    = bp_lookup_i.ras_top;
+                pred_source = PRED_RAS;
+                pred_taken  = bp_lookup_i.ras_valid;
+                pred_target = bp_lookup_i.ras_top;
             end else if (is_cond_cf) begin
                 // Conditional: direction from the gshare PHT, target pc+imm.
                 pred_source    = PRED_PHT;
@@ -1311,9 +1311,9 @@ module decode_stage #(
                 pred_pht_index = bp_lookup_i.pht_index;
             end else if (branch_type == BR_JAL) begin
                 // Unconditional JAL / c.j / c.jal: always taken, pc+imm.
-                pred_source    = PRED_DIRECT;
-                pred_taken     = 1'b1;
-                pred_target    = pred_dir_target;
+                pred_source = PRED_DIRECT;
+                pred_taken  = 1'b1;
+                pred_target = pred_dir_target;
             end
             // JALR call / indirect (JALR, not a return): no target prediction
             // (rs1+imm is data-dependent); pred_taken stays 0 and execute
@@ -1352,11 +1352,11 @@ module decode_stage #(
         // zero the metadata so execute resolves every control-flow instruction
         // exactly as before (pred_valid=0 -> pred_t=0 -> mispredict reduces to
         // the legacy taken-redirect, and no predicted redirect fires).
-        de_d.pred_valid     = (BP_EN != 0) & pred_valid;
-        de_d.pred_taken     = (BP_EN != 0) & pred_taken;
-        de_d.pred_target    = (BP_EN != 0) ? pred_target : '0;
-        de_d.pred_source    = (BP_EN != 0) ? pred_source : PRED_NONE;
-        de_d.pred_pht_index = (BP_EN != 0) ? pred_pht_index : 6'd0;
+        de_d.pred_valid      = (BP_EN != 0) & pred_valid;
+        de_d.pred_taken      = (BP_EN != 0) & pred_taken;
+        de_d.pred_target     = (BP_EN != 0) ? pred_target : '0;
+        de_d.pred_source     = (BP_EN != 0) ? pred_source : PRED_NONE;
+        de_d.pred_pht_index  = (BP_EN != 0) ? pred_pht_index : 6'd0;
         // reg_write / mem_read / mem_write / csr_wren are squashed by
         // illegal. A spanning stitch decodes a real 32-bit instr through
         // the uniform decoder, so spanning no longer forces illegal.
@@ -1472,18 +1472,18 @@ module decode_stage #(
     // =================================================================
     wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
     wire backpressure_stall = stall_i;
-    assign stall_o    = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
+    assign stall_o          = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
 
     // Same-cycle target-span stitch: pop 2 (head + head+1). target_span_complete
     // has hold_q=0 so resource_stall=0; only stall_i back-pressures, which fetch
     // already gates out of buf_pop_cnt. Asserted only when fe_next_valid_i
     // (count>=2) -> pop-2 <= count.
-    assign fe_pop2_o  = target_span_complete;
+    assign fe_pop2_o        = target_span_complete;
 
     // Branch-predictor lookup outputs (PC + kind, no register data).
-    assign bp_lookup_o.pc  = src_pc;
+    assign bp_lookup_o.pc   = src_pc;
     assign bp_lookup_o.cond = is_cond_cf;
-    assign bp_lookup_o.ret = is_return_cf;
+    assign bp_lookup_o.ret  = is_return_cf;
 
     // Predicted redirect to fetch: fire the cycle a control-flow instruction
     // at the head is consumed into de_d (~stall_i, ~flush_i) and predicted
@@ -1500,16 +1500,16 @@ module decode_stage #(
     assign pred_redirect_addr_o  = pred_target;
 
     // Register-read addresses drive the reg file.
-    assign rs1_addr_o = rs1_addr_dec;
-    assign rs2_addr_o = rs2_addr_dec;
+    assign rs1_addr_o            = rs1_addr_dec;
+    assign rs2_addr_o            = rs2_addr_dec;
 
     // D/E output
-    assign de_o       = de_q;
+    assign de_o                  = de_q;
 
     // de_* per-stage taps (fields of de_o / de_q).
-    assign de_pc_o    = de_q.pc;
-    assign de_instr_o = de_q.instr;
-    assign de_valid_o = de_q.valid;
+    assign de_pc_o               = de_q.pc;
+    assign de_instr_o            = de_q.instr;
+    assign de_valid_o            = de_q.valid;
 
     // =================================================================
     // Sequential

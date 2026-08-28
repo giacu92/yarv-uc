@@ -103,43 +103,43 @@ module rv32imac_zicsr_zifencei #(
     // Fetch owns the I-mem port uncontended (Harvard). fe_* = fetch native
     // side -> imem_req_o/imem_rsp_i (64-bit read-only ifetch interface).
     // -------------------------------------------------------------
-    ifetch_req_t            fe_req;
-    ifetch_rsp_t            fe_rsp;
+    ifetch_req_t               fe_req;
+    ifetch_rsp_t               fe_rsp;
     // LSU native peri side -> the peri bridge -> axi_peri.
-    mem_req_t               peri_req;
-    mem_rsp_t               peri_rsp;
+    mem_req_t                  peri_req;
+    mem_rsp_t                  peri_rsp;
 
     // F/D pipeline-register taps, consumed by the decode stage below.
-    wire         [XLEN-1:0] fe_pc;
-    wire         [XLEN-1:0] fe_instr;
-    wire                    fe_valid;
-    wire                    fe_fault;
+    wire            [XLEN-1:0] fe_pc;
+    wire            [XLEN-1:0] fe_instr;
+    wire                       fe_valid;
+    wire                       fe_fault;
     // Buffer head+1 taps (same-cycle RVC spanning stitch) + the decode->fetch
     // pop-2 handshake for the stitch.
-    wire         [XLEN-1:0] fe_next_instr;
-    wire         [XLEN-1:0] fe_next_pc;
-    wire                    fe_next_valid;
-    wire                    fe_next_fault;
-    wire                    fe_pop2;
+    wire            [XLEN-1:0] fe_next_instr;
+    wire            [XLEN-1:0] fe_next_pc;
+    wire                       fe_next_valid;
+    wire                       fe_next_fault;
+    wire                       fe_pop2;
 
     // Decode -> fetch back-pressure (propagates execute's stall).
-    wire                    dec_stall;
+    wire                       dec_stall;
     // Execute -> fetch redirect.
-    wire                    ex_branch_valid;
-    wire         [XLEN-1:0] ex_branch_addr;
+    wire                       ex_branch_valid;
+    wire            [XLEN-1:0] ex_branch_addr;
     // Decode -> fetch predicted redirect (branch predictor). Lower priority
     // than the execute redirect (priority-merged inside fetch).
-    wire                    pred_redirect_valid;
-    wire         [XLEN-1:0] pred_redirect_addr;
+    wire                       pred_redirect_valid;
+    wire            [XLEN-1:0] pred_redirect_addr;
 
     // Branch predictor lookup (decode -> predictor) + training (execute ->
     // predictor). Decode queries the PHT/RAS for the control-flow instr at the
     // buffer head; execute trains on every resolved control-flow instr. The
     // three bundles live in rv32_pkg (bp_lookup_req_t / bp_lookup_rsp_t /
     // bp_train_t), split by direction like mem_req_t / mem_rsp_t.
-    bp_lookup_req_t        bp_lookup_req;
-    bp_lookup_rsp_t        bp_lookup_rsp;
-    bp_train_t             bp_train;
+    bp_lookup_req_t            bp_lookup_req;
+    bp_lookup_rsp_t            bp_lookup_rsp;
+    bp_train_t                 bp_train;
 
     // -------------------------------------------------------------
     // Register file + decode/execute
@@ -150,31 +150,31 @@ module rv32imac_zicsr_zifencei #(
     // drives the reg-file write port (ALU / PC4 writeback), the fetch
     // redirect, and decode's stall (div) / flush (branch).
     // -------------------------------------------------------------
-    wire         [     4:0] rs1_addr;
-    wire         [     4:0] rs2_addr;
-    wire         [XLEN-1:0] rs1_data;
-    wire         [XLEN-1:0] rs2_data;
+    wire            [     4:0] rs1_addr;
+    wire            [     4:0] rs2_addr;
+    wire            [XLEN-1:0] rs1_data;
+    wire            [XLEN-1:0] rs2_data;
 
-    wire         [     4:0] wb_addr;
-    wire         [XLEN-1:0] wb_data;
-    wire                    wb_en;
+    wire            [     4:0] wb_addr;
+    wire            [XLEN-1:0] wb_data;
+    wire                       wb_en;
 
-    de_t                    de_bus;
+    de_t                       de_bus;
 
     // de_* D/E taps (decode stage outputs). Debug only — left
     // unconnected here; the sim probes them via the Verilator hierarchy.
-    wire         [XLEN-1:0] de_pc;
-    wire         [XLEN-1:0] de_instr;
-    wire                    de_valid;
+    wire            [XLEN-1:0] de_pc;
+    wire            [XLEN-1:0] de_instr;
+    wire                       de_valid;
 
     // Execute -> decode back-pressure / flush.
-    wire                    ex_stall;
-    wire                    ex_flush;
+    wire                       ex_stall;
+    wire                       ex_flush;
 
     // CSR
-    wire         [XLEN-1:0] csr_wdata;
-    wire                    csr_we;
-    wire         [XLEN-1:0] csr_rdata;
+    wire            [XLEN-1:0] csr_wdata;
+    wire                       csr_we;
+    wire            [XLEN-1:0] csr_rdata;
 
     // CSR taps (trap unit reads mtvec / mepc / mstatus / mip / mie).
     wire [XLEN-1:0] csr_mtvec, csr_mepc, csr_mstatus, csr_mip, csr_mie;
@@ -326,35 +326,35 @@ module rv32imac_zicsr_zifencei #(
     decode_stage #(
         .BP_EN(BP_EN)
     ) u_decode (
-        .clk_i          (clk_i),
-        .rstn_i         (rstn_i),
-        .fe_instr_i     (fe_instr),
-        .fe_pc_i        (fe_pc),
-        .fe_valid_i     (fe_valid),
-        .fe_fault_i     (fe_fault),
-        .fe_next_instr_i(fe_next_instr),
-        .fe_next_pc_i   (fe_next_pc),
-        .fe_next_valid_i(fe_next_valid),
-        .fe_next_fault_i(fe_next_fault),
-        .rs1_addr_o     (rs1_addr),
-        .rs2_addr_o     (rs2_addr),
-        .rs1_data_i     (rs1_data),
-        .rs2_data_i     (rs2_data),
-        .stall_i        (ex_stall),
-        .flush_i        (ex_flush),
-        .ex_wb_en_i     (wb_en),
-        .ex_wb_addr_i   (wb_addr),
-        .ex_wb_data_i   (wb_data),
-        .stall_o        (dec_stall),
-        .fe_pop2_o      (fe_pop2),
-        .bp_lookup_o        (bp_lookup_req),
-        .bp_lookup_i        (bp_lookup_rsp),
-        .pred_redirect_valid_o (pred_redirect_valid),
-        .pred_redirect_addr_o  (pred_redirect_addr),
-        .de_o           (de_bus),
-        .de_pc_o        (de_pc),
-        .de_instr_o     (de_instr),
-        .de_valid_o     (de_valid)
+        .clk_i                (clk_i),
+        .rstn_i               (rstn_i),
+        .fe_instr_i           (fe_instr),
+        .fe_pc_i              (fe_pc),
+        .fe_valid_i           (fe_valid),
+        .fe_fault_i           (fe_fault),
+        .fe_next_instr_i      (fe_next_instr),
+        .fe_next_pc_i         (fe_next_pc),
+        .fe_next_valid_i      (fe_next_valid),
+        .fe_next_fault_i      (fe_next_fault),
+        .rs1_addr_o           (rs1_addr),
+        .rs2_addr_o           (rs2_addr),
+        .rs1_data_i           (rs1_data),
+        .rs2_data_i           (rs2_data),
+        .stall_i              (ex_stall),
+        .flush_i              (ex_flush),
+        .ex_wb_en_i           (wb_en),
+        .ex_wb_addr_i         (wb_addr),
+        .ex_wb_data_i         (wb_data),
+        .stall_o              (dec_stall),
+        .fe_pop2_o            (fe_pop2),
+        .bp_lookup_o          (bp_lookup_req),
+        .bp_lookup_i          (bp_lookup_rsp),
+        .pred_redirect_valid_o(pred_redirect_valid),
+        .pred_redirect_addr_o (pred_redirect_addr),
+        .de_o                 (de_bus),
+        .de_pc_o              (de_pc),
+        .de_instr_o           (de_instr),
+        .de_valid_o           (de_valid)
     );
 
     execute_stage u_execute (
@@ -406,11 +406,11 @@ module rv32imac_zicsr_zifencei #(
     // predicted redirect and zeroes de_t.pred_*, so execute's mispredict logic
     // reduces to the legacy taken-redirect.
     branch_predictor u_bp (
-        .clk_i          (clk_i),
-        .rstn_i         (rstn_i),
-        .lookup_req_i   (bp_lookup_req),
-        .lookup_rsp_o   (bp_lookup_rsp),
-        .train_i        (bp_train)
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .lookup_req_i(bp_lookup_req),
+        .lookup_rsp_o(bp_lookup_rsp),
+        .train_i     (bp_train)
     );
 
     // ===================================================================

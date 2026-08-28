@@ -92,12 +92,12 @@ module native_ram #(
     // -----------------------------------------------------------------
     // Local params
     // -----------------------------------------------------------------
-    localparam int DATA_W      = DATA_WIDTH;
-    localparam int STRB_W      = DATA_W / 8;               // bytes per word
-    localparam int BYTES_W     = $clog2(STRB_W);           // byte-select bits
+    localparam int DATA_W = DATA_WIDTH;
+    localparam int STRB_W = DATA_W / 8;  // bytes per word
+    localparam int BYTES_W = $clog2(STRB_W);  // byte-select bits
     localparam int WORD_ADDR_W = ADDR_W - BYTES_W;
     localparam int DEPTH_WORDS = 1 << WORD_ADDR_W;
-    localparam int CNT_W       = $clog2(OUTSTANDING + 1);  // 0..OUTSTANDING
+    localparam int CNT_W = $clog2(OUTSTANDING + 1);  // 0..OUTSTANDING
 
 `ifdef VERILATOR
     initial
