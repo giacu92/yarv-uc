@@ -54,7 +54,7 @@ COMMON_DIR := $(patsubst %/,%,$(dir $(realpath $(lastword $(MAKEFILE_LIST)))))
 # cover, and it defaults to PIE). Override RISCV_PREFIX to point at another
 # rv32-capable toolchain (e.g. the PlatformIO/esphome bare-metal
 # riscv32-esp-elf, riscv64-unknown-elf, riscv-none-elf) if preferred.
-RISCV_PREFIX ?= $(HOME)/_toolchains/riscv32-ilp32d--glibc--stable-2025.08-1/bin/riscv32-buildroot-linux-gnu
+RISCV_PREFIX ?= $(HOME)/_toolchains/riscv32-zilx/out/bin/riscv32-unknown-elf
 
 CC      := $(RISCV_PREFIX)-gcc
 OBJCOPY := $(RISCV_PREFIX)-objcopy

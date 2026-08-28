@@ -14,7 +14,7 @@
 # Default: buildroot glibc rv32 toolchain (gcc 14.3.0). Override
 # RISCV_PREFIX to point at another rv32-capable toolchain (e.g.
 # riscv64-unknown-elf, riscv-none-elf) if you have one on PATH.
-RISCV_PREFIX ?= $(HOME)/_toolchains/riscv32-ilp32d--glibc--stable-2025.08-1/bin/riscv32-buildroot-linux-gnu
+RISCV_PREFIX ?= $(HOME)/_toolchains/riscv32-zilx/out/bin/riscv32-unknown-elf
 
 CC      := $(RISCV_PREFIX)-gcc
 OBJCOPY := $(RISCV_PREFIX)-objcopy

@@ -38,7 +38,7 @@ this tree, not inside it — `top_module.sv` loads
 ## Toolchain
 
 Default: buildroot glibc `riscv32-buildroot-linux-gnu` (gcc 14.3.0) at
-`~/_toolchains/riscv32-ilp32d--glibc--stable-2025.08-1`. Override
+`~/_toolchains/riscv32-zilx/out`. Override
 `RISCV_PREFIX` for another rv32 toolchain (`riscv64-unknown-elf`,
 `riscv-none-elf`, ...):
 
