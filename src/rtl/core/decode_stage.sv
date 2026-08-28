@@ -1472,18 +1472,22 @@ module decode_stage #(
     // =================================================================
     wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
     wire backpressure_stall = stall_i;
-    assign stall_o          = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
+    assign stall_o                 = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
 
     // Same-cycle target-span stitch: pop 2 (head + head+1). target_span_complete
     // has hold_q=0 so resource_stall=0; only stall_i back-pressures, which fetch
     // already gates out of buf_pop_cnt. Asserted only when fe_next_valid_i
     // (count>=2) -> pop-2 <= count.
-    assign fe_pop2_o        = target_span_complete;
+    assign fe_pop2_o               = target_span_complete;
 
-    // Branch-predictor lookup outputs (PC + kind, no register data).
-    assign bp_lookup_o.pc   = src_pc;
-    assign bp_lookup_o.cond = is_cond_cf;
-    assign bp_lookup_o.ret  = is_return_cf;
+    // Branch-predictor lookup outputs (PC only, no register data). The
+    // predictor exports the PHT entry and the RAS top unconditionally and the
+    // selection above picks between them, so no kind bits are needed. The one
+    // extra field is the sim-only return-lookup event, which carries decode's
+    // consume condition: bp_lookup_o is a held level, so a return waiting out
+    // an execute stall must not be counted once per waiting cycle.
+    assign bp_lookup_o.pc          = src_pc;
+    assign bp_lookup_o.ret_consume = is_return_cf & ~stall_i & ~flush_i;
 
     // Predicted redirect to fetch: fire the cycle a control-flow instruction
     // at the head is consumed into de_d (~stall_i, ~flush_i) and predicted

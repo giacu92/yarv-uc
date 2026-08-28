@@ -28,7 +28,7 @@ import rv32_pkg::*;
  * speculative outcomes. In-order single-issue means a squashed instruction
  * never resolves, so there is no wrong-path contamination of the PHT/GHR/RAS.
  * The PHT update is indexed by the gshare snapshot carried in de_t
- * (pred_pht_index = pc[7:2]^ghr at decode time), not the live GHR — an older
+ * (pred_pht_index = pc[6:1]^ghr at decode time), not the live GHR — an older
  * branch may have shifted the GHR between this branch's decode and its
  * resolve, and the update must use the history the branch was predicted with.
  *
@@ -53,9 +53,11 @@ module branch_predictor (
 
     // -------------------------------------------------------------------
     // Lookup port (decode, combinational). Decode presents the PC of the
-    // control-flow instruction at the buffer head plus its kind; the
-    // predictor returns the PHT direction bit (conditional), the RAS top
-    // (return), and the gshare index snapshot to carry in de_t.
+    // control-flow instruction at the buffer head; the predictor returns the
+    // gshare PHT direction bit, the RAS top + valid, and the gshare index
+    // snapshot to carry in de_t. All four are returned unconditionally --
+    // decode knows the instruction kind and selects -- so the request needs
+    // no kind bits (the one extra field is the sim-only RAS-counter event).
     // -------------------------------------------------------------------
     input  wire bp_lookup_req_t lookup_req_i,
     output wire bp_lookup_rsp_t lookup_rsp_o,
@@ -71,13 +73,10 @@ module branch_predictor (
     // Field aliases — keep the body reading the same names as the old per-
     // wire port list, so the lookup/train logic below is unchanged.
     wire [XLEN-1:0] lookup_pc_i = lookup_req_i.pc;
-    wire            lookup_cond_i = lookup_req_i.cond;
-    wire            lookup_return_i = lookup_req_i.ret;
     wire            train_valid_i = train_i.valid;
     wire            train_cond_i = train_i.cond;
     wire            train_call_i = train_i.call;
     wire            train_return_i = train_i.ret;
-    wire            train_indirect_i = train_i.indirect;
     wire            train_taken_i = train_i.taken;
     wire [     5:0] train_pht_index_i = train_i.pht_index;
     wire [XLEN-1:0] train_push_pc_i = train_i.push_pc;
@@ -98,7 +97,11 @@ module branch_predictor (
     // -------------------------------------------------------------------
     // Lookup (combinational, PC + GHR only)
     // -------------------------------------------------------------------
-    wire  [      5:0] lookup_index = lookup_pc_i[7:2] ^ ghr_q;
+    // gshare index. pc[6:1], not pc[7:2]: IALIGN is 16 with the C extension,
+    // so pc[1] is a real address bit — dropping it folds two compressed
+    // branches 2 bytes apart onto one PHT entry. pc[6:1] covers the same 64
+    // entries without that aliasing.
+    wire  [      5:0] lookup_index = lookup_pc_i[6:1] ^ ghr_q;
     // Top = most-recently-pushed entry = slot (ptr - 1). When empty the top is
     // a don't-care (ras_valid=0 gates its use in decode).
     wire  [      2:0] ras_top_idx = ras_ptr_q - 3'd1;
@@ -191,11 +194,21 @@ module branch_predictor (
     // Event inputs declared as ports would clutter the architectural list, so
     // they are probed directly by sim_main off the decode/execute hierarchy
     // instead. Keep only RAS-internal stats here.
+    //
+    // Counted off lookup_req_i.ret_consume, NOT a bare "a return is at the
+    // head": the lookup port is a held level, so a return waiting out an
+    // execute stall (a preceding load's EX_MEM_WAIT, a div, EX_CSR_WAIT)
+    // would be re-counted every cycle it waits — that inflated the reported
+    // return count ~1.7x. ret_consume carries decode's ~stall & ~flush, so it
+    // is one count per return actually consumed into de_d.
     longint unsigned ras_hit_q;
     longint unsigned ras_miss_q;
     always_ff @(posedge clk_i) begin
-        if (rstn_i) begin
-            if (lookup_return_i) begin
+        if (!rstn_i) begin
+            ras_hit_q  <= 64'd0;
+            ras_miss_q <= 64'd0;
+        end else begin
+            if (lookup_req_i.ret_consume) begin
                 if (ras_valid) ras_hit_q <= ras_hit_q + 64'd1;
                 else ras_miss_q <= ras_miss_q + 64'd1;
             end

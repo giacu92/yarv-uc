@@ -327,13 +327,19 @@ int main(int argc, char** argv) {
     long n_mem_ops = 0, n_loads = 0, n_divs = 0, n_csrs = 0, n_redirects = 0;
     bool pv_mem_req = false, pv_mem_done = false, pv_div = false;
     bool pv_csr = false, pv_redir = false;
-    // Branch-predictor event counters (rising-edge of execute's resolve/train
-    // pulses). n_bp_resolved = every resolved control-flow instr; n_bp_predt =
-    // those predicted taken at decode; n_bp_mispred = mispredict redirects.
+    // Branch-predictor event counters. n_bp_resolved = every resolved
+    // control-flow instr; n_bp_predt = those predicted taken at decode;
+    // n_bp_mispred = mispredict redirects. Counted per cycle the wire is
+    // high, NOT on its rising edge: cf_resolving is a level that is high for
+    // exactly the one cycle each control-flow instr resolves, so two of them
+    // resolving in consecutive cycles (a not-taken branch followed by another
+    // branch -- what `if (a && b)` compiles to) is two events with no falling
+    // edge in between. Edge-counting merged those pairs, under-reporting
+    // CoreMark's control-flow count by 2917 of 68234 and silently dropping
+    // any mispredict landing on the second cycle of a pair.
     // RAS hit/miss come from the predictor's own free-running counters
     // (sampled once at the end).
     long n_bp_resolved = 0, n_bp_predt = 0, n_bp_mispred = 0;
-    bool pv_bp_resolved = false;
     uint32_t prev_fe_pc = 0;
     bool have_prev_fe = false;
     int fe_pc_checked = 0, fe_pc_ok = 0, fe_pc_bad = 0;
@@ -410,8 +416,8 @@ int main(int argc, char** argv) {
             const bool ev_div      = XTAP(alu_start) != 0;
             const bool ev_csr      = XTAP(csr_start) != 0;
             const bool ev_redir    = XTAP(branch_valid_o) != 0;
-            // Branch predictor: cf_resolving pulses for every resolved
-            // control-flow instr (the denominator); pred_t is the prediction
+            // Branch predictor: cf_resolving is high for exactly one cycle
+            // per resolved control-flow instr (the denominator); pred_t is the prediction
             // decode carried (valid & taken); mispredict is the execute-
             // internal redirect-that-was-a-mispred wire. All three are flat
             // internal wires (tapping the packed bp_train_o struct port would
@@ -420,19 +426,23 @@ int main(int argc, char** argv) {
             const bool ev_bp_predt = XTAP(pred_t) != 0;
             const bool ev_bp_mis   = XTAP(mispredict) != 0;
 
-            // Rising edges only: these are one-cycle pulses by construction
-            // (all are gated on ex_state_q == EX_IDLE), but counting edges
-            // keeps the totals right if that ever stops being true.
+            // Rising edges only for the FSM-event counters below: these are
+            // one-cycle pulses by construction (all are gated on
+            // ex_state_q == EX_IDLE), but counting edges keeps the totals
+            // right if that ever stops being true. The bp_* counters must NOT
+            // use an edge gate -- see their declaration.
             if (ev_mem_req && !pv_mem_req) ++n_mem_ops;
             if (ev_mem_done && !pv_mem_done) ++n_loads;   // only loads reach EX_MEM_WAIT
             if (ev_div && !pv_div) ++n_divs;
             if (ev_csr && !pv_csr) ++n_csrs;
             if (ev_redir && !pv_redir) ++n_redirects;
-            if (ev_bp_res && !pv_bp_resolved) ++n_bp_resolved;
-            if (ev_bp_predt && ev_bp_res) ++n_bp_predt;   // predicted-taken, at resolve
-            if (ev_bp_mis && !pv_bp_resolved) ++n_bp_mispred;  // mispred coincides w/ resolve
+            // Every high cycle, no edge gate (see the declaration): one
+            // control-flow instr resolves per high cycle of cf_resolving.
+            if (ev_bp_res) ++n_bp_resolved;
+            if (ev_bp_predt && ev_bp_res) ++n_bp_predt;  // predicted-taken, at resolve
+            if (ev_bp_mis) ++n_bp_mispred;  // mispredict implies cf_resolving
             pv_mem_req = ev_mem_req; pv_mem_done = ev_mem_done; pv_div = ev_div;
-            pv_csr = ev_csr; pv_redir = ev_redir; pv_bp_resolved = ev_bp_res;
+            pv_csr = ev_csr; pv_redir = ev_redir;
 
             // NOT applied here: the redirect cycle is normally the branch's
             // own retire, and the post-edge retire test below would clear
@@ -731,7 +741,7 @@ int main(int argc, char** argv) {
         // that reached execute's resolve (the denominator for accuracy and
         // MPKI); n_bp_predt = those decode predicted taken; n_bp_mispred =
         // mispredict redirects. RAS hit/miss are the predictor's own
-        // free-running counters (returns looked up at decode vs RAS
+        // free-running counters (returns consumed at decode vs RAS
         // non-empty). With BP_EN=0 these are all zero (no prediction).
         if (n_bp_resolved > 0) {
             const long correct = n_bp_resolved - n_bp_mispred;
