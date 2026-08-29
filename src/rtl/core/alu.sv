@@ -44,28 +44,73 @@ module alu (
 );
 
     // -----------------------------------------------------------
-    // Base RV32I — combinational
+    // Output mux structure (2026-08-28, timing)
+    //
+    // The result path used to be an 11-way `unique case` producing
+    // base_result, cascaded into a 3-way final mux against mul_result and
+    // div_result. On the 4-stage design's PnR that cascade measured
+    // **4.06-4.27 ns over 4-5 logic levels**, on BOTH of the two
+    // equally-long ALU routes (the DSP multiplier one and the shift/add
+    // ripple-chain one), making it the largest single term after the
+    // operators themselves.
+    //
+    // It is now two tiers of class muxes with the selects decoded up front:
+    //   tier 1: one narrow mux inside each op class (arith / logic / shift /
+    //           compare), each select 1-2 bits
+    //   tier 2: one 6-way one-hot AND-OR over the class results
+    // The point is WHERE the select comes from: alu_op_i is a de_q flop
+    // output, so every select below is ready long before the operand data
+    // arrives. Decoding it into explicit one-hot wires hands the tool that
+    // structure instead of asking it to rediscover it inside a case
+    // statement, and the slow data then crosses fewer levels.
+    //
+    // Behaviour is bit-identical, including the "unknown op reads 0" case:
+    // with one-hot AND-OR, no select asserted gives 0 for free, which is what
+    // the old `default: base_result = '0` plus the final else produced.
     // -----------------------------------------------------------
-    logic [XLEN-1:0] base_result;
-    logic [     4:0] shamt_rb;  // shift amount from operand_b (SLL/SRL/SRA)
+    logic [4:0] shamt_rb;  // shift amount from operand_b (SLL/SRL/SRA)
     assign shamt_rb = operand_b_i[4:0];
 
+    // ---- Class selects, decoded from the alu_op_i flop (off the data path)
+    wire sel_arith = (alu_op_i == ALU_ADD) || (alu_op_i == ALU_SUB) || (alu_op_i == ALU_LX);
+    wire sel_logic = (alu_op_i == ALU_XOR) || (alu_op_i == ALU_OR) || (alu_op_i == ALU_AND);
+    wire sel_shift = (alu_op_i == ALU_SLL) || (alu_op_i == ALU_SRL) || (alu_op_i == ALU_SRA);
+    wire sel_cmp = (alu_op_i == ALU_SLT) || (alu_op_i == ALU_SLTU);
+
+    // ---- Tier 1: within-class muxes
+    logic [XLEN-1:0] arith_result;
     always_comb begin
         unique case (alu_op_i)
-            ALU_ADD:  base_result = operand_a_i + operand_b_i;
-            ALU_SUB:  base_result = operand_a_i - operand_b_i;
-            ALU_SLL:  base_result = operand_a_i << shamt_rb;
-            ALU_SLT:  base_result = {31'b0, $signed(operand_a_i) < $signed(operand_b_i)};
-            ALU_SLTU: base_result = {31'b0, operand_a_i < operand_b_i};
-            ALU_XOR:  base_result = operand_a_i ^ operand_b_i;
-            ALU_SRL:  base_result = operand_a_i >> shamt_rb;
-            ALU_SRA:  base_result = $signed(operand_a_i) >>> shamt_rb;
-            ALU_OR:   base_result = operand_a_i | operand_b_i;
-            ALU_AND:  base_result = operand_a_i & operand_b_i;
-            ALU_LX:   base_result = operand_a_i + (operand_b_i << shamt_i);  // Zilx
-            default:  base_result = '0;
+            ALU_SUB: arith_result = operand_a_i - operand_b_i;
+            ALU_LX:  arith_result = operand_a_i + (operand_b_i << shamt_i);  // Zilx
+            default: arith_result = operand_a_i + operand_b_i;  // ALU_ADD
         endcase
     end
+
+    logic [XLEN-1:0] logic_result;
+    always_comb begin
+        unique case (alu_op_i)
+            ALU_OR:  logic_result = operand_a_i | operand_b_i;
+            ALU_AND: logic_result = operand_a_i & operand_b_i;
+            default: logic_result = operand_a_i ^ operand_b_i;  // ALU_XOR
+        endcase
+    end
+
+    logic [XLEN-1:0] shift_result;
+    always_comb begin
+        unique case (alu_op_i)
+            ALU_SRL: shift_result = operand_a_i >> shamt_rb;
+            ALU_SRA: shift_result = $signed(operand_a_i) >>> shamt_rb;
+            default: shift_result = operand_a_i << shamt_rb;  // ALU_SLL
+        endcase
+    end
+
+    // Compare: one bit wide, so its mux is a single LUT and the zero-extend
+    // costs nothing.
+    wire                      cmp_lt_signed = ($signed(operand_a_i) < $signed(operand_b_i));
+    wire                      cmp_lt_unsigned = (operand_a_i < operand_b_i);
+    wire                      cmp_bit = (alu_op_i == ALU_SLTU) ? cmp_lt_unsigned : cmp_lt_signed;
+    wire         [  XLEN-1:0] cmp_result = {{XLEN - 1{1'b0}}, cmp_bit};
 
     // -----------------------------------------------------------
     // MUL — single-cycle (DSP inference)
@@ -224,19 +269,20 @@ module alu (
     end
 
     // -----------------------------------------------------------
-    // Mux finale + valid
+    // Tier 2: one 6-way one-hot AND-OR over the class results. Every select
+    // is decoded from the alu_op_i flop, so this is one AND-OR over slow
+    // data rather than a mux cascade the data has to walk. No select
+    // asserted (an alu_op value this ALU does not implement) gives 0, which
+    // is the old default.
     // -----------------------------------------------------------
     always_comb begin
-        if (is_div_op) begin
-            result_o       = div_result;
-            result_valid_o = (div_state_q == DIV_DONE);
-        end else if (is_mul_op) begin
-            result_o       = mul_result;
-            result_valid_o = 1'b1;
-        end else begin
-            result_o       = base_result;
-            result_valid_o = 1'b1;
-        end
+        result_o = ({XLEN{sel_arith}} & arith_result) | ({XLEN{sel_logic}} & logic_result) |
+            ({XLEN{sel_shift}} & shift_result) | ({XLEN{sel_cmp}} & cmp_result) |
+            ({XLEN{is_mul_op}} & mul_result) | ({XLEN{is_div_op}} & div_result);
+
+        // DIV/REM is the only multi-cycle op, so it is the only one whose
+        // result is not ready in the cycle it is presented.
+        result_valid_o = is_div_op ? (div_state_q == DIV_DONE) : 1'b1;
     end
 
 endmodule
