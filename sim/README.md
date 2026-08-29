@@ -197,11 +197,18 @@ then an empty buffer is the fetch path's fault:
 | `div/rem` | `div_running \| alu_start` | multi-cycle divide |
 | `csr-read` | `csr_start` | the registered CSR read (`EX_CSR_WAIT`) |
 | `wfi-halt` | `wfi_stall` | halted until an interrupt is pending |
-| `rvc-hold` | `resource_stall` | compressed upper half held against a fresh word |
-| `rvc-span` | `span_wait` | 32-bit instruction straddling a word boundary |
+| `rvc-hold` | `resource_stall` (align stage) | compressed upper half held against a fresh word |
+| `rvc-span` | `span_wait` (align stage) | 32-bit instruction straddling a word boundary |
 | `redirect` | between `branch_valid_o` and the next retire | flushed D/E + killed buffer + refill |
 | `imem-starve` | buffer empty, no redirect | fetch could not keep up |
-| `decode-bubble` | `~decoded_valid` | words available, no instruction out |
+| `decode-bubble` | `~al_valid_q` | words available, A/D register empty |
+
+Two of those taps moved with the 4-stage split (2026-08-28): the RVC hold
+buffer and both spanning stitches live in `align_stage` now, so `rvc-hold` and
+`rvc-span` are read through `ATAP` rather than `DTAP`. `decode-bubble` is
+`~al_valid_q`, the A/D register being empty, so besides odd-half realignment
+and a spanning stitch waiting on its second word it now also carries the
+align stage's own fill bubble.
 
 `redirect` deliberately absorbs the flushed D/E slot and the refill together:
 split apart they hide the one number that matters, cycles per taken
@@ -258,27 +265,42 @@ rm -rf obj_dir && make VPARAMS="-GBP_EN=0"     # predictor off (A/B baseline)
 rm -rf obj_dir && make                          # predictor on (default)
 ```
 
-With the predictor on, the **`redirect` bucket drops ~3×** (a correct
-prediction issues no execute redirect) but a new **`imem-starve` + `other`
-~0.21 CPI** appears — the kill+refill bubble on every *correct* predicted-taken
-branch, charged to `imem-starve` (no mispredict fires) instead of `redirect`.
-So the gross redirect saving (~0.28) nets to ~+0.06 CPI. CoreMark `BP_EN=1`:
+With the predictor on, the **`redirect` bucket drops ~4×** (a correct
+prediction issues no execute redirect) but a new **`imem-starve` + `other` +
+`decode-bubble` 0.212 CPI** appears — the kill+refill bubble on every
+*correct* predicted-taken branch, charged to `imem-starve` (no mispredict
+fires) instead of `redirect`. So the gross redirect saving nets to ~0.06 CPI.
+CoreMark `BP_EN=1`:
 
 | cycles per retired instruction | CoreMark `BP=1` | CoreMark `BP=0` |
 |---|---|---|
 | retire (floor) | 1.000 | 1.000 |
-| + `lsu-launch` | 0.171 | 0.171 |
-| + `lsu-capture` | 0.221 | 0.221 |
-| + `redirect` | 0.102 | 0.383 |
-| + `imem-starve` | 0.105 | <0.001 |
-| + `other` | 0.105 | <0.001 |
-| + `decode-bubble` | 0.006 | — |
-| **= CPI** | **1.711** | **1.775** |
-| (IPC) | 0.585 | 0.563 |
+| + `lsu-launch` | 0.182 | 0.181 |
+| + `lsu-capture` | 0.234 | 0.234 |
+| + `redirect` | 0.086 | 0.360 |
+| + `imem-starve` | 0.102 | <0.001 |
+| + `other` | 0.102 | <0.001 |
+| + `decode-bubble` | 0.008 | — |
+| **= CPI** | **1.715** | **1.775** |
+| (IPC) | 0.583 | 0.563 |
 
 The LSU and div buckets are unchanged (memory cost is prediction-independent).
 A `branch predictor:` line prints underneath the histogram: resolved /
 predicted-taken / mispredicts / accuracy / MPKI, plus a `RAS:` hit/miss line.
+CoreMark reads 68240 resolved / 9319 mispredicts / **86.34% accuracy** /
+27.34 MPKI / 1429 RAS returns at 100% hit.
+
+Those counters are driven by **levels, not pulses** — `cf_resolving` and the
+RAS lookup event are high for exactly one cycle per event, but two events in
+consecutive cycles leave no falling edge between them. So they are counted
+every high cycle, never on a rising edge. An edge-gated version merged
+adjacent-cycle control-flow pairs (what `if (a && b)` compiles to), losing
+2917 of CoreMark's 68234; the unqualified RAS version counted a return once
+per cycle it waited out an execute stall, inflating returns 1.7×. Both now
+match a per-opcode count of the retire trace exactly. Under `BP_EN=0` the
+printed `accuracy` is *not* an accuracy — with no predictions every taken
+branch counts as a mispredict, so it reads ~33–42% and means only the
+not-taken rate of the branch mix.
 The full A/B (quicksort/CoreMark/Dhrystone, `BP=1` vs `BP=0`) and the
 copy-paste reproduce recipe are in [`bench_ipc_ab.md`](bench_ipc_ab.md).
 
