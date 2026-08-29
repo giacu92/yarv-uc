@@ -765,6 +765,16 @@ int main(int argc, char** argv) {
                        ras_tot, ras_hits, ras_misses,
                        100.0 * ras_hits / ras_tot);
         }
+
+        // Distance-1 RAW forwards actually consumed. This is the price list
+        // for a writeback stage: registering alu_result forces forwarding
+        // from the post-flop copy (distance 2), so each of these becomes a
+        // 1-cycle bubble.
+        const long fwd_d1 = (long)DTAP(fwd_d1_q);
+        printf("distance-1 forwards consumed: %ld (%.1f%% of retires)"
+               " -> a writeback stage would add %.3f CPI, cycles %ld -> %ld\n",
+               fwd_d1, 100.0 * fwd_d1 / retired, (double)fwd_d1 / retired,
+               cyc, cyc + fwd_d1);
     }
 
     if (wfi_fail_cyc >= 0) {

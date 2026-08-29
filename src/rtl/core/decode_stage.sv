@@ -222,6 +222,25 @@ module decode_stage #(
     wire fwd_rs1 = ex_wb_en_i & (ex_wb_addr_i != 5'd0) & (rs1_addr_dec == ex_wb_addr_i);
     wire fwd_rs2 = ex_wb_en_i & (ex_wb_addr_i != 5'd0) & (rs2_addr_dec == ex_wb_addr_i);
 
+`ifdef VERILATOR
+    // Sim-only: count the distance-1 RAW forwards that are actually CONSUMED
+    // (~stall & ~flush, the same qualifier ret_consume uses -- fwd_rs* are
+    // held levels, so a forward waiting out an execute stall must not be
+    // counted once per waiting cycle).
+    //
+    // This is the price list for a writeback stage. Registering alu_result
+    // would force forwarding from alu_result_q (post-flop, distance 2), so
+    // every one of these events becomes a 1-cycle bubble: after one bubble
+    // the producer sits in W and the forward works. Read this counter against
+    // retires to get the CPI the W stage would add.
+    wire fwd_consume = (fwd_rs1 | fwd_rs2) & ~stall_i & ~flush_i;
+    longint unsigned fwd_d1_q;
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) fwd_d1_q <= 64'd0;
+        else if (fwd_consume) fwd_d1_q <= fwd_d1_q + 64'd1;
+    end
+`endif
+
     wire [XLEN-1:0] rs1_fwd = fwd_rs1 ? ex_wb_data_i : rs1_data_i;
     wire [XLEN-1:0] rs2_fwd = fwd_rs2 ? ex_wb_data_i : rs2_data_i;
 
