@@ -763,13 +763,36 @@ module execute_stage (
     wire ex_is_return = ex_is_jalr & (de_i.rs1_addr == 5'd1 || de_i.rs1_addr == 5'd5) &
         (de_i.rd == 5'd0);
 
-    assign bp_train_o.valid     = cf_resolving;
-    assign bp_train_o.cond      = cf_resolving & ex_is_cond;
-    assign bp_train_o.call      = cf_resolving & ex_is_call;
-    assign bp_train_o.ret       = cf_resolving & ex_is_return;
-    assign bp_train_o.taken     = branch_taken;
-    assign bp_train_o.pht_index = de_i.pred_pht_index;
-    assign bp_train_o.push_pc   = pc_link;  // return address for a RAS push
+    // The training bundle is REGISTERED (2026-08-28, timing). bp_train.taken is
+    // branch_taken, which is the data-dependent compare, so an unregistered
+    // bundle put `regfile read -> forward mux -> branch compare` in front of
+    // the PHT's write port: four of the 25 worst setup paths ran
+    // `regs_regs_0_0_s/DO[8] -> u_bp/pht_q_pht_q_RAMREG_<n>/D` at -3.18 ns.
+    // Registering it costs nothing architecturally -- the PHT/GHR/RAS are
+    // written at resolve and nothing reads them in that cycle, and the PHT
+    // update is indexed by the de_t snapshot rather than the live GHR, so a
+    // one-cycle-later update uses the same index either way. The only visible
+    // effect is on prediction *accuracy*: a branch decoded in the cycle right
+    // after another branch resolves now looks up pre-update state. Measured
+    // cost of that below.
+    bp_train_t bp_train_d, bp_train_q;
+
+    always_comb begin
+        bp_train_d.valid     = cf_resolving;
+        bp_train_d.cond      = cf_resolving & ex_is_cond;
+        bp_train_d.call      = cf_resolving & ex_is_call;
+        bp_train_d.ret       = cf_resolving & ex_is_return;
+        bp_train_d.taken     = branch_taken;
+        bp_train_d.pht_index = de_i.pred_pht_index;
+        bp_train_d.push_pc   = pc_link;  // return address for a RAS push
+    end
+
+    always_ff @(posedge clk_i) begin
+        if (!rstn_i) bp_train_q <= '0;
+        else bp_train_q <= bp_train_d;
+    end
+
+    assign bp_train_o = bp_train_q;
 
     // =================================================================
     // E/M debug taps (retired instruction)
