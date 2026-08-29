@@ -70,7 +70,27 @@ import rv32_pkg::*;
  * Naming: ports *_i/_o; internals no prefix; flops _q, next-state _d. Stage
  * sigil `al_` (fe_ / al_ / de_ / ex_).
  */
-module align_stage (
+module align_stage #(
+    // A/D pipeline register present (1) or bypassed (0).
+    //
+    // 0 = the 3-stage pipeline: al_o is combinational off the fetch buffer,
+    //     exactly as decode computed these values itself before this module
+    //     existed. The RVC hold buffer stays a flop either way -- that is
+    //     original behaviour, not the pipeline register.
+    // 1 = the 4-stage pipeline: al_o comes from a flop.
+    //
+    // Default is 0, and the measurements are why. The register raised Fmax
+    // 49.590 -> 53.278 MHz (Logic Level 14 -> 11) and cost 7-9% CPI, which
+    // came out a dead heat in absolute throughput: CoreMark 97.0 vs 97.1
+    // iterations/s. It only starts paying above ~53.6 MHz, and the cut that
+    // would take the clock past that -- registering alu_result -- costs
+    // another 0.30 CPI and needs ~62 MHz of its own to break even.
+    //
+    // The module split is kept regardless of this parameter: the RVC
+    // machinery does not belong in decode_stage, and keeping it here is what
+    // makes the remaining span-bubble work tractable.
+    parameter int AD_REG = 0
+) (
     input wire clk_i,
     input wire rstn_i,
 
@@ -719,11 +739,17 @@ module align_stage (
         end
     end
 
-    assign al_o.instr         = al_instr_q;
-    assign al_o.pc            = al_pc_q;
-    assign al_o.valid         = al_valid_q;
-    assign al_o.fault         = al_fault_q;
-    assign al_o.is_compressed = al_comp_q;
+    // AD_REG=0 bypasses the flops above -- synthesis prunes them, the
+    // simulator leaves them as dead state -- handing decode the same
+    // combinational values it computed for itself in the 3-stage design.
+    // al_kill is not applied on the bypass path and must not be: with no
+    // register there is nothing stale to kill, and decode's own flush_i
+    // already zeroes de_q on the same cycle.
+    assign al_o.instr         = (AD_REG != 0) ? al_instr_q : src_instr32;
+    assign al_o.pc            = (AD_REG != 0) ? al_pc_q : src_pc;
+    assign al_o.valid         = (AD_REG != 0) ? al_valid_q : decoded_valid;
+    assign al_o.fault         = (AD_REG != 0) ? al_fault_q : fetch_fault;
+    assign al_o.is_compressed = (AD_REG != 0) ? al_comp_q : src_is_compressed;
 
 endmodule
 

@@ -52,7 +52,12 @@ module rv32imac_zicsr_zifencei #(
     // predicted redirect and zeroes de_t.pred_* -> execute resolves every
     // control-flow instr with a taken redirect exactly as before the
     // predictor existed. The A/B measurement knob and a safety fallback.
-    parameter int BP_EN = 1
+    parameter int BP_EN = 1,
+    // A/D pipeline register in the align stage. 0 = 3-stage pipeline (the
+    // align stage is combinational, which is the original behaviour and the
+    // default); 1 = 4-stage. See align_stage.sv for the measurements: the
+    // register buys clock and costs CPI, and the two cancel.
+    parameter int AD_REG = 0
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -253,7 +258,9 @@ module rv32imac_zicsr_zifencei #(
     // predicted-taken branch must flush them explicitly or the wrong-path
     // half behind it retires.
     // -------------------------------------------------------------
-    align_stage u_align (
+    align_stage #(
+        .AD_REG(AD_REG)
+    ) u_align (
         .clk_i       (clk_i),
         .rstn_i      (rstn_i),
         .fe_head_i   (fe_head),
