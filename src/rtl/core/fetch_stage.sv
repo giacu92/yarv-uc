@@ -21,17 +21,21 @@ import rv32_pkg::*;
  *   - Request launch : imem_req_o.valid && imem_rsp_i.ready
  *   - Read response  : imem_rsp_i.rvalid && imem_req_o.rready
  *
- * Decode contract: the buffer head is exported as fe_instr /
- * fe_pc / fe_valid / fe_fault, 32-bit / 32-bit / 1-bit / 1-bit, exactly as
- * the old 2-deep F/D+skid FIFO exported them. Decode is a pure consumer of
- * the head register and cannot tell a 32-bit RAM from a split 64-bit RAM.
- * A second read port exports head+1 (fe_next_instr / fe_next_pc /
- * fe_next_valid = count>=2 / fe_next_fault) so decode can same-cycle stitch
- * a 32-bit instr at a 2-byte-aligned branch target (offset 2/6) without a
- * bubble; fe_pop2_i tells fetch to drop both entries on that stitch. The
- * sequential RVC spanning stitch (span_wait, a 32-bit instr at offset 2
- * reached by fall-through) still lives in decode and costs 1 bubble --
- * removing it is dual-issue, a separate change.
+ * Consumer contract: the buffer head is exported as one fa_t bundle
+ * (instr / pc / valid / fault), exactly the fields the old 2-deep F/D+skid
+ * FIFO exported. The consumer is a pure reader of the head register and
+ * cannot tell a 32-bit RAM from a split 64-bit RAM. A second read port
+ * exports head+1 as another fa_t (valid = count>=2) so a 32-bit instr at a
+ * 2-byte-aligned branch target (offset 2/6) can be stitched in one cycle
+ * without a bubble; fe_pop2_i tells fetch to drop both entries on that
+ * stitch.
+ *
+ * Since 2026-08-28 that consumer is align_stage, not decode: the buffer read
+ * mux, the RVC hold buffer, both spanning stitches and c_expand() live there,
+ * behind a flop. This module is unchanged by that split -- the F/A ports are
+ * the same signals in an fa_t wrapper. The sequential RVC spanning stitch
+ * (span_wait, a 32-bit instr at offset 2 reached by fall-through) still costs
+ * 1 bubble; removing it is dual-issue, a separate change.
  *
  * PC + split:
  *   - pc_q advances by 8 in steady state; pc_d = (pc_q & ~7) + 8 after a
@@ -147,25 +151,19 @@ module fetch_stage #(
     output ifetch_req_t imem_req_o,
     input  ifetch_rsp_t imem_rsp_i,
 
-    // F/D pipeline register outputs (buffer head): each pipeline stage
-    // exposes the PC it is treating, the instruction word, and a valid
-    // (stage sigil `fe_`).
-    output wire [XLEN-1:0] fe_instr_o,  // F/D instruction word (32-bit)
-    output wire [XLEN-1:0] fe_pc_o,     // F/D instruction PC (exact)
-    output wire            fe_valid_o,  // F/D valid (held level)
-    output wire            fe_fault_o,  // F/D entry is an access fault, not an instruction
+    // F/A pipeline register output (buffer head), as one fa_t bundle:
+    // instr / pc / valid / fault. The consumer is align_stage.
+    output fa_t fe_head_o,
 
-    // Buffer head+1 read port (same-cycle RVC spanning stitch). Exposes the
-    // word right behind the head so decode can stitch a 32-bit instr sitting
-    // at a 2-byte-aligned branch target (offset 2 / 6) without a bubble: the
-    // stitch consumes head[31:16] + head+1[15:0] in the cycle the target word
-    // is seen. Gated by fe_next_valid_o (count>=2); decode drives fe_pop2_i
-    // only then, so pop-2 <= count (no underflow).
-    output wire [XLEN-1:0] fe_next_instr_o,  // buffer[head+1] word
-    output wire [XLEN-1:0] fe_next_pc_o,     // buffer[head+1] PC
-    output wire            fe_next_valid_o,  // count >= 2
-    output wire            fe_next_fault_o,  // buffer[head+1] fault flag
-    input  wire            fe_pop2_i         // decode: pop 2 this cycle (target stitch)
+    // Buffer head+1 read port (same-cycle RVC spanning stitch), same fa_t
+    // shape. Exposes the word right behind the head so the align stage can
+    // stitch a 32-bit instr sitting at a 2-byte-aligned branch target
+    // (offset 2 / 6) without a bubble: the stitch consumes head[31:16] +
+    // head+1[15:0] in the cycle the target word is seen. Gated by
+    // fe_next_o.valid (count>=2); align drives fe_pop2_i only then, so
+    // pop-2 <= count (no underflow).
+    output fa_t fe_next_o,
+    input  wire fe_pop2_i   // align: pop 2 this cycle (target stitch)
 );
 
     // -----------------------------------------------------------------
@@ -377,23 +375,25 @@ module fetch_stage #(
     end
 
     // -----------------------------------------------------------------
-    // F/D outputs (buffer head). fe_valid is a held level (head stays until
-    // decode consumes it via !stall_i, or a redirect kills the buffer).
+    // F/A outputs (buffer head). valid is a held level (the head stays until
+    // align consumes it via !stall_i, or a redirect kills the buffer).
+    //
+    // head+1 read port (same-cycle target-span stitch): head_next is a 3-bit
+    // wrap, always a valid 0..7 index even when count<2, and align gates on
+    // fe_next_o.valid. A redirect zeros count -> both valids drop, so no
+    // extra kill logic.
     // -----------------------------------------------------------------
-    assign fe_instr_o = buf_instr_q[head_q];
-    assign fe_pc_o    = buf_pc_q[head_q];
-    assign fe_valid_o = (count_q != 4'd0);
-    assign fe_fault_o = buf_fault_q[head_q];
-
-    // Buffer head+1 read port (same-cycle target-span stitch). head_next is a
-    // 3-bit wrap, always a valid 0..7 index even when count<2; decode gates on
-    // fe_next_valid_o. A redirect zeros count -> both fe_valid_o and
-    // fe_next_valid_o drop, so no extra kill logic.
     wire [2:0] head_next = head_q + 3'd1;
-    assign fe_next_instr_o = buf_instr_q[head_next];
-    assign fe_next_pc_o    = buf_pc_q[head_next];
-    assign fe_next_fault_o = buf_fault_q[head_next];
-    assign fe_next_valid_o = (count_q >= 4'd2);
+
+    assign fe_head_o.instr = buf_instr_q[head_q];
+    assign fe_head_o.pc    = buf_pc_q[head_q];
+    assign fe_head_o.valid = (count_q != 4'd0);
+    assign fe_head_o.fault = buf_fault_q[head_q];
+
+    assign fe_next_o.instr = buf_instr_q[head_next];
+    assign fe_next_o.pc    = buf_pc_q[head_next];
+    assign fe_next_o.valid = (count_q >= 4'd2);
+    assign fe_next_o.fault = buf_fault_q[head_next];
 
 `ifdef VERILATOR
     // The split assumes the I-mem aligns the read address down to 8 bytes

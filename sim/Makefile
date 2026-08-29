@@ -21,6 +21,7 @@ RTL := \
 	../src/rtl/core/fetch_stage.sv \
 	../src/rtl/core/reg_file.sv \
 	../src/rtl/core/csr_regfile.sv \
+	../src/rtl/core/align_stage.sv \
 	../src/rtl/core/decode_stage.sv \
 	../src/rtl/core/trap_unit.sv \
 	../src/rtl/core/alu.sv \

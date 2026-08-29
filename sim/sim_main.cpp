@@ -65,6 +65,10 @@
 // Taps inside the decode and fetch stages. Note the instance names differ:
 // the CPU top instantiates decode as u_decode but fetch as fetch_stage_i.
 #define DTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_decode__DOT__##field)
+// Align+expand stage (A/D). The RVC hold buffer and both spanning stitches
+// live here since the 3-stage -> 4-stage split, so the rvc-hold / rvc-span
+// stall causes are tapped from this hierarchy rather than from decode.
+#define ATAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_align__DOT__##field)
 #define FTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__fetch_stage_i__DOT__##field)
 
 // Tap inside the branch predictor (u_bp).
@@ -460,8 +464,8 @@ int main(int argc, char** argv) {
             else if (XTAP(div_running) || ev_div)        sc_this = SC_DIV;
             else if (ev_csr)                             sc_this = SC_CSR;
             else if (XTAP(wfi_stall))                    sc_this = SC_WFI;
-            else if (DTAP(resource_stall))               sc_this = SC_RVC_HOLD;
-            else if (DTAP(span_wait))                    sc_this = SC_RVC_SPAN;
+            else if (ATAP(resource_stall))               sc_this = SC_RVC_HOLD;
+            else if (ATAP(span_wait))                    sc_this = SC_RVC_SPAN;
             // An empty buffer is charged to the redirect that emptied it
             // until something retires again -- the drain AND the refill are
             // both the branch's cost, not the I-mem's.
@@ -472,9 +476,12 @@ int main(int argc, char** argv) {
             // branch / trap / mret.
             else if (post_redirect)                      sc_this = SC_REDIRECT;
             else if (buf_empty)                          sc_this = SC_IMEM;
-            // Words are in the buffer but decode emitted nothing: odd-half
-            // realignment, or a spanning stitch waiting on its second word.
-            else if (!DTAP(decoded_valid))               sc_this = SC_DEC_BUBBLE;
+            // Words are in the buffer but the A/D register is empty: odd-half
+            // realignment, a spanning stitch waiting on its second word, or
+            // the align stage's own fill bubble (the 4-stage split put a flop
+            // between the buffer and the decoder, so this bucket now also
+            // carries that stage's refill).
+            else if (!ATAP(al_valid_q))                  sc_this = SC_DEC_BUBBLE;
             else                                         sc_this = SC_OTHER;
         }
 

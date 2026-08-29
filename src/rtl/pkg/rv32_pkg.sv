@@ -144,6 +144,42 @@ package rv32_pkg;
     } bp_train_t;
 
     // ---------------------------------------------------------------
+    // Pipeline-register bundles. One struct per pipeline register, named
+    // after the register rather than the stage (fa_t / ad_t / de_t for
+    // F/A, A/D, D/E), so a stage boundary is a single typed port instead
+    // of a fan of parallel wires that has to be kept in the same order in
+    // three places. Same convention as mem_req_t / mem_rsp_t.
+    //
+    //   fa_t : F/A -- one 32-bit-word entry of the fetch instruction
+    //          buffer, RVC halves NOT yet expanded. Also the type of the
+    //          head+1 read port, which has exactly the same shape.
+    //   ad_t : A/D -- one aligned, RVC-expanded instruction.
+    //   de_t : D/E -- the full decoded control word (below).
+    // ---------------------------------------------------------------
+    // Fetch -> align. The PC stamp carries the unaligned low bits, so
+    // pc[1] selects which halfword of instr the instruction starts at
+    // (see fetch_stage's split-PC-stamp note).
+    typedef struct packed {
+        logic [XLEN-1:0] instr;  // 32-bit word as buffered
+        logic [XLEN-1:0] pc;     // PC stamp; [1] selects the halfword
+        logic            valid;
+        logic            fault;  // instruction access fault: no word exists
+    } fa_t;
+
+    // Align -> decode. One decodable 32-bit instruction: native, or the
+    // c_expand()ed form of an RVC one, or the stitch of a 32-bit
+    // instruction that spanned two fetch words. is_compressed is the only
+    // residue of compression downstream -- it sets the instruction size,
+    // which pc_link and mepc need.
+    typedef struct packed {
+        logic [XLEN-1:0] instr;          // 32-bit, RVC already expanded
+        logic [XLEN-1:0] pc;             // the instruction's own PC
+        logic            valid;
+        logic            fault;          // instruction access fault
+        logic            is_compressed;  // original was 16-bit -> size 2
+    } ad_t;
+
+    // ---------------------------------------------------------------
     // Decode: opcodes, ALU/branch/source enums, and the D/E control
     // struct. RV32I + M + C + Zilx + Zicsr + Zifencei all decode AND
     // execute; nothing in this list is stubbed out as illegal any more.

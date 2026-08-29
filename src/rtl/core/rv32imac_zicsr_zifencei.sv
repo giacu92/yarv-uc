@@ -96,9 +96,10 @@ module rv32imac_zicsr_zifencei #(
     // -----------------------------------------------------------------
     // Fetch stage
     //
-    // stall_i is driven by decode's back-pressure (propagated from the
-    // execute stage's div stall). branch_* come from the execute stage's
-    // branch-resolve path (redirect + in-flight flush).
+    // stall_i is driven by the align stage's back-pressure (its own RVC
+    // resource stall ORed with decode's, which is execute's div/mem stall).
+    // branch_* come from the execute stage's branch-resolve path (redirect +
+    // in-flight flush).
     // -----------------------------------------------------------------
     // Fetch owns the I-mem port uncontended (Harvard). fe_* = fetch native
     // side -> imem_req_o/imem_rsp_i (64-bit read-only ifetch interface).
@@ -109,20 +110,31 @@ module rv32imac_zicsr_zifencei #(
     mem_req_t                  peri_req;
     mem_rsp_t                  peri_rsp;
 
-    // F/D pipeline-register taps, consumed by the decode stage below.
-    wire            [XLEN-1:0] fe_pc;
-    wire            [XLEN-1:0] fe_instr;
-    wire                       fe_valid;
-    wire                       fe_fault;
-    // Buffer head+1 taps (same-cycle RVC spanning stitch) + the decode->fetch
-    // pop-2 handshake for the stitch.
-    wire            [XLEN-1:0] fe_next_instr;
-    wire            [XLEN-1:0] fe_next_pc;
-    wire                       fe_next_valid;
-    wire                       fe_next_fault;
+    // F/A pipeline register (fetch buffer head) and the head+1 read port,
+    // consumed by the align stage below; plus the align->fetch pop-2
+    // handshake for the same-cycle target-span stitch.
+    fa_t                       fe_head;
+    fa_t                       fe_next;
     wire                       fe_pop2;
 
-    // Decode -> fetch back-pressure (propagates execute's stall).
+    // A/D pipeline register (align stage output): one registered,
+    // already-RVC-expanded 32-bit instruction, consumed by decode.
+    ad_t                       al_bus;
+
+    // Per-stage debug taps, broken out of the bundles so every stage exposes
+    // a pc / instr / valid the way de_pc / de_instr / de_valid do (and so the
+    // simulation harness can read the F/A boundary field-wise -- do not start
+    // a comment line with the simulator's name, it is read as a pragma).
+    wire            [XLEN-1:0] fe_pc = fe_head.pc;
+    wire            [XLEN-1:0] fe_instr = fe_head.instr;
+    wire                       fe_valid = fe_head.valid;
+    wire            [XLEN-1:0] al_pc = al_bus.pc;
+    wire            [XLEN-1:0] al_instr = al_bus.instr;
+    wire                       al_valid = al_bus.valid;
+
+    // Align -> fetch back-pressure (its own resource stall OR decode's, which
+    // is execute's) and decode -> align back-pressure.
+    wire                       align_stall;
     wire                       dec_stall;
     // Execute -> fetch redirect.
     wire                       ex_branch_valid;
@@ -203,32 +215,55 @@ module rv32imac_zicsr_zifencei #(
     // -------------------------------------------------------------
     // Fetch stage
     //
-    // stall_i is driven by decode's back-pressure (propagated from the
-    // execute stage's div stall). branch_* come from the execute stage's
-    // branch-resolve path (redirect + in-flight flush).
+    // stall_i is driven by the align stage's back-pressure (its own RVC
+    // resource stall ORed with decode's, which is execute's div/mem stall).
+    // branch_* come from the execute stage's branch-resolve path (redirect +
+    // in-flight flush).
     // -------------------------------------------------------------
     fetch_stage #(
         .IMEM_ADDR_W(IMEM_ADDR_W)
     ) fetch_stage_i (
-        .clk_i          (clk_i),
-        .rstn_i         (rstn_i),
-        .boot_addr_i    (boot_addr_i),
-        .stall_i        (dec_stall),
-        .branch_valid_i (ex_branch_valid),
-        .branch_addr_i  (ex_branch_addr),
-        .pred_valid_i   (pred_redirect_valid),
-        .pred_addr_i    (pred_redirect_addr),
-        .imem_req_o     (fe_req),
-        .imem_rsp_i     (fe_rsp),
-        .fe_instr_o     (fe_instr),
-        .fe_pc_o        (fe_pc),
-        .fe_valid_o     (fe_valid),
-        .fe_fault_o     (fe_fault),
-        .fe_next_instr_o(fe_next_instr),
-        .fe_next_pc_o   (fe_next_pc),
-        .fe_next_valid_o(fe_next_valid),
-        .fe_next_fault_o(fe_next_fault),
-        .fe_pop2_i      (fe_pop2)
+        .clk_i         (clk_i),
+        .rstn_i        (rstn_i),
+        .boot_addr_i   (boot_addr_i),
+        .stall_i       (align_stall),
+        .branch_valid_i(ex_branch_valid),
+        .branch_addr_i (ex_branch_addr),
+        .pred_valid_i  (pred_redirect_valid),
+        .pred_addr_i   (pred_redirect_addr),
+        .imem_req_o    (fe_req),
+        .imem_rsp_i    (fe_rsp),
+        .fe_head_o     (fe_head),
+        .fe_next_o     (fe_next),
+        .fe_pop2_i     (fe_pop2)
+    );
+
+    // -------------------------------------------------------------
+    // Align + expand stage (A/D)
+    //
+    // Sits between the fetch buffer and the decoder (added 2026-08-28, the
+    // 3-stage -> 4-stage split). Owns the buffer read mux, the RVC hold
+    // buffer, both spanning stitches and c_expand(), and hands decode ONE
+    // registered, already-expanded 32-bit instruction. See align_stage.sv
+    // for the timing measurements that motivated it and the CPI it costs.
+    //
+    // Two flushes, both needed: flush_i is execute's redirect, and
+    // pred_flush_i is decode's predicted-taken redirect -- the fetch buffer
+    // kill reaches neither the A/D flop nor the RVC stash, so a
+    // predicted-taken branch must flush them explicitly or the wrong-path
+    // half behind it retires.
+    // -------------------------------------------------------------
+    align_stage u_align (
+        .clk_i       (clk_i),
+        .rstn_i      (rstn_i),
+        .fe_head_i   (fe_head),
+        .fe_next_i   (fe_next),
+        .fe_pop2_o   (fe_pop2),
+        .stall_i     (dec_stall),
+        .stall_o     (align_stall),
+        .flush_i     (ex_flush),
+        .pred_flush_i(pred_redirect_valid),
+        .al_o        (al_bus)
     );
 
     // -------------------------------------------------------------
@@ -328,14 +363,7 @@ module rv32imac_zicsr_zifencei #(
     ) u_decode (
         .clk_i                (clk_i),
         .rstn_i               (rstn_i),
-        .fe_instr_i           (fe_instr),
-        .fe_pc_i              (fe_pc),
-        .fe_valid_i           (fe_valid),
-        .fe_fault_i           (fe_fault),
-        .fe_next_instr_i      (fe_next_instr),
-        .fe_next_pc_i         (fe_next_pc),
-        .fe_next_valid_i      (fe_next_valid),
-        .fe_next_fault_i      (fe_next_fault),
+        .al_i                 (al_bus),
         .rs1_addr_o           (rs1_addr),
         .rs2_addr_o           (rs2_addr),
         .rs1_data_i           (rs1_data),
@@ -346,7 +374,6 @@ module rv32imac_zicsr_zifencei #(
         .ex_wb_addr_i         (wb_addr),
         .ex_wb_data_i         (wb_data),
         .stall_o              (dec_stall),
-        .fe_pop2_o            (fe_pop2),
         .bp_lookup_o          (bp_lookup_req),
         .bp_lookup_i          (bp_lookup_rsp),
         .pred_redirect_valid_o(pred_redirect_valid),
