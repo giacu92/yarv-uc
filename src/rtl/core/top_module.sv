@@ -65,45 +65,59 @@ module top_module (
     //   clk_i = 25 MHz (MS5351M clock generator, crystal-fed; CLK0 on
     //   PIN10, single-ended LVCMOS33)
     //
-    // Internal CPU clock (rPLL CLKOUT) — target 50 MHz:
-    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 10 / 5 = 50 MHz
-    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=9 -> FBDIV=10; ODIV_SEL=16 sets
-    //   the VCO = 25*10*16/5 = 800 MHz and does NOT divide CLKOUT).
-    //   Period = 20 ns. Constrained in the SDC as a generated clock.
+    // Internal CPU clock (rPLL CLKOUT) — target 65 MHz (TIMING PROBE):
+    //   clk_core = FCLKIN * FBDIV / IDIV = 25 * 13 / 5 = 65 MHz exactly
+    //   (IDIV_SEL=4 -> IDIV=5, FBDIV_SEL=12 -> FBDIV=13; ODIV_SEL=16 sets
+    //   the VCO = 25*13*16/5 = 1040 MHz and does NOT divide CLKOUT).
+    //   Period = 15.385 ns. Constrained in the SDC as a generated clock.
     //
     // Constraint check for this device: PFD = FCLKIN/IDIV = 5 MHz (range
-    // 3-400 MHz), CLKOUT = 50 MHz (range 3.125-600), VCO = 800 MHz (range
+    // 3-400 MHz), CLKOUT = 65 MHz (range 3.125-600), VCO = 1040 MHz (range
     // 500-1250, and ODIV_SEL maxes out at 16 on this primitive — larger
-    // values are silently replaced by the default 8, which would drop the
-    // VCO to 400 and trip EX0311).
+    // values are silently replaced by the default 8, which would halve the
+    // VCO and trip EX0311). PFD is unchanged from the 50 MHz config; only
+    // FBDIV moves and ODIV returns to 16.
     //
-    // 50 MHz is a target, not a verified closure. The pre-fetch-rewrite
-    // design closed at 40.281 MHz actual via the LSU + CSR register stages;
-    // the 64-bit fetch rewrite adds a buffer + room comparator, so whether
-    // the remaining paths make 20 ns is what the next PnR run answers. The
-    // fallback recipe is below the rPLL.
+    // *** THIS IS A TIMING PROBE, NOT A SHIPPING CONFIG. *** The design
+    // closes at 50 MHz (+0.013 ns worst setup slack) and its longest path
+    // measures 20.10-20.13 ns, so 65 MHz (15.385 ns) needs ~4.7 ns cut and
+    // will NOT close as it stands. It is the second of two probe points:
+    //   - 100 MHz (10 ns): worst path 20.130 ns, i.e. Fmax ~49.7 MHz. Asking
+    //     for 2x made the longest path slightly WORSE than the 50 MHz run's
+    //     19.952 ns, which settles the question the probe existed to answer:
+    //     PnR was not holding back at 50 MHz, there is no hidden margin.
+    //   - 65 MHz (this one, 15.385 ns): a target ~30% out of reach rather
+    //     than 100% out of reach, to check the path ranking is stable rather
+    //     than an artefact of extreme over-constraint.
+    // Do not program a board with either bitstream expecting the core to
+    // run. Reverting to the shipping 50 MHz build is two parameters and
+    // CLK_CORE_HZ:
+    //   localparam int unsigned CLK_CORE_HZ = 50_000_000;
+    //   .FBDIV_SEL(9), .ODIV_SEL(16)
+    // then the SDC generated clock back to -multiply_by 10 and global_freq
+    // back to 50.000 in pnr_check.tcl + impl/pnr/cmd.do.
     // clk_core frequency, in Hz. MUST track the clock source below: it is
     // what the UART divides down to hit BAUD_RATE, so editing the clock
     // source without editing this too leaves the UART running at the wrong
     // baud (garbage on the wire).
     //
-    // *** 50 MHz rPLL MODE (active). ***
+    // *** 65 MHz rPLL MODE (active, TIMING PROBE). ***
     // MUST match the rPLL settings below: this is what the UART divides
     // down to hit BAUD_RATE, so changing one without the other puts the
     // serial line at the wrong baud, which on a board looks exactly like a
-    // dead core. At 50 MHz BAUDDIV resets to CLK_FREQ_HZ/BAUD_RATE-1 = 433,
-    // giving 50e6/434 = 115 207 Hz against a nominal 115 200 (+0.006%, well
+    // dead core. At 65 MHz BAUDDIV resets to CLK_FREQ_HZ/BAUD_RATE-1 = 563,
+    // giving 65e6/564 = 115 248 Hz against a nominal 115 200 (+0.042%, well
     // inside RS-232 tolerance).
-    localparam int unsigned CLK_CORE_HZ = 50_000_000;
+    localparam int unsigned CLK_CORE_HZ = 65_000_000;
 
     wire clk_core;
     wire pll_lock;
 
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("25"),
-        .IDIV_SEL (4),     // -> IDIV = 5,  PFD    =   5 MHz (range 3-400)
-        .FBDIV_SEL(9),     // -> FBDIV = 10, CLKOUT = 50 MHz (range 3.125-600)
-        .ODIV_SEL (16)     // ->            VCO    = 800 MHz (range 500-1250)
+        .IDIV_SEL (4),     // -> IDIV = 5,   PFD    =    5 MHz (range 3-400)
+        .FBDIV_SEL(12),    // -> FBDIV = 13, CLKOUT =   65 MHz (range 3.125-600)
+        .ODIV_SEL (16)     // ->             VCO    = 1040 MHz (range 500-1250)
     ) pll (
         .CLKOUTP (),
         .CLKOUTD (),
@@ -118,7 +132,7 @@ module top_module (
         .DUTYDA  (4'b0),
         .FDLY    (4'b0),
         .CLKIN   (clk_i),     // 25 MHz reference
-        .CLKOUT  (clk_core),  // 50 MHz core clock
+        .CLKOUT  (clk_core),  // 65 MHz core clock (timing probe)
         .LOCK    (pll_lock)
     );
 
