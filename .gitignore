@@ -28,7 +28,7 @@ sim/*.log
 
 # C-program build artefacts (sim/sw tree: C -> $readmemh hex, regenerable)
 sim/sw/**/build/
-sim/sw-yarvmon/build/
+sim/sw*/**/build/
 sim/cosim/ecall/build/
 
 # Local sim artifacts (backups, GTKWave session layouts — not shared)

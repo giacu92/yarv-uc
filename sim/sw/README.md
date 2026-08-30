@@ -20,6 +20,7 @@ sim/sw/
   quicksort/        benchmark program (main.c)
   coremark/         EEMBC CoreMark (eembc/ upstream + local port layer)
   dhrystone/        Dhrystone 2.1 (sifive/ upstream + local port layer)
+  yarvmon/          YarvMon serial monitor (board's default product firmware)
   isa/              ISA oracles: ifault, isa_probe, rvc_scramble,
                     span_target, bp_pred
   intr/             trap + interrupt oracles: trap, timer, wfi_trap
@@ -31,9 +32,11 @@ one group; `make -C sim/sw/quicksort` one program. Each leaf Makefile is ~15
 lines: set a few variables and `include` `common/sw_build.mk`, so the
 toolchain, flags and rules live in one place.
 
-`sim/sw-yarvmon/` (the board's default product firmware) stays a sibling of
-this tree, not inside it — `top_module.sv` loads
-`sim/sw-yarvmon/build/imem.hex`.
+`yarvmon/` is the board's default product firmware as well as a sim program.
+It is the only harness that sets `IMEM_PAD_WORDS`, because a board image must
+make GowinSynthesis size the inferred ROM at the full declared depth. Point
+`top_module.sv`'s `INIT_FILE` at `sim/sw/yarvmon/build/imem.hex` to ship it
+(it currently loads the CoreMark images).
 
 ## Toolchain
 

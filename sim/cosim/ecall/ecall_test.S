@@ -9,7 +9,7 @@
  * instruction traps to mtvec in both models with no hijack. The MSIP
  * software interrupt is also not Spike-comparable (Spike has no slave at
  * our MSIP MMIO address 0x1000_0000), so it is exercised only by the
- * standalone sw_trap oracle, not here.
+ * standalone sim/sw/intr/trap oracle, not here.
  *
  * Flow: set mtvec (direct) -> illegal instr (.word 0, traps, NOT retired
  * -- no commit line in either model) -> handler (csrr mcause/mepc,

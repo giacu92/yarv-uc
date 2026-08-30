@@ -4,12 +4,12 @@
 #   make            build quicksort + every isa/intr/peri test
 #   make clean      clean all
 #   make quicksort  build one group/program
-#                   (quicksort | coremark | dhrystone | isa | intr | peri)
+#                   (quicksort | coremark | dhrystone | yarvmon | isa | intr | peri)
 #
 # Each leaf harness has its own Makefile (see common/sw_build.mk for the shared
 # build logic); this just recurses into each subdir.
 
-GROUPS := quicksort coremark dhrystone isa intr peri
+GROUPS := quicksort coremark dhrystone yarvmon isa intr peri
 
 .PHONY: all clean $(GROUPS)
 all:

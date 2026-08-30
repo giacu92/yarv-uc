@@ -69,7 +69,7 @@ program can be exercised end to end without hardware.
 
 ```
 cd sim
-UART_RX='2000\r' make run RUN_ARGS="+IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex"
+UART_RX='2000\r' make run RUN_ARGS="+IINIT=sw/yarvmon/build/imem.hex +DINIT=sw/yarvmon/build/dmem.hex"
 cat sim_uart_tx.txt          # everything the CPU transmitted
 ```
 
@@ -92,7 +92,7 @@ Environment knobs:
 rm -rf obj_dir
 make VPARAMS="-GUART_CLK_HZ=50000000 -GUART_BAUD=115200"
 NO_VCD=1 UART_BIT_CYCLES=434 UART_RX='2000\r' MAX_CYC=400000 \
-  ./obj_dir/Vsim_top +IINIT=sw-yarvmon/build/imem.hex +DINIT=sw-yarvmon/build/dmem.hex
+  ./obj_dir/Vsim_top +IINIT=sw/yarvmon/build/imem.hex +DINIT=sw/yarvmon/build/dmem.hex
 rm -rf obj_dir && make        # back to the fast default
 ```
 
