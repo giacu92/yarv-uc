@@ -41,6 +41,18 @@ writeback log** (`cycle / ex_pc / ex_instr`, plus `wb x<n> = 0x...` when a
 register is written). The writeback log makes the execute→decode forward path
 and the load-use path verifiable.
 
+**These three transcripts print only for the Harvard oracle** — the run with
+no `+IINIT`, i.e. plain `make run`. That program is 36 instructions long and
+exists to be read cycle by cycle. A firmware run under `sim/sw/` is millions
+of cycles, where the transcripts cost a string per stage per cycle and produce
+an output nobody scrolls: at 500k cycles, quicksort emits 803k lines / 26 MB
+and peaks at 75 MB resident, against 32 lines / 4 KB and 4.5 MB with them off
+(and runs ~14% slower). `INSTR_LOG=1` forces them back on for a firmware run
+when something needs reading instruction by instruction; `INSTR_LOG=0` turns
+them off for the oracle. The counters under each section (`fetched` /
+`decoded` / `retired`), the stall histogram, the CPI decomposition and the
+`RTL_TRACE` co-sim log are unaffected either way.
+
 An exit summary prints `retired N instructions in M cycles`, `IPC = N/M`, and
 a `stalled K/M cycles (P%)` breakdown (DIV/REM hold, LSU `EX_MEM_WAIT`,
 legacy RAW cost — now zero). Every run also checks the WFI-halt invariant
@@ -84,6 +96,9 @@ Environment knobs:
   build, 217 for the 25 MHz PLL-bypass one.
 - `NO_VCD=1` — skip the waveform dump (a board-accurate run is millions of
   cycles = multi-GB VCD).
+- `INSTR_LOG=1` / `INSTR_LOG=0` — force the per-cycle fetch / decode /
+  execute+writeback transcripts on or off. Default: on for the Harvard oracle
+  (no `+IINIT`), off for every firmware run.
 
 `sim_top`'s UART clock/baud are parameters, so the sim can run fast (default
 5 clocks/bit) or with the board's real divisor to check the RX sampling phase:
@@ -364,8 +379,9 @@ filled" from "the poll never returned" when a board goes quiet mid-line.
 - `sim_top.sv` — sim wrapper (CPU + native I/D-mem + peri MMIO slaves + VCD
   data-RAM window). RX pin double-flopped; TX monitor writes
   `sim_uart_tx.txt`.
-- `sim_main.cpp` — Verilator harness (clk/rst, trace, three logs, stall
-  breakdown, WFI-halt check, park/`MAX_CYC` stop, UART RX frame driver).
+- `sim_main.cpp` — Verilator harness (clk/rst, trace, three logs — oracle
+  only, see `INSTR_LOG` — stall breakdown, WFI-halt check, park/`MAX_CYC`
+  stop, UART RX frame driver).
 - `imem.hex`/`dmem.hex` — Harvard oracle preload.
 - `Makefile` — build/run rules (`RUN_ARGS` forwards plusargs).
 - `hw/{native_mem_tb,ram_tb,uart_tb}/` — compliance tests.

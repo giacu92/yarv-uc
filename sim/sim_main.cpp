@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -205,6 +206,26 @@ static void tick(Vsim_top* top, VerilatedVcdC* tfp) {
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
+
+    // Per-instruction fe/de/ex+wb logging is for the hand-crafted Harvard
+    // oracle (sim/imem.hex + sim/dmem.hex), which is 36 instructions long and
+    // exists precisely so one can read every cycle of it. A firmware run under
+    // sim/sw/ is six orders of magnitude longer: CoreMark retires ~330k
+    // instructions, so the logs cost a snprintf and a heap string per stage
+    // per cycle, hundreds of MB of retained std::string, and a final print
+    // nobody scrolls through. The counters, the histogram and the CPI
+    // decomposition below are built either way -- only the transcript goes.
+    //
+    // The oracle is the run with no +IINIT plusarg (sim_top defaults to
+    // imem.hex/dmem.hex), so absence of +IINIT is the default-on condition.
+    // INSTR_LOG=1 forces the transcript back on for a firmware run when
+    // something needs reading instruction by instruction; INSTR_LOG=0 turns
+    // it off for the oracle.
+    bool instr_log = true;
+    for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "+IINIT=", 7) == 0) { instr_log = false; break; }
+    }
+    if (const char *e = getenv("INSTR_LOG")) instr_log = atoi(e) != 0;
 
     Vsim_top* top = new Vsim_top;
     // NO_VCD=1 skips the waveform dump. A board-accurate UART run (217
@@ -528,9 +549,11 @@ int main(int argc, char** argv) {
             uint32_t pc    = TAP(fe_pc);
             uint32_t instr = TAP(fe_instr);
             int      c     = (instr & 3u) != 3u;
-            snprintf(line, sizeof(line), "%5d  0x%08x  0x%08x  %c",
-                     cyc, pc, instr, c ? 'C' : '.');
-            fe_log.push_back(line);
+            if (instr_log) {
+                snprintf(line, sizeof(line), "%5d  0x%08x  0x%08x  %c",
+                         cyc, pc, instr, c ? 'C' : '.');
+                fe_log.push_back(line);
+            }
             if (have_prev_fe) {
                 ++fe_pc_checked;
                 if (pc == prev_fe_pc + 4u) ++fe_pc_ok; else ++fe_pc_bad;
@@ -546,8 +569,10 @@ int main(int argc, char** argv) {
         if (TAP(de_valid)) {
             uint32_t pc    = TAP(de_pc);
             uint32_t instr = TAP(de_instr);
-            snprintf(line, sizeof(line), "%3d  0x%08x  0x%08x", cyc, pc, instr);
-            de_log.push_back(line);
+            if (instr_log) {
+                snprintf(line, sizeof(line), "%3d  0x%08x  0x%08x", cyc, pc, instr);
+                de_log.push_back(line);
+            }
             ++decoded;
         }
 
@@ -557,7 +582,7 @@ int main(int argc, char** argv) {
         // retire the cycle they are valid; DIV/REM retire when the ALU
         // asserts result_valid_o; loads/stores retire when the mem
         // response arrives). Illegal ops do not retire (ex_valid stays 0).
-        if (wb_en) {
+        if (wb_en && instr_log) {
             snprintf(line, sizeof(line), "%3d  wb    x%-2u = 0x%08x", cyc, wb_addr, wb_data);
             ex_log.push_back(line);
         }
@@ -579,8 +604,10 @@ int main(int argc, char** argv) {
         if (TAP(ex_valid)) {
             uint32_t pc    = TAP(ex_pc);
             uint32_t instr = TAP(ex_instr);
-            snprintf(line, sizeof(line), "%3d  ex    0x%08x  0x%08x", cyc, pc, instr);
-            ex_log.push_back(line);
+            if (instr_log) {
+                snprintf(line, sizeof(line), "%3d  ex    0x%08x  0x%08x", cyc, pc, instr);
+                ex_log.push_back(line);
+            }
             ++retired;
 
             // Co-sim commit log: one line per retire, pc + reg effect.
@@ -613,28 +640,38 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------
-    // Print the three log sections.
+    // Print the three log sections. The per-cycle transcripts appear only
+    // when instr_log is set (the Harvard oracle, or INSTR_LOG=1); the
+    // per-stage summary line under each is always printed, so a firmware run
+    // still reports fetched / decoded / retired and the +4 word-advance
+    // check.
     // -----------------------------------------------------------------
-    printf("--- fetch (fe) ---\n");
-    printf("cycle  pc          instr       c\n");
-    printf("-----  ----------  ----------  -\n");
-    for (const std::string& s : fe_log) printf("%s\n", s.c_str());
-    printf("-----  ----------  ----------  -\n");
+    if (instr_log) {
+        printf("--- fetch (fe) ---\n");
+        printf("cycle  pc          instr       c\n");
+        printf("-----  ----------  ----------  -\n");
+        for (const std::string& s : fe_log) printf("%s\n", s.c_str());
+        printf("-----  ----------  ----------  -\n");
+    }
     printf("fetched %d words in %d cycles | word-advance +4: %d ok / %d bad\n",
            fetched, cyc, fe_pc_ok, fe_pc_bad);
 
-    printf("--- decode (de) ---\n");
-    printf("cyc  pc          instr\n");
-    printf("---  ----------  ----------\n");
-    for (const std::string& s : de_log) printf("%s\n", s.c_str());
-    printf("---  ----------  ----------\n");
+    if (instr_log) {
+        printf("--- decode (de) ---\n");
+        printf("cyc  pc          instr\n");
+        printf("---  ----------  ----------\n");
+        for (const std::string& s : de_log) printf("%s\n", s.c_str());
+        printf("---  ----------  ----------\n");
+    }
     printf("decoded %d instructions in %d cycles\n", decoded, cyc);
 
-    printf("--- execute (ex) + writeback (wb) ---\n");
-    printf("cyc  kind  pc / value\n");
-    printf("---  ----  -----------------------\n");
-    for (const std::string& s : ex_log) printf("%s\n", s.c_str());
-    printf("---  ----  -----------------------\n");
+    if (instr_log) {
+        printf("--- execute (ex) + writeback (wb) ---\n");
+        printf("cyc  kind  pc / value\n");
+        printf("---  ----  -----------------------\n");
+        for (const std::string& s : ex_log) printf("%s\n", s.c_str());
+        printf("---  ----  -----------------------\n");
+    }
     if (park_cyc >= 0) {
         printf("retired %d instructions in %d cycles (parked at cyc %d: "
                "self-loop detected after %d identical retires)\n",
