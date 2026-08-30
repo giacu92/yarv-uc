@@ -1,5 +1,6 @@
 # Gowin build artefacts (regenerable from src/)
 impl/gwsynthesis/
+impl/pnr/cmd.do
 impl/pnr/*.vg
 impl/pnr/*.bin
 impl/pnr/*.binx
@@ -57,12 +58,5 @@ sim/cosim/coremark/rtl.stdout
 sim/cosim/__pycache__/
 sim/cosim/ecall/__pycache__/
 
-
 # UART TX capture written by the sim harness (sim_top's tx monitor).
 sim/sim_uart_tx.txt
-
-# Generated patch series (regenerate with git format-patch)
-patches-coremark/
-
-# Single combined patch (regenerate with git format-patch)
-coremark-all.patch
