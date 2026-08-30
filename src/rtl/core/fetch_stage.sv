@@ -49,20 +49,40 @@ import rv32_pkg::*;
  *     req_pc, decode uses fe_pc[1]" contract — traced for redirect->0x2 and
  *     redirect->0x6.
  *
- * 2-outstanding + redirect drain:
+ * 2-outstanding + redirect drain (generation-tagged, non-blocking):
  *   - inflight_q (0..2): outstanding reads (inc on launch, dec on rsp_cap).
- *   - draining_q: a redirect invalidated all in-flight reads; their stale
- *     responses are accepted (rready=1) and discarded until inflight reaches
- *     0, then fetching resumes at branch_addr_i. No buffer push while
- *     draining. The I-mem's depth-2 response skid backs this up (at most 2
- *     stale responses to drain).
+ *   - stale_q (0..2): how many of those outstanding reads were launched
+ *     before the last redirect. Responses come back strictly in order (the
+ *     I-mem is a fixed-latency BSRAM behind an in-order skid FIFO), so the
+ *     next stale_q responses belong to the killed path and the ones after
+ *     them belong to the new path. A redirect therefore sets
+ *     stale_q = inflight, and each accepted response decrements it; a
+ *     response arriving while stale_q != 0 is accepted (rready=1) and
+ *     discarded instead of pushed.
+ *
+ *     This is the whole point of the counter: fetching down the new path
+ *     does NOT wait for the old path to drain. The former draining_q flag
+ *     blocked bus_issue until inflight reached 0, so every redirect that
+ *     caught a read in flight paid an extra cycle (or two) before the first
+ *     request at the target could even be launched. With the counter the
+ *     redirect cycle is still gated (bus_issue has !redirect), but the very
+ *     next cycle issues at the target while the stale response is still in
+ *     flight behind it.
+ *
+ *     req_pc_q (single register, see below) stays safe under this: a launch
+ *     may only overwrite it when no *good* response is pending. rready is
+ *     low only when count_q >= 7, and count_q >= 7 forces available < 2,
+ *     which blocks bus_issue -- so on any launch cycle a pending response is
+ *     either absent or consumed that same cycle, before the overwrite takes
+ *     effect at the clock edge. A response consumed under stale_q != 0 is
+ *     discarded and never reads req_pc_q at all.
  *
  * Buffer-room gating (overflow-safe): each outstanding read can push up to
  * 2 words, so issue reserves 2 slots per in-flight read.
  *   reserved     = count + 2*inflight  (always <= 8 by invariant)
  *   available    = 8 - reserved
- *   bus_issue    = inflight<2 && available>=2 && !redirect && !drain && !fault
- *   fault_push   = pc_fault && available>=1 && !drain && !rsp_cap
+ *   bus_issue    = inflight<2 && available_issue>=2 && (redirect || !pc_fault)
+ *   fault_push   = pc_fault && available>=1 && !rsp_cap && inflight==0
  * A fault pushes exactly 1 word and launches no read -> its own >=1 gate,
  * and it is deferred a cycle when a response is landing the same cycle so
  * the buffer never pushes more than 2 words in one cycle.
@@ -82,13 +102,30 @@ import rv32_pkg::*;
  * Registers:
  *   - pc_q / req_pc_q : next fetch address / in-flight read address.
  *   - inflight_q      : outstanding reads (0..2).
- *   - draining_q      : draining stale in-flight reads after a redirect.
+ *   - stale_q         : in-flight reads still owed by the killed path.
+ *   - redir_launched_q: a redirect cycle issued at the target; pc_q still
+ *                       points at that word, so the next issue goes one
+ *                       8-byte block on and pc steps past both.
  *   - buf_*_q[8]      : depth-8 32-bit-word instruction buffer.
  *   - head_q/tail_q/count_q : buffer FIFO pointers + occupancy.
  *
  * Redirect (branch_valid_i, highest priority): kills the buffer (count=0,
- * head=tail=0), points pc_q at the target, arms draining for any in-flight
- * reads. No launch on the redirect cycle (bus_issue is gated).
+ * head=tail=0), points pc_q at the target, marks every read already in
+ * flight stale, AND launches the first request at the target on the redirect
+ * cycle itself (issue_addr = redirect_addr). The read launched on that cycle
+ * belongs to the new path, so stale_q is armed from inflight_q - rsp_cap
+ * rather than from inflight_d.
+ *
+ * pc_d on a redirect stays the plain `pc_d = redirect_addr` mux it has always
+ * been: neither `launch` nor the target's 8-byte advance may sit on it.
+ * redirect is combinational in the decode predictor (head_q -> c_expand ->
+ * decode -> PHT -> pred_target), so anything AND-ed onto it lands at the very
+ * end of the longest path in the design. Measured: putting `launch` and
+ * `(redirect_addr & ~7) + 8` there cost ~1 ns of setup slack at 50 MHz on two
+ * separate paths (predicted redirect, and execute's mispredict resolve).
+ * redir_launched_q defers the advance one cycle so every 8-byte adder runs
+ * off pc_q. The sequence of issued addresses is unchanged -- only where the
+ * arithmetic sits.
  *
  * A push or a pop may still *happen* on the redirect cycle, and both are
  * harmless -- which is what lets `redirect` stay off those paths:
@@ -101,9 +138,9 @@ import rv32_pkg::*;
  *     else branch, which the redirect branch overrides wholesale.
  *   - Held response: rready no longer forces high on a redirect, so a
  *     response landing while count_q >= 7 is left in the I-mem skid instead
- *     of being discarded. inflight then stays non-zero, draining_q arms, and
- *     it is consumed one cycle later under the drain -- count_q is 0 by then,
- *     so rready is high anyway. Same net effect, one cycle later.
+ *     of being discarded. inflight then stays non-zero, stale_q is armed to
+ *     match, and it is consumed one cycle later and dropped -- count_q is 0
+ *     by then, so rready is high anyway. Same net effect, one cycle later.
  *
  * stall_i: decode back-pressure. While high the head is held (no pop); fetch
  * keeps running ahead into the buffer (up to 8 words), then stops issuing
@@ -135,7 +172,7 @@ module fetch_stage #(
     // the execute redirect: a mispredict / trap / mret / interrupt resolved in
     // execute overrides whatever decode speculated. Routed through the same
     // kill path as branch_valid_i — kills the buffer, points pc_q at the
-    // predicted target, arms draining for any in-flight reads. The predicted
+    // predicted target, marks any in-flight read stale. The predicted
     // branch itself sits at the buffer head this cycle and is consumed into
     // decode's de_q combinationally, so killing the buffer only discards the
     // younger wrong-path entries behind it (same net effect as an execute
@@ -176,7 +213,8 @@ module fetch_stage #(
     logic [XLEN-1:0] pc_q, pc_d;  // next fetch address
     logic [XLEN-1:0] req_pc_q, req_pc_d;  // address of the in-flight read
     logic [1:0] inflight_q, inflight_d;  // outstanding reads (0..2)
-    logic draining_q, draining_d;  // discarding stale in-flight reads
+    logic [1:0] stale_q, stale_d;  // in-flight reads owed by the killed path
+    logic redir_launched_q, redir_launched_d;  // redirect cycle already issued at the target
 
     // Depth-8 32-bit-word instruction buffer (FIFO).
     logic [XLEN-1:0] buf_instr_q[BUF_DEPTH];
@@ -210,39 +248,90 @@ module fetch_stage #(
     wire [4:0] reserved = {1'b0, count_q} + {2'b0, twice_inflight};
     wire [4:0] available = 5'd8 - reserved;  // >= 0 by invariant
 
-    // Issue a fetch when idle (inflight<2), not redirecting/draining, the PC
-    // is in range, and the buffer has room for the response (2 words reserved
-    // per in-flight read).
-    wire bus_issue = (inflight_q < 2'd2) && (available >= 5'd2) && !redirect && !draining_q &&
-        !pc_fault;
+    // Same-cycle redirect issue: the request launched on a redirect cycle
+    // goes to the redirect target, not to pc_q. Without this the redirect
+    // cycle launches nothing and the first request at the target waits for
+    // the next cycle -- one dead cycle on every taken branch, predicted or
+    // mispredicted. issue_addr therefore replaces pc_q on the issue path.
+    //
+    // issue_addr feeds ONLY imem_req_o.addr -- never bus_issue. An
+    // |issue_addr[31:IMEM_ADDR_W]| range check here would be an 18-input
+    // OR-reduce hanging off the decode predictor's src_pc+imm adder, and it
+    // would then reach pc_q through launch: measured -2.292 ns at 50 MHz
+    // (44.9 MHz), 7.05 ns of tail on the last-arriving decode signal. The
+    // check moved to the response side instead (rsp_fault), where the
+    // address is req_pc_q -- a flop, and therefore free.
+    // Both derived from pc_q, a flop -- deliberately NOT from redirect_addr.
+    wire [XLEN-1:0] pc_next_block = (pc_q & ~32'h7) + 32'd8;
+    wire [XLEN-1:0] pc_next_block2 = (pc_q & ~32'h7) + 32'd16;
+
+    // redir_launched_q: the redirect cycle already issued the read at the
+    // target and left pc_q pointing AT it, so this cycle issues one block on.
+    // This is what keeps the 8-byte advance off the predictor's target: the
+    // adder runs on pc_q instead of on redirect_addr. The stream of issued
+    // addresses is identical to advancing pc_q on the redirect cycle itself.
+    wire [XLEN-1:0] issue_addr = redirect ? redirect_addr : redir_launched_q ? pc_next_block : pc_q;
+
+    // Room on a redirect cycle is measured against the buffer the redirect
+    // is about to zero, not the one still holding wrong-path words: count
+    // becomes 0 this cycle, and reads already in flight are marked stale and
+    // will push nothing.
+    wire [4:0] available_issue = redirect ? (5'd8 - {2'b0, twice_inflight}) : available;
+
+    // Issue a fetch when idle (inflight<2) and the buffer has room for the
+    // response (2 words reserved per in-flight read). Deliberately NOT gated
+    // on stale_q: issuing at the new target while the killed path's responses
+    // are still in flight is what removes the drain bubble.
+    //
+    // The in-range term is pc_fault, i.e. pc_q -- a flop. On a redirect cycle
+    // it is dropped entirely: a redirect to an unfetchable target DOES launch
+    // a bus read, whose aliased data is then discarded and turned into a
+    // fault entry when it lands (rsp_fault). Speculating a read that is
+    // thrown away costs nothing (the I-mem is read-only and one cycle deep)
+    // and keeps the whole range check off the predictor's adder.
+    wire bus_issue = (inflight_q < 2'd2) && (available_issue >= 5'd2) && (redirect || !pc_fault);
     // A fault pushes 1 word and launches no read -> its own >=1 gate. Hold it
     // off a cycle when a response is landing the same cycle so the buffer
-    // never pushes more than 2 words in one cycle.
-    wire fault_push = pc_fault && (available >= 5'd1) && !draining_q && !rsp_cap;
+    // never pushes more than 2 words in one cycle, and while any read is
+    // still in flight so a fault entry can never overtake an older response
+    // (an out-of-range redirect launches one, and its rsp_fault entry carries
+    // the earlier PC -- it has to reach decode first).
+    wire fault_push = pc_fault && (available >= 5'd1) && !rsp_cap && (inflight_q == 2'd0);
 
     // Read launch accepted this cycle.
     wire launch = bus_issue && imem_rsp_i.ready;
 
     always_comb begin
-        // Accept read data when draining stale responses (discard) or
+        // Accept read data when a stale response is owed (discard it) or
         // whenever the buffer has room for the two words a response can
-        // push. Depends only on registers (draining_q, count_q) + nothing
+        // push. Depends only on registers (stale_q, count_q) + nothing
         // from the slave's rvalid -> no combinational loop through the I-mem,
         // and deliberately NOT on redirect (see the timing rule in the header:
         // pred_valid_i drags the whole decoder onto anything redirect feeds).
-        imem_req_o.rready = draining_q || (count_q <= 4'd6);
+        imem_req_o.rready = (stale_q != 2'd0) || (count_q <= 4'd6);
 
-        // Issue a fetch when idle (inflight<2), not redirecting/draining, the
-        // PC is in range, and the buffer has room for the response (2 words
-        // reserved per in-flight read).
+        // Issue a fetch when idle (inflight<2) and the buffer has room for
+        // the response (2 words reserved per in-flight read). On a redirect
+        // cycle the address is the redirect target (see issue_addr) and may
+        // be out of range; rsp_fault converts the response.
         imem_req_o.valid  = bus_issue;
-        imem_req_o.addr   = pc_q;
+        imem_req_o.addr   = issue_addr;
     end
 
     // -----------------------------------------------------------------
     // 64-bit response split -> 32-bit buffer pushes (0, 1, or 2 words/cycle)
     // -----------------------------------------------------------------
-    wire do_rsp = rsp_cap && !draining_q;
+    // A response owed to the killed path (stale_q != 0) is accepted and
+    // dropped: no buffer push, no PC stamp read.
+    wire do_rsp = rsp_cap && (stale_q == 2'd0);
+    // The in-flight read was launched at an address outside the implemented
+    // I-mem (only a redirect cycle can do that -- see bus_issue). The memory
+    // decodes IMEM_ADDR_W bits, so its answer is an alias of real
+    // instructions: drop it and push one fault entry stamped with the exact
+    // faulting PC instead. req_pc_q is a flop, so this check costs nothing.
+    wire rsp_fault = |req_pc_q[XLEN-1:IMEM_ADDR_W];
+    wire do_rsp_data = do_rsp && !rsp_fault;  // push instruction words
+    wire do_rsp_fault = do_rsp && rsp_fault;  // push one fault entry
     wire rsp_two = ~req_pc_q[2];  // target in low half -> push both words
 
     wire [XLEN-1:0] rsp_low_pc = req_pc_q;
@@ -256,18 +345,21 @@ module fetch_stage #(
     // so decode's fe_pc[1] selects the right halfword. Using rsp_high_pc
     // (= base+4) for the [2]==1 case would clear bit[1] and make decode pick
     // the wrong halfword on a 2-aligned redirect into the high half
-    // (e.g. jalr to 0xee stamped 0xec). A fault push fills this slot
-    // (pc=pc_q, fault=1).
+    // (e.g. jalr to 0xee stamped 0xec). A fault fills this slot instead of an
+    // instruction in two cases: an out-of-range response (pc=req_pc_q, the
+    // exact faulting target) and the no-launch fault push (pc=pc_q).
     wire [XLEN-1:0] push0_pc = do_rsp ? rsp_low_pc : pc_q;
-    wire [31:0] push0_word = do_rsp ? (rsp_two ? rsp_low_word : rsp_high_word) : 32'd0;
-    wire push0_fault = !do_rsp;  // fault_push case (do_rsp==0)
+    wire [31:0] push0_word = do_rsp_data ? (rsp_two ? rsp_low_word : rsp_high_word) : 32'd0;
+    wire push0_fault = !do_rsp_data;
 
-    // Second push: the high half, only when pushing both words.
+    // Second push: the high half, only when pushing both words (data
+    // response only -- a fault response pushes exactly one entry).
     wire [XLEN-1:0] push1_pc = rsp_high_pc;
     wire [31:0] push1_word = rsp_high_word;
     wire push1_fault = 1'b0;
 
-    wire [1:0] push_cnt = do_rsp ? (rsp_two ? 2'd2 : 2'd1) : fault_push ? 2'd1 : 2'd0;
+    wire [1:0] push_cnt = do_rsp_data ?
+        (rsp_two ? 2'd2 : 2'd1) : (do_rsp_fault || fault_push) ? 2'd1 : 2'd0;
 
     // -----------------------------------------------------------------
     // Buffer pop: decode consumes the head when it is not back-pressuring.
@@ -288,7 +380,7 @@ module fetch_stage #(
         pc_d       = pc_q;
         req_pc_d   = req_pc_q;
         inflight_d = inflight_q;
-        draining_d = draining_q;
+        stale_d    = stale_q;
         head_d     = head_q;
         tail_d     = tail_q;
         count_d    = count_q;
@@ -297,7 +389,7 @@ module fetch_stage #(
             // ---- Redirect (highest priority) ----
             // Execute (trap/mret/mispredict) wins over a decode prediction;
             // redirect_addr selects accordingly. Kills the buffer, points pc_q
-            // at the target, arms draining for any in-flight reads. The
+            // at the target, marks every in-flight read stale. The
             // predicted branch at the head is consumed into decode's de_q this
             // cycle (combinational read), so zeroing the buffer only discards
             // the younger wrong-path entries behind it.
@@ -305,23 +397,19 @@ module fetch_stage #(
             head_d  = 3'd0;  // kill the buffer
             tail_d  = 3'd0;
             count_d = 4'd0;
-            // No launch this cycle (bus_issue is gated on !redirect). A
-            // push may still land at the old tail_q and a pop may still be
+            // A push may still land at the old tail_q and a pop may still be
             // computed: both are harmless because head/tail/count are zeroed
-            // here (see the header). inflight is updated below.
-        end else if (draining_q) begin
-            // ---- Drain stale in-flight responses (discard) ----
-            // No push, no pop, no launch. rready is high so the I-mem skid
-            // drains at max rate. Buffer stays empty (killed on redirect).
+            // here (see the header). inflight and stale are updated below.
         end else begin
             // ---- Normal: issue + split-push + buffer drain ----
-            if (launch) begin
-                req_pc_d = pc_q;  // remember the in-flight read address
-                pc_d     = (pc_q & ~32'h7) + 32'd8;  // next 8-byte boundary
-            end
+            // The word at pc_q is already in flight when redir_launched_q,
+            // so pc steps past it -- twice if this cycle launched the block
+            // after it as well. Every one of these adders runs on pc_q.
+            if (redir_launched_q) pc_d = launch ? pc_next_block2 : pc_next_block;
+            else if (launch) pc_d = pc_next_block;
             if (fault_push) begin
                 // A fault PC advances past the unfetchable 8-byte word.
-                pc_d = (pc_q & ~32'h7) + 32'd8;
+                pc_d = pc_next_block;
             end
             // Buffer FIFO advance. buf_pop_cnt is 0/1/2 (3-bit wrap on head).
             head_d  = head_q + buf_pop_cnt;
@@ -335,11 +423,24 @@ module fetch_stage #(
         if (launch) inflight_d = inflight_d + 2'd1;
         if (rsp_cap) inflight_d = inflight_d - 2'd1;
 
-        // Draining arms on a redirect and persists while any stale read is
-        // still outstanding; it clears the cycle inflight reaches 0 (so a
-        // redirect with nothing in flight costs no drain bubble, matching
-        // the old flushed_q behaviour).
-        draining_d = (redirect || draining_q) && (inflight_d != 2'd0);
+        // The in-flight read address, wherever the launch came from. On a
+        // redirect cycle issue_addr is the target; otherwise it is pc_q.
+        if (launch) req_pc_d = issue_addr;
+
+        // A redirect-cycle launch defers the pc advance to the next cycle.
+        redir_launched_d = redirect && launch;
+
+        // stale tracks how many outstanding responses still belong to the
+        // killed path. An accepted response retires the oldest one; a
+        // redirect re-marks everything still outstanding (inflight_d is
+        // already net of this cycle's launch/rsp_cap, and bus_issue is gated
+        // on !redirect, so on a redirect cycle inflight_d is exactly the set
+        // of reads the new path must ignore). The redirect assignment comes
+        // last so it wins over the decrement.
+        if (rsp_cap && (stale_q != 2'd0)) stale_d = stale_q - 2'd1;
+        // NOTE: inflight_q - rsp_cap, NOT inflight_d: the read launched on
+        // this very cycle belongs to the NEW path and must not be discarded.
+        if (redirect) stale_d = inflight_q - {1'b0, rsp_cap};
     end
 
     // -----------------------------------------------------------------
@@ -347,21 +448,23 @@ module fetch_stage #(
     // -----------------------------------------------------------------
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            pc_q       <= boot_addr_i;
-            req_pc_q   <= '0;
-            inflight_q <= 2'd0;
-            draining_q <= 1'b0;
-            head_q     <= 3'd0;
-            tail_q     <= 3'd0;
-            count_q    <= 4'd0;
+            pc_q             <= boot_addr_i;
+            req_pc_q         <= '0;
+            inflight_q       <= 2'd0;
+            stale_q          <= 2'd0;
+            redir_launched_q <= 1'b0;
+            head_q           <= 3'd0;
+            tail_q           <= 3'd0;
+            count_q          <= 4'd0;
         end else begin
-            pc_q       <= pc_d;
-            req_pc_q   <= req_pc_d;
-            inflight_q <= inflight_d;
-            draining_q <= draining_d;
-            head_q     <= head_d;
-            tail_q     <= tail_d;
-            count_q    <= count_d;
+            pc_q             <= pc_d;
+            req_pc_q         <= req_pc_d;
+            inflight_q       <= inflight_d;
+            stale_q          <= stale_d;
+            redir_launched_q <= redir_launched_d;
+            head_q           <= head_d;
+            tail_q           <= tail_d;
+            count_q          <= count_d;
             // Buffer writes: push0 at tail, push1 at tail+1 (3-bit wrap).
             if (push_cnt >= 2'd1) begin
                 buf_instr_q[tail_q] <= push0_word;
