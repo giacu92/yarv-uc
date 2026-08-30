@@ -86,8 +86,17 @@ OPT ?= -O2
 CFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
           -fno-builtin -fno-stack-protector -fomit-frame-pointer $(OPT) -Wall -g -fno-pie \
           -I$(COMMON_DIR) $(EXTRA_CFLAGS)
+# Linker relaxation is ON. With --no-relax every `call` stays the two-instruction
+# `auipc ra,X; jalr ra,off(ra)` form, which costs an instruction *and* an
+# unpredictable indirect jump: the branch predictor computes PC-relative targets
+# at decode, so a jal is predicted for free while a jalr is not predicted at all
+# and eats a full ~3.1-cycle mispredict flush. Relaxing them to `jal` removed 110
+# of Dhrystone's 111 static jalr/jr sites, cut its mispredicts 52% (31995 ->
+# 15505) and its score 677 -> 651 cycles/iteration. gp-relative relaxation is
+# inert here because no linker script defines __global_pointer$ and start.S never
+# loads gp, so ld simply skips it -- do not add one without also setting gp.
 LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
-           -T $(LINK_LD) -Wl,--no-relax -Wl,--no-check-sections -no-pie -Wl,-N \
+           -T $(LINK_LD) -Wl,--no-check-sections -no-pie -Wl,-N \
            $(EXTRA_LDFLAGS)
 
 BUILD    := build

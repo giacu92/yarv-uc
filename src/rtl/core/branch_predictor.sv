@@ -5,7 +5,7 @@
 import rv32_pkg::*;
 
 /**
- * Branch predictor — gshare 2-bit PHT + 6-bit GHR + 8-entry RAS.
+ * Branch predictor — gshare 2-bit PHT + 7-bit GHR + 8-entry RAS.
  *
  * Phase 1 of the branch-prediction add: direction prediction for conditional
  * branches (gshare PHT) + return-address prediction for JALR returns (RAS).
@@ -20,19 +20,19 @@ import rv32_pkg::*;
  *
  * Timing rule: the lookup depends ONLY on the PC and the GHR — never on
  * register data — so it sits off the `regfile -> forward mux -> branch
- * compare -> PC redirect` critical path. The PHT (64x2b), GHR (6b) and RAS
- * (8x32b) live in FF/LUTRAM with a combinational lookup; for 64 entries that
- * avoids adding a cycle to the frontend (note §11).
+ * compare -> PC redirect` critical path. The PHT (128x2b) lives in LUT-RAM, the
+ * GHR (7b) and RAS (8x32b) in flops, all with a combinational lookup, so no
+ * cycle is added to the frontend (note §11).
  *
  * Training happens ONLY at resolve (the execute training port), never on
  * speculative outcomes. In-order single-issue means a squashed instruction
  * never resolves, so there is no wrong-path contamination of the PHT/GHR/RAS.
  * The PHT update is indexed by the gshare snapshot carried in de_t
- * (pred_pht_index = pc[6:1]^ghr at decode time), not the live GHR — an older
+ * (pred_pht_index = pc[7:1]^ghr at decode time), not the live GHR — an older
  * branch may have shifted the GHR between this branch's decode and its
  * resolve, and the update must use the history the branch was predicted with.
  *
- * GHR (global history register): 6 bits, shifted left on each resolved
+ * GHR (global history register): 7 bits, shifted left on each resolved
  * conditional branch (newest outcome in bit 0). Used to xor the PHT index
  * (gshare) so correlated branches share state usefully. Updated only for
  * conditional branches (note Appendix A).
@@ -72,40 +72,64 @@ module branch_predictor (
 
     // Field aliases — keep the body reading the same names as the old per-
     // wire port list, so the lookup/train logic below is unchanged.
-    wire [XLEN-1:0] lookup_pc_i = lookup_req_i.pc;
-    wire            train_valid_i = train_i.valid;
-    wire            train_cond_i = train_i.cond;
-    wire            train_call_i = train_i.call;
-    wire            train_return_i = train_i.ret;
-    wire            train_taken_i = train_i.taken;
-    wire [     5:0] train_pht_index_i = train_i.pht_index;
-    wire [XLEN-1:0] train_push_pc_i = train_i.push_pc;
+    wire [        XLEN-1:0] lookup_pc_i = lookup_req_i.pc;
+    wire                    train_valid_i = train_i.valid;
+    wire                    train_cond_i = train_i.cond;
+    wire                    train_call_i = train_i.call;
+    wire                    train_return_i = train_i.ret;
+    wire                    train_taken_i = train_i.taken;
+    wire [BP_PHT_IDX_W-1:0] train_pht_index_i = train_i.pht_index;
+    wire [        XLEN-1:0] train_push_pc_i = train_i.push_pc;
 
     // -------------------------------------------------------------------
     // Storage
     // -------------------------------------------------------------------
-    localparam int unsigned PHT_DEPTH = 64;
-    localparam int unsigned GHR_W = 6;
-    localparam int unsigned RAS_DEPTH = 8;
+    // Geometry lives in rv32_pkg because the de_t / bp_train_t index fields
+    // must be the same width as this table's index (see BP_PHT_DEPTH there
+    // for the trace-driven sizing measurements).
+    localparam int unsigned PHT_DEPTH = BP_PHT_DEPTH;
+    localparam int unsigned IDX_W = BP_PHT_IDX_W;
+    localparam int unsigned GHR_W = BP_GHR_W;
+    localparam int unsigned RAS_DEPTH = BP_RAS_DEPTH;
+    localparam int unsigned RAS_PTR_W = $clog2(RAS_DEPTH);
 
-    logic [      1:0] pht_q                                      [PHT_DEPTH];
-    logic [GHR_W-1:0] ghr_q;
-    logic [ XLEN-1:0] ras_q                                      [RAS_DEPTH];
-    logic [      2:0] ras_ptr_q;  // next push slot (wraps mod 8)
-    logic [      3:0] ras_cnt_q;  // 0..8, saturating
+    // The PHT is LUT-RAM, NOT a flop array. At 512x2 a flop array would be
+    // 1024 FF, on a device where the ~430 flops this predictor already adds
+    // are what dropped PnR from 50.0 to 47.4 MHz by congesting the
+    // regfile -> forward -> de_bus.rs2_data path. As distributed RAM the same
+    // table costs LUTs instead and removes flops from that neighbourhood.
+    // Two requirements the style imposes, both met here: reads are
+    // asynchronous (the decode lookup is combinational, and the train-side
+    // read-modify-write reads a second address in the cycle it writes, so
+    // synthesis duplicates the array for that port), and there is no reset
+    // port, so the weak-not-taken initialisation is an `initial` block.
+    // Losing the reset is harmless by construction: the PHT is a hint and
+    // execute is the golden resolver, so an uninitialised table costs at most
+    // a few cold-start mispredicts and can never produce a wrong retire.
+    (* ram_style = "distributed" *)
+    (* syn_ramstyle = "distributed" *)
+    logic [          1:0] pht_q                                              [PHT_DEPTH];
+    logic [    GHR_W-1:0] ghr_q;
+    logic [     XLEN-1:0] ras_q                                              [RAS_DEPTH];
+    logic [RAS_PTR_W-1:0] ras_ptr_q;  // next push slot (wraps mod RAS_DEPTH)
+    logic [  RAS_PTR_W:0] ras_cnt_q;  // 0..RAS_DEPTH, saturating
+
+    initial begin
+        for (int i = 0; i < PHT_DEPTH; i++) pht_q[i] = 2'b01;  // weak not-taken
+    end
 
     // -------------------------------------------------------------------
     // Lookup (combinational, PC + GHR only)
     // -------------------------------------------------------------------
-    // gshare index. pc[6:1], not pc[7:2]: IALIGN is 16 with the C extension,
-    // so pc[1] is a real address bit — dropping it folds two compressed
-    // branches 2 bytes apart onto one PHT entry. pc[6:1] covers the same 64
-    // entries without that aliasing.
-    wire  [      5:0] lookup_index = lookup_pc_i[6:1] ^ ghr_q;
+    // gshare index. pc[IDX_W:1], not pc[IDX_W+1:2]: IALIGN is 16 with the C
+    // extension, so pc[1] is a real address bit — dropping it folds two
+    // compressed branches 2 bytes apart onto one PHT entry. pc[IDX_W:1]
+    // covers the whole table without that aliasing.
+    wire [    IDX_W-1:0] lookup_index = lookup_pc_i[IDX_W:1] ^ ghr_q;
     // Top = most-recently-pushed entry = slot (ptr - 1). When empty the top is
     // a don't-care (ras_valid=0 gates its use in decode).
-    wire  [      2:0] ras_top_idx = ras_ptr_q - 3'd1;
-    wire              ras_valid = (ras_cnt_q != 4'd0);
+    wire [RAS_PTR_W-1:0] ras_top_idx = ras_ptr_q - RAS_PTR_W'(1);
+    wire                 ras_valid = (ras_cnt_q != '0);
 
     assign lookup_rsp_o.pht_index = lookup_index;
     assign lookup_rsp_o.pht_taken = pht_q[lookup_index][1];
@@ -125,43 +149,60 @@ module branch_predictor (
     // -------------------------------------------------------------------
     // Next-state
     // -------------------------------------------------------------------
-    logic [      1:0] pht_d     [PHT_DEPTH];
-    logic [GHR_W-1:0] ghr_d;
-    logic [ XLEN-1:0] ras_d     [RAS_DEPTH];
-    logic [      2:0] ras_ptr_d;
-    logic [      3:0] ras_cnt_d;
+    logic [    GHR_W-1:0] ghr_d;
+    logic [     XLEN-1:0] ras_d     [RAS_DEPTH];
+    logic [RAS_PTR_W-1:0] ras_ptr_d;
+    logic [  RAS_PTR_W:0] ras_cnt_d;
 
     always_comb begin
         // Default: hold.
-        for (int i = 0; i < PHT_DEPTH; i++) pht_d[i] = pht_q[i];
         for (int i = 0; i < RAS_DEPTH; i++) ras_d[i] = ras_q[i];
         ghr_d     = ghr_q;
         ras_ptr_d = ras_ptr_q;
         ras_cnt_d = ras_cnt_q;
 
         if (train_valid_i) begin
-            // PHT + GHR: conditional only. Index from the de_t snapshot so the
-            // update uses the history the branch was predicted with, not the
-            // (possibly since-shifted) live GHR.
-            if (train_cond_i) begin
-                pht_d[train_pht_index_i] = sat_update(pht_q[train_pht_index_i], train_taken_i);
-                ghr_d                    = {ghr_q[GHR_W-2:0], train_taken_i};
-            end
-            // RAS push (call). Circular: write at ptr, advance ptr (mod 8),
-            // saturate count at RAS_DEPTH (a push when full overwrites the
-            // oldest entry — standard circular-RAS behaviour).
+            // GHR: conditional only, shifted with the resolved outcome. The
+            // PHT write that goes with it is in its own always_ff below.
+            if (train_cond_i) ghr_d = {ghr_q[GHR_W-2:0], train_taken_i};
+            // RAS push (call). Circular: write at ptr, advance ptr (mod
+            // RAS_DEPTH), saturate count at RAS_DEPTH (a push when full
+            // overwrites the oldest entry — standard circular-RAS behaviour).
             if (train_call_i) begin
                 ras_d[ras_ptr_q] = train_push_pc_i;
-                ras_ptr_d        = ras_ptr_q + 3'd1;
-                ras_cnt_d        = (ras_cnt_q == RAS_DEPTH) ? ras_cnt_q : (ras_cnt_q + 4'd1);
+                ras_ptr_d        = ras_ptr_q + RAS_PTR_W'(1);
+                ras_cnt_d        = (ras_cnt_q == RAS_DEPTH) ? ras_cnt_q : (ras_cnt_q + 1'b1);
             end
-            // RAS pop (return). Decrement ptr (mod 8); count floors at 0 (a
-            // pop when empty just walks the pointer, harmless: ras_valid_o=0).
+            // RAS pop (return). Decrement ptr (mod RAS_DEPTH); count floors at
+            // 0 (a pop when empty just walks the pointer, harmless:
+            // ras_valid=0).
             if (train_return_i) begin
-                ras_ptr_d = ras_ptr_q - 3'd1;
-                ras_cnt_d = (ras_cnt_q == 4'd0) ? 4'd0 : (ras_cnt_q - 4'd1);
+                ras_ptr_d = ras_ptr_q - RAS_PTR_W'(1);
+                ras_cnt_d = (ras_cnt_q == '0) ? '0 : (ras_cnt_q - 1'b1);
             end
         end
+    end
+
+    // -------------------------------------------------------------------
+    // PHT write port
+    // -------------------------------------------------------------------
+    // Deliberately its own always_ff with a single conditional element
+    // assignment. The whole-array form this replaced
+    // (`for (i) pht_q[i] <= pht_d[i]`) describes PHT_DEPTH individually
+    // enabled registers and cannot infer RAM — at 512 entries that is 1024
+    // flops the fabric has no room for at 50 MHz. Index comes from the de_t
+    // snapshot so the update uses the history the branch was predicted with,
+    // not the (possibly since-shifted) live GHR.
+    //
+    // pht_train_ctr is the read-modify-write's read: a second asynchronous
+    // read address alongside the decode lookup, which synthesis serves by
+    // duplicating the array. It reads the pre-write value, exactly as the old
+    // flop array did.
+    wire       pht_we = train_valid_i & train_cond_i;
+    wire [1:0] pht_train_ctr = pht_q[train_pht_index_i];
+
+    always_ff @(posedge clk_i) begin
+        if (pht_we) pht_q[train_pht_index_i] <= sat_update(pht_train_ctr, train_taken_i);
     end
 
     // -------------------------------------------------------------------
@@ -169,15 +210,13 @@ module branch_predictor (
     // -------------------------------------------------------------------
     always_ff @(posedge clk_i) begin
         if (!rstn_i) begin
-            for (int i = 0; i < PHT_DEPTH; i++) pht_q[i] <= 2'b01;  // weak not-taken
             ghr_q     <= '0;
-            ras_ptr_q <= 3'd0;
-            ras_cnt_q <= 4'd0;
-            // ras_q unset on reset (top is gated by ras_valid_o); the sim
+            ras_ptr_q <= '0;
+            ras_cnt_q <= '0;
+            // ras_q unset on reset (top is gated by ras_valid); the sim
             // zero-inits unsynthesised flops, and silicon never reads a slot
             // before a push writes it (count floors the valid window).
         end else begin
-            for (int i = 0; i < PHT_DEPTH; i++) pht_q[i] <= pht_d[i];
             for (int i = 0; i < RAS_DEPTH; i++) ras_q[i] <= ras_d[i];
             ghr_q     <= ghr_d;
             ras_ptr_q <= ras_ptr_d;

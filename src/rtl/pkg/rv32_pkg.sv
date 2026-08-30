@@ -9,6 +9,46 @@ package rv32_pkg;
     localparam int unsigned STRB_WIDTH = XLEN / 8;
 
     // ---------------------------------------------------------------
+    // Branch-predictor geometry. One place, because three files have to
+    // agree: branch_predictor.sv sizes the PHT/GHR from it, and the
+    // bp_lookup_rsp_t / bp_train_t / de_t index fields below are all
+    // BP_PHT_IDX_W wide (the gshare index snapshot rides D/E to resolve).
+    //
+    // 128 entries x 2 bits, 7 bits of global history. Sized by timing, not
+    // by accuracy: the table is read combinationally at decode and that read
+    // feeds fetch's launch/inflight logic in the same cycle, so PHT depth is
+    // directly on a critical path (2026-08-31 PnR: a 512-entry table put
+    // pht_index -> RAM out at 6.1 ns, 3.36 ns of it pure routing across the
+    // spread-out primitives, landing that path at -1.024 ns).
+    //
+    // Measured CoreMark cost of shrinking it (ITERATIONS=4, -O3):
+    //   512 x 9 -> 2004284 ticks, 18608 mispredicts   (1.99 CoreMark/MHz)
+    //   256 x 8 -> 2010433 ticks, 23601 mispredicts   (+0.31% cycles)
+    //   128 x 7 -> 2017387 ticks, 24944 mispredicts   (+0.65% cycles)
+    // 0.65% of cycles is cheap for ~1 ns of slack -- 1 MHz is worth 2%. Move
+    // up to 256 (or back to 512) only if PnR says the slack is there; the
+    // three localparams below plus nothing else need to change, since the
+    // index width and every struct field carrying it are derived.
+    //
+    // The original 64x2 / 6-bit table was aliasing-bound, not history-bound:
+    // a trace-driven model over the real retire streams put a 64-entry gshare
+    // *behind* a 64-entry bimodal on CoreMark (7674 vs 6289 mispredicts).
+    // 128 is the first size where the history pays for itself.
+    //
+    // GHR width == index width is deliberate: gshare xors the full history
+    // into the full index, so a shorter GHR wastes index bits.
+    //
+    // If the accuracy of a big table is ever wanted back without the timing
+    // cost, the structural fix is to look the PHT up at instruction-buffer
+    // PUSH time and carry the 1-bit prediction in the buffer entry -- that
+    // takes the RAM read off the decode->fetch path entirely, at the price of
+    // a slightly staler GHR.
+    localparam int unsigned BP_PHT_DEPTH = 128;
+    localparam int unsigned BP_PHT_IDX_W = 7;  // $clog2(BP_PHT_DEPTH)
+    localparam int unsigned BP_GHR_W = 7;  // == BP_PHT_IDX_W (full-width gshare)
+    localparam int unsigned BP_RAS_DEPTH = 8;
+
+    // ---------------------------------------------------------------
     // Peripheral address map. These are the single source of truth for
     // the peri xbar windows: the board top and the sim top pass them to
     // axi4_lite_xbar_3 as BASE0/BASE1/BASE2 rather than repeating
@@ -123,10 +163,10 @@ package rv32_pkg;
 
     // Predictor -> decode: the looked-up prediction.
     typedef struct packed {
-        logic            pht_taken;  // PHT[counter].MSB (predict taken)
-        logic            ras_valid;  // RAS non-empty
-        logic [XLEN-1:0] ras_top;    // RAS top (predicted return target)
-        logic [5:0]      pht_index;  // pc[6:1]^ghr snapshot (carried in de_t)
+        logic                    pht_taken;  // PHT[counter].MSB (predict taken)
+        logic                    ras_valid;  // RAS non-empty
+        logic [XLEN-1:0]         ras_top;    // RAS top (predicted return target)
+        logic [BP_PHT_IDX_W-1:0] pht_index;  // pc[7:1]^ghr snapshot (carried in de_t)
     } bp_lookup_rsp_t;
 
     // Execute -> predictor: training at resolve. Kind bits are mutually
@@ -134,13 +174,13 @@ package rv32_pkg;
     // the de_t snapshot so the PHT update uses the history the branch was
     // predicted with. train_push_pc is pc-link, the return address for a push.
     typedef struct packed {
-        logic            valid;
-        logic            cond;       // conditional -> PHT sat-update + GHR shift
-        logic            call;       // call -> RAS push push_pc
-        logic            ret;        // return -> RAS pop
-        logic            taken;      // resolved taken outcome
-        logic [5:0]      pht_index;
-        logic [XLEN-1:0] push_pc;
+        logic                    valid;
+        logic                    cond;       // conditional -> PHT sat-update + GHR shift
+        logic                    call;       // call -> RAS push push_pc
+        logic                    ret;        // return -> RAS pop
+        logic                    taken;      // resolved taken outcome
+        logic [BP_PHT_IDX_W-1:0] pht_index;
+        logic [XLEN-1:0]         push_pc;
     } bp_train_t;
 
     // ---------------------------------------------------------------
@@ -323,48 +363,48 @@ package rv32_pkg;
     // execute stage. Single-direction packed struct, legal as one port
     // (matches the mem_req_t / mem_rsp_t convention).
     typedef struct packed {
-        logic            valid;            // a decoded instr is held this cycle
-        logic [XLEN-1:0] pc;               // instr PC (P for low/32-bit, P+2 for upper half)
-        logic [XLEN-1:0] instr;            // 32-bit word decode treated (native or RVC-expanded)
-        logic            is_compressed;    // source was a 16-bit RVC instr
-        logic [4:0]      rs1_addr;
-        logic [4:0]      rs2_addr;
-        logic [XLEN-1:0] rs1_data;         // operand captured at decode (async read)
+        logic valid;  // a decoded instr is held this cycle
+        logic [XLEN-1:0] pc;  // instr PC (P for low/32-bit, P+2 for upper half)
+        logic [XLEN-1:0] instr;  // 32-bit word decode treated (native or RVC-expanded)
+        logic is_compressed;  // source was a 16-bit RVC instr
+        logic [4:0] rs1_addr;
+        logic [4:0] rs2_addr;
+        logic [XLEN-1:0] rs1_data;  // operand captured at decode (async read)
         logic [XLEN-1:0] rs2_data;
-        logic [XLEN-1:0] imm;              // sign-extended I/S/B/U/J immediate
-        logic [4:0]      rd;
-        logic            reg_write;        // write back to rd
-        logic            csr_wren;         // write back to CSR (Zicsr subset)
-        csr_op_t         csr_op;           // CSR access type (Zicsr subset)
-        logic [11:0]     csr_addr;         // CSR address (Zicsr subset)
-        alu_op_t         alu_op;
-        alu_src_a_t      alu_src_a;
-        alu_src_b_t      alu_src_b;
-        logic            mem_read;
-        logic            mem_write;
-        mem_size_t       mem_size;
-        logic            mem_unsigned;     // load zero-extend (LBU/LHU)
-        logic [1:0]      mem_shamt;        // Zilx index scale (0 unscaled, log2 size scaled)
-        wb_src_t         wb_src;
-        branch_t         branch_type;
-        sys_op_t         sys_op;           // OPC_SYSTEM funct3=0 / fence ops
-        logic            exception;        // decode requests a sync trap now
+        logic [XLEN-1:0] imm;  // sign-extended I/S/B/U/J immediate
+        logic [4:0] rd;
+        logic reg_write;  // write back to rd
+        logic csr_wren;  // write back to CSR (Zicsr subset)
+        csr_op_t csr_op;  // CSR access type (Zicsr subset)
+        logic [11:0] csr_addr;  // CSR address (Zicsr subset)
+        alu_op_t alu_op;
+        alu_src_a_t alu_src_a;
+        alu_src_b_t alu_src_b;
+        logic mem_read;
+        logic mem_write;
+        mem_size_t mem_size;
+        logic mem_unsigned;  // load zero-extend (LBU/LHU)
+        logic [1:0] mem_shamt;  // Zilx index scale (0 unscaled, log2 size scaled)
+        wb_src_t wb_src;
+        branch_t branch_type;
+        sys_op_t sys_op;  // OPC_SYSTEM funct3=0 / fence ops
+        logic exception;  // decode requests a sync trap now
         logic [XLEN-1:0] exception_cause;  // mcause for the sync trap
-        logic [XLEN-1:0] exception_tval;   // mtval for the sync trap (illegal=instr, else 0)
-        logic            illegal;          // opcode/encoding not decoded this phase
+        logic [XLEN-1:0] exception_tval;  // mtval for the sync trap (illegal=instr, else 0)
+        logic illegal;  // opcode/encoding not decoded this phase
         // Branch-prediction metadata (prediction-at-decode). pred_valid marks
         // a control-flow instr decode attempted to predict; pred_taken is the
         // speculated direction; pred_target is the taken target (valid when
         // pred_taken); pred_source attributes the hit; pred_pht_index is the
-        // gshare index snapshot (pc[6:1]^ghr) taken at decode, carried so the
+        // gshare index snapshot (pc[7:1]^ghr) taken at decode, carried so the
         // PHT update at resolve uses the history the branch was predicted with
         // (an older branch may have shifted the GHR in between). Execute
         // compares these against the resolved outcome -> mispredict.
-        logic            pred_valid;
-        logic            pred_taken;
+        logic pred_valid;
+        logic pred_taken;
         logic [XLEN-1:0] pred_target;
-        pred_source_t    pred_source;
-        logic [5:0]      pred_pht_index;
+        pred_source_t pred_source;
+        logic [BP_PHT_IDX_W-1:0] pred_pht_index;
     } de_t;
 
 endpackage

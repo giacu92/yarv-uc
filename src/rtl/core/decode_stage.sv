@@ -670,12 +670,12 @@ module decode_stage #(
     // calls/indirect fall to execute (a call still pushes the RAS at resolve,
     // where execute re-derives the kind from branch_type/rd).
     logic is_cf, is_cond_cf, is_return_cf;
-    logic                    pred_valid;
-    logic                    pred_taken;
-    logic         [XLEN-1:0] pred_target;
-    pred_source_t            pred_source;
-    logic         [     5:0] pred_pht_index;
-    logic         [XLEN-1:0] pred_dir_target;  // src_pc + imm (PC-relative target)
+    logic                            pred_valid;
+    logic                            pred_taken;
+    logic         [        XLEN-1:0] pred_target;
+    pred_source_t                    pred_source;
+    logic         [BP_PHT_IDX_W-1:0] pred_pht_index;
+    logic         [        XLEN-1:0] pred_dir_target;  // src_pc + imm (PC-relative target)
 
     // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
     // and driven with a default every cycle in the decode always_comb below:
@@ -1295,7 +1295,7 @@ module decode_stage #(
         pred_source = PRED_NONE;
         pred_taken = 1'b0;
         pred_target = '0;
-        pred_pht_index = 6'd0;
+        pred_pht_index = '0;
         if (is_cf) begin
             if (is_return_cf) begin
                 // Return: target from the RAS; taken only if the RAS has an
@@ -1356,7 +1356,7 @@ module decode_stage #(
         de_d.pred_taken      = (BP_EN != 0) & pred_taken;
         de_d.pred_target     = (BP_EN != 0) ? pred_target : '0;
         de_d.pred_source     = (BP_EN != 0) ? pred_source : PRED_NONE;
-        de_d.pred_pht_index  = (BP_EN != 0) ? pred_pht_index : 6'd0;
+        de_d.pred_pht_index  = (BP_EN != 0) ? pred_pht_index : '0;
         // reg_write / mem_read / mem_write / csr_wren are squashed by
         // illegal. A spanning stitch decodes a real 32-bit instr through
         // the uniform decoder, so spanning no longer forces illegal.

@@ -46,26 +46,85 @@ module alu (
     // -----------------------------------------------------------
     // Base RV32I — combinational
     // -----------------------------------------------------------
-    logic [XLEN-1:0] base_result;
-    logic [     4:0] shamt_rb;  // shift amount from operand_b (SLL/SRL/SRA)
+    // Organised by ARRIVAL TIME, not by opcode. The ALU sits in the middle
+    // of the machine's critical path
+    //   regfile -> forward mux -> operand mux -> ALU -> wb mux -> forward mux
+    // and the adder is the last thing on it to settle, so the adder's output
+    // gets its own final 2:1 mux and everything that settles earlier is
+    // folded into the other input of that mux.
+    //
+    // The previous form -- an 11-way `unique case` building base_result, with
+    // a second if/else selecting div/mul on top -- put the adder deep inside
+    // the first mux and cost 5.50 ns of mux depth after the carry chain,
+    // MORE than the 4.76 ns adder feeding it (measured on the 2026-08-30
+    // 49.359 MHz PnR run). Selecting on alu_op_i is free by comparison:
+    // alu_op_i is a flopped de_q field, stable long before the operands
+    // finish forwarding, so every select below is ready early.
+    //
+    // Ordering of the two late candidates is measured, not assumed. On the
+    // 2026-08-31 PnR run the DSP's output (`mul_ss`) arrives 3.76 ns after
+    // its operands and is the LATEST signal in the block -- later than the
+    // adder's carry chain. An earlier version of this file folded MUL in
+    // with the early candidates on the assumption it had slack; it did not,
+    // and MUL immediately became the critical path at -1.041 ns with five
+    // mux levels behind the DSP. So: MUL takes the final mux (1 level), the
+    // adder the one behind it (2 levels), and genuinely early candidates
+    // (div / compare / shift / logic) sit deepest (3 levels).
+
+    logic [4:0] shamt_rb;  // shift amount from operand_b (SLL/SRL/SRA)
     assign shamt_rb = operand_b_i[4:0];
 
+    // ---- the one adder ----------------------------------------
+    // ADD/LX add; SUB/SLT/SLTU subtract as a + ~b + 1. One carry chain
+    // serves all five, so SLT/SLTU no longer instantiate comparators of
+    // their own -- that removes two more wide candidates from the mux and
+    // one more 32-bit carry chain from the fabric.
+    logic            op_is_sub;  // SUB / SLT / SLTU: a + ~b + 1
+    logic            op_is_lx;  // Zilx EA: a + (b << shamt)
+    logic [XLEN-1:0] addend_b;
+    logic [  XLEN:0] adder_sum;  // MSB = carry-out, used by SLTU
+
+    assign op_is_sub = (alu_op_i == ALU_SUB) || (alu_op_i == ALU_SLT) || (alu_op_i == ALU_SLTU);
+    assign op_is_lx  = (alu_op_i == ALU_LX);
+
+    always_comb begin
+        if (op_is_sub) addend_b = ~operand_b_i;
+        else if (op_is_lx) addend_b = operand_b_i << shamt_i;
+        else addend_b = operand_b_i;
+    end
+
+    assign adder_sum = {1'b0, operand_a_i} + {1'b0, addend_b} + {{XLEN{1'b0}}, op_is_sub};
+
+    // ---- compares, read off that same adder --------------------
+    // Unsigned: a + ~b + 1 carries out exactly when a >= b, so a < b is the
+    // inverted carry-out. Signed: differing sign bits decide on their own
+    // (the negative operand is the smaller), otherwise the difference's sign
+    // bit decides. Both are one LUT on top of the adder.
+    logic cmp_lt;
+    assign cmp_lt = (alu_op_i == ALU_SLTU) ? ~adder_sum[XLEN] :
+        ((operand_a_i[XLEN-1] ^ operand_b_i[XLEN-1]) ? operand_a_i[XLEN-1] : adder_sum[XLEN-1]);
+
+    // ---- everything that settles early -------------------------
+    // Shifts and bitwise logic: no carry chain, so these can afford to sit
+    // behind the deeper half of the mux tree.
+    logic [XLEN-1:0] logic_shift_result;
     always_comb begin
         unique case (alu_op_i)
-            ALU_ADD:  base_result = operand_a_i + operand_b_i;
-            ALU_SUB:  base_result = operand_a_i - operand_b_i;
-            ALU_SLL:  base_result = operand_a_i << shamt_rb;
-            ALU_SLT:  base_result = {31'b0, $signed(operand_a_i) < $signed(operand_b_i)};
-            ALU_SLTU: base_result = {31'b0, operand_a_i < operand_b_i};
-            ALU_XOR:  base_result = operand_a_i ^ operand_b_i;
-            ALU_SRL:  base_result = operand_a_i >> shamt_rb;
-            ALU_SRA:  base_result = $signed(operand_a_i) >>> shamt_rb;
-            ALU_OR:   base_result = operand_a_i | operand_b_i;
-            ALU_AND:  base_result = operand_a_i & operand_b_i;
-            ALU_LX:   base_result = operand_a_i + (operand_b_i << shamt_i);  // Zilx
-            default:  base_result = '0;
+            ALU_SLL: logic_shift_result = operand_a_i << shamt_rb;
+            ALU_SRL: logic_shift_result = operand_a_i >> shamt_rb;
+            ALU_SRA: logic_shift_result = $signed(operand_a_i) >>> shamt_rb;
+            ALU_XOR: logic_shift_result = operand_a_i ^ operand_b_i;
+            ALU_OR:  logic_shift_result = operand_a_i | operand_b_i;
+            ALU_AND: logic_shift_result = operand_a_i & operand_b_i;
+            default: logic_shift_result = '0;
         endcase
     end
+
+    // Selects for the final mux. sel_adder is the only one the adder's own
+    // output has to wait on, and it depends on alu_op_i alone.
+    logic sel_adder, sel_cmp;
+    assign sel_adder = (alu_op_i == ALU_ADD) || (alu_op_i == ALU_SUB) || op_is_lx;
+    assign sel_cmp   = (alu_op_i == ALU_SLT) || (alu_op_i == ALU_SLTU);
 
     // -----------------------------------------------------------
     // MUL — single-cycle (DSP inference)
@@ -226,17 +285,27 @@ module alu (
     // -----------------------------------------------------------
     // Mux finale + valid
     // -----------------------------------------------------------
+    // Ordered by measured arrival: MUL (DSP, latest) gets the final mux,
+    // the adder the one behind it, everything genuinely early sits deepest.
+    // See the arrival-time note at the top of the base-RV32I block.
+    logic [XLEN-1:0] early_result;
+
     always_comb begin
-        if (is_div_op) begin
-            result_o       = div_result;
-            result_valid_o = (div_state_q == DIV_DONE);
-        end else if (is_mul_op) begin
-            result_o       = mul_result;
-            result_valid_o = 1'b1;
-        end else begin
-            result_o       = base_result;
-            result_valid_o = 1'b1;
-        end
+        if (is_div_op) early_result = div_result;
+        else if (sel_cmp) early_result = {{(XLEN - 1) {1'b0}}, cmp_lt};
+        else early_result = logic_shift_result;
+    end
+
+    always_comb begin
+        if (is_mul_op) result_o = mul_result;
+        else if (sel_adder) result_o = adder_sum[XLEN-1:0];
+        else result_o = early_result;
+    end
+
+    // Only DIV/REM can be un-ready; everything else answers in-cycle.
+    always_comb begin
+        if (is_div_op) result_valid_o = (div_state_q == DIV_DONE);
+        else result_valid_o = 1'b1;
     end
 
 endmodule

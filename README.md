@@ -11,9 +11,8 @@ A 25 MHz MS5351M reference feeds an on-chip rPLL that drives the fabric at
 **50 MHz** (`clk_core = 25 × 10/5`). Synthesis + PnR re-close at **50.017 MHz**
 on the 64-bit fetch-rewrite + target-span design (the pre-rewrite design closed
 at 40.281 MHz). A **branch predictor** (gshare PHT + RAS, prediction-at-decode)
-is integrated and sim-verified with a +2–4% IPC gain; its 50 MHz re-closure is
-in progress (currently 47.4 MHz — predictor-flop congestion on the forward
-path; `BP_EN=0` is the 50 MHz-clean fallback).
+is integrated, and the design **re-closes 50 MHz with it enabled** (+0.093 ns
+worst slack).
 
 ## Core
 
@@ -37,13 +36,16 @@ for the LSU, and AXI4-Lite kept only for peripherals.
   unified LSU FSM for loads/stores/Zilx. The LSU steers
   `addr[PERI_ADDR_BIT]` internally: `0` → native D-mem, `1` → AXI4-Lite
   peripheral bridge. Misaligned accesses trap (suppressed, not launched).
-- **Branch predictor** — gshare 2-bit PHT (64 entries) + 6-bit GHR + 8-entry
+- **Branch predictor** — gshare 2-bit PHT (128 entries) + 7-bit GHR + 8-entry
   RAS, **prediction-at-decode**, execute as the golden resolver. JAL and
   conditional-branch targets are direct `pc+imm` (no BTB); conditional
   direction comes from the PHT; JALR returns use the RAS. Training fires at
   resolve only, so wrong-path instructions never contaminate it. A correct
   prediction issues no execute redirect (the win); a mispredict reuses the
   existing flush/drain. `BP_EN` (default 1) is the A/B knob and fallback.
+  PHT depth is a **timing** parameter, not an accuracy one: the table is read
+  combinationally at decode and that read feeds fetch in the same cycle, so a
+  bigger table costs slack (512 entries cost ~1 ns to buy 0.65% of cycles).
 - **CSR file (Zicsr)** — machine-mode subset (mstatus/misa/mie/mtvec/
   mscratch/mepc/mcause/mtval/mip) plus `mcycle`/`minstret`. CSRRW/S/C
   retire with `rd ← old CSR`; field semantics enforced; a dedicated
@@ -66,20 +68,26 @@ inside the CPU; the board top is pure point-to-point wiring.
 
 | Benchmark | Result |
 |---|---|
-| CoreMark (`BP_EN=1`) | **~1.95 CoreMark/MHz**, IPC 0.585 (predictor on) |
-| CoreMark (`BP_EN=0`) | 1.88 CoreMark/MHz, IPC 0.563 (531 025 cycles/iteration, 2K, -O3) |
-| Dhrystone (`BP_EN=1` / `=0`) | ~0.85 / 0.82 DMIPS/MHz (IPC 0.535 / 0.519) |
-| Quicksort (256 words, print-free) | IPC 0.549 (`BP_EN=1`) / 0.538 (`BP_EN=0`), 29 675 retires |
-| CoreMark co-sim | PASS — 332 803 retires matched vs Spike |
-| Quicksort co-sim | PASS — 29 632 retires matched vs Spike |
+| CoreMark | **1.98 CoreMark/MHz** (504 977 cycles/iteration, 2K, -O3) |
+| Dhrystone | **0.88 DMIPS/MHz** (644 cycles/iteration) |
+| Quicksort (256 words, print-free) | 53 290 cycles, 29 336 retires |
+| CoreMark co-sim | PASS — 306 366 retires matched vs Spike |
+| Quicksort co-sim | PASS — 29 293 retires matched vs Spike |
 
-The branch predictor (`BP_EN=1`) adds **+2–4% IPC**: CoreMark +3.9%,
-Dhrystone +3.1%, quicksort +2.0%. The win is entirely **fewer redirects**
-(correct predictions cost 0 cycles; a mispredict still pays the full
-~3.1-cycle flush+refill) — redirect CPI drops ~3× (CoreMark 0.383→0.102).
-Predictor accuracy 74/84/79% (quicksort/CoreMark/Dhrystone), RAS hit
-98–100%. The architectural retire stream is identical predictor on or off
-(verified). Reproduce the A/B with the recipe in `sim/bench_ipc_ab.md`.
+All at 50 MHz. Against the pre-predictor baseline (1.96 CoreMark/MHz,
+0.84 DMIPS/MHz) three changes contributed:
+
+- **Linker relaxation.** `-Wl,--no-relax` had left every `call` as
+  `auipc ra,X; jalr ra,off(ra)` — an extra instruction *and* an indirect
+  jump the predictor cannot predict. Relaxing to `jal` removed 110 of
+  Dhrystone's 111 static `jalr`/`jr` sites and cut its mispredicts 52%.
+- **Branch predictor.** A correct prediction issues no execute redirect;
+  redirect CPI on CoreMark is 0.053, down from 0.383 unpredicted. The
+  architectural retire stream is identical predictor on or off (verified).
+- **ALU result mux ordered by arrival time.** The adder and the DSP are the
+  last signals to settle, so they take the shallowest mux levels.
+
+Reproduce the A/B with the recipe in `sim/bench_ipc_ab.md`.
 
 CoreMark runs on **verbatim upstream EEMBC sources** (commit 1f483d5,
 provenance hashed in `eembc/UPSTREAM.md`; `make verify-eembc` fails the
@@ -92,12 +100,13 @@ the clock, the wrap maximum is cycle-based).
 
 The 64-bit/2-outstanding fetch rewrite removed the pre-rewrite fetch
 bottleneck (~2.2 → ~1.8 cycles/instr); the branch predictor then cut the
-redirect cost (the next-largest item) ~3×. Remaining IPC levers, in yield
-order: remove the LSU request register stage (one cycle per access —
-gated on re-closing 50 MHz without it), hide the predicted-taken refill
-bubble the predictor introduced, and a finer PHT / BTB for indirect
-JALR. Together those reach ~2.5 CoreMark/MHz (CPI ~1.33); see `CLAUDE.md`
-Open work for the lever analysis. The registered CSR read is free (hides
+redirect cost (the next-largest item) ~7×. Remaining IPC levers, in yield
+order: remove the LSU request register stage (0.42 CPI on CoreMark, the
+largest single item — gated on re-closing 50 MHz without it) and hide the
+predicted-taken refill bubble the predictor introduced (~0.23 CPI). A BTB
+for indirect JALR is **not** on the list: once linker relaxation is on,
+Dhrystone has one static `jalr` site and CoreMark two, so it would buy
+nothing here. See `CLAUDE.md` Open work for the lever analysis. The registered CSR read is free (hides
 in the fetch bubble).
 
 ## Repository layout
@@ -151,17 +160,15 @@ Done: Harvard split, LSU + forwarding, Zicsr, M-mode traps + all three
 interrupt sources, UART with FIFOs, silicon bring-up, 40 MHz closure
 (pre-rewrite), CoreMark, 64-bit/2-outstanding fetch + instruction buffer,
 50 MHz PnR re-closure on the fetch-rewrite + target-span design, **branch
-predictor (gshare PHT + GHR + RAS, prediction-at-decode)** — sim-verified,
-+2–4% IPC.
+predictor (gshare PHT + GHR + RAS, prediction-at-decode)**, and **50 MHz
+re-closure with the predictor enabled**.
 
 Remaining, in order:
 
-1. **Predictor: 50 MHz re-closure + hide the predicted-taken refill bubble**
-   — the predictor is integrated but PnR is 47.4 MHz (predictor-flop
-   congestion on the forward path; `BP_EN=0` is the 50 MHz-clean fallback).
-   Re-close 50 MHz with `BP_EN=1`, then recover the ~0.21 CPI refill bubble
-   the predictor introduced. Together with a finer PHT/BTB this is the path
-   to ~2.5 CoreMark/MHz.
+1. **Hide the predicted-taken refill bubble** — a correct predicted-taken
+   branch still kills and refills the instruction buffer, ~0.23 CPI on
+   CoreMark that did not exist before the predictor. Fetch into the
+   predicted path instead of flushing.
 2. **Cache over the in-package 8 MiB SDRAM** — write-back set-associative
    I/D cache behind the native interfaces; buys capacity (programs > 16 KiB),
    not speed.

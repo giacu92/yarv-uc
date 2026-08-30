@@ -57,6 +57,14 @@ because both of its defaults are wrong for a freestanding Harvard image:
   layout does not cover, failing the link. `-N` (omagic) drops it. Harmless on
   a bare-metal toolchain.
 
+**Linker relaxation is on.** `sw_build.mk` used to pass `-Wl,--no-relax`, which
+left every `call` as `auipc ra,X; jalr ra,off(ra)` — an extra instruction, and
+an indirect jump the branch predictor cannot predict where a `jal` is predicted
+for free. Removing it took 110 of Dhrystone's 111 static `jalr`/`jr` sites down
+to `jal`, shrank `.text` ~12% and cut its cycles/iteration ~4%. `gp`-relative
+relaxation stays inert because no linker script defines `__global_pointer$` and
+`start.S` never loads `gp` — do not define one without also setting `gp`.
+
 ## Build & run
 
 In any harness dir:
@@ -146,11 +154,10 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   optional: this core traps on misalignment rather than fixing it up. 11.1 KiB
   `.text` (of 16) / 4.0 KiB D-mem data. gcc 15.1.0 measured ~2% slower, so
   the 14.3.0 default stands.
-  **Score: 531 025 cycles/iteration = 1.88 CoreMark/MHz, IPC 0.561** (single
-  iteration, 2K, -O3; 339 436 instr / 605 491 sim cyc; a 50-iteration run
-  smooths to a similar figure). **With the branch predictor (`BP_EN=1`,
-  2026-08-28): ~1.95 CoreMark/MHz, IPC 0.585** (+3.9% — the redirect CPI
-  drops 0.383→0.102). A/B reproduce recipe in `sim/bench_ipc_ab.md`. CRCs `list 0xe714` /
+  **Score: 504 977 cycles/iteration = 1.98 CoreMark/MHz** (single iteration,
+  2K, -O3), measured on the board and matched in sim. Was 531 025 / 1.88
+  before the branch predictor and linker relaxation; redirect CPI is 0.069,
+  down from 0.383 with no predictor. A/B reproduce recipe in `sim/bench_ipc_ab.md`. CRCs `list 0xe714` /
   `matrix 0x1fd7` / `state 0x8e3a` = the official 2K performance-seed values;
   `crcfinal` 0x4983 on a 2000-iteration run. At the board's 50 MHz a
   rules-valid run (≥10 s, under the 32-bit `mcycle` wrap — there is no
@@ -184,9 +191,10 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   FPU while the toolchain's libgcc is built `ilp32d` — the soft-float helpers
   do not exist to link against. 5.8 KiB `.text` (of 16) / 1.9 KiB `.rodata` +
   10.3 KiB `.bss`.
-  **Score: 686 cycles/iteration = 0.82 DMIPS/MHz, 72 886 Dhrystones/s at
-  50 MHz** (`DHRY_ITERS=2000`, -O3; 1 372 041 ticks). **With the branch
-  predictor (`BP_EN=1`, 2026-08-28): ~0.85 DMIPS/MHz, IPC 0.535** (+3.1%).
+  **Score: 644 cycles/iteration = 0.88 DMIPS/MHz at 50 MHz**
+  (`DHRY_ITERS=2000`, -O3). Was 686 / 0.82 before the branch predictor and
+  linker relaxation — Dhrystone gains most from relaxation because it is
+  call-dense.
   All 22 of Dhrystone's
   own `should be:` final values match at every iteration count tried. The
   figure is `strcpy`-sensitive by construction — a plain byte loop measures

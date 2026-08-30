@@ -154,8 +154,8 @@ The `0x2000` split above exists precisely to avoid that; Dhrystone is the
 one workload that cannot fit inside it.
 
 ```
-cd cosim/quicksort && make cosim   # PASS -- matched 29632 retires
-cd cosim/coremark  && make cosim   # PASS -- matched 332803 retires
+cd cosim/quicksort && make cosim   # PASS -- matched 29293 retires
+cd cosim/coremark  && make cosim   # PASS -- matched 306366 retires
 cd cosim/ecall     && make cosim   # PASS -- matched 17 retires
 ```
 
@@ -258,21 +258,21 @@ rm -rf obj_dir && make VPARAMS="-GBP_EN=0"     # predictor off (A/B baseline)
 rm -rf obj_dir && make                          # predictor on (default)
 ```
 
-With the predictor on, the **`redirect` bucket drops ~3×** (a correct
+With the predictor on, the **`redirect` bucket drops ~5×** (a correct
 prediction issues no execute redirect) but a new **`imem-starve` + `other`
-~0.21 CPI** appears — the kill+refill bubble on every *correct* predicted-taken
+~0.23 CPI** appears — the kill+refill bubble on every *correct* predicted-taken
 branch, charged to `imem-starve` (no mispredict fires) instead of `redirect`.
-So the gross redirect saving (~0.28) nets to ~+0.06 CPI. CoreMark `BP_EN=1`:
+That refill bubble is the predictor's own open item. CoreMark:
 
 | cycles per retired instruction | CoreMark `BP=1` | CoreMark `BP=0` |
 |---|---|---|
 | retire (floor) | 1.000 | 1.000 |
-| + `lsu-launch` | 0.171 | 0.171 |
-| + `lsu-capture` | 0.221 | 0.221 |
-| + `redirect` | 0.102 | 0.383 |
-| + `imem-starve` | 0.105 | <0.001 |
-| + `other` | 0.105 | <0.001 |
-| + `decode-bubble` | 0.006 | — |
+| + `lsu-launch` | 0.186 | 0.171 |
+| + `lsu-capture` | 0.238 | 0.221 |
+| + `redirect` | 0.069 | 0.383 |
+| + `imem-starve` | 0.115 | <0.001 |
+| + `other` | 0.115 | <0.001 |
+| + `decode-bubble` | 0.008 | — |
 | **= CPI** | **1.711** | **1.775** |
 | (IPC) | 0.585 | 0.563 |
 
