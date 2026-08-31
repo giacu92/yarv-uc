@@ -20,9 +20,9 @@ import rv32_pkg::*;
  *
  * Timing rule: the lookup depends ONLY on the PC and the GHR — never on
  * register data — so it sits off the `regfile -> forward mux -> branch
- * compare -> PC redirect` critical path. The PHT (128x2b) lives in LUT-RAM, the
- * GHR (7b) and RAS (8x32b) in flops, all with a combinational lookup, so no
- * cycle is added to the frontend (note §11).
+ * compare -> PC redirect` critical path. The PHT (128x2b), the GHR (7b) and
+ * the RAS (8x32b) are all flops read combinationally, so no cycle is added to
+ * the frontend (note §11).
  *
  * Training happens ONLY at resolve (the execute training port), never on
  * speculative outcomes. In-order single-issue means a squashed instruction
@@ -42,8 +42,12 @@ import rv32_pkg::*;
  * resolve of a RETURN (JALR with rs1 in {x1,x5}, rd=x0). The top is read at
  * decode to predict a return's target. Trained at resolve, not at predict, so
  * a wrong-path call never pushes — the RAS is not corrupted by speculation.
- * RAS read (decode, this cycle) and write (execute, an older instr resolving)
- * hit different entries, so the 8-flop array supports both in one cycle.
+ * The decode read is of ras_q, a flop output, so a resolve writing the array
+ * in the same cycle cannot disturb it -- the read simply sees the pre-write
+ * state. The one visible consequence is that a return decoded in the very
+ * cycle its own call resolves would read the top from before that push; a
+ * redirect costs at least two cycles of refill, so no call and its matching
+ * return are ever that close.
  *
  * Naming: ports *_i/_o; internals no prefix; flops _q/_d.
  */
@@ -93,29 +97,50 @@ module branch_predictor (
     localparam int unsigned RAS_DEPTH = BP_RAS_DEPTH;
     localparam int unsigned RAS_PTR_W = $clog2(RAS_DEPTH);
 
-    // The PHT is LUT-RAM, NOT a flop array. At 512x2 a flop array would be
-    // 1024 FF, on a device where the ~430 flops this predictor already adds
-    // are what dropped PnR from 50.0 to 47.4 MHz by congesting the
-    // regfile -> forward -> de_bus.rs2_data path. As distributed RAM the same
-    // table costs LUTs instead and removes flops from that neighbourhood.
-    // Two requirements the style imposes, both met here: reads are
-    // asynchronous (the decode lookup is combinational, and the train-side
-    // read-modify-write reads a second address in the cycle it writes, so
-    // synthesis duplicates the array for that port), and there is no reset
-    // port, so the weak-not-taken initialisation is an `initial` block.
-    // Losing the reset is harmless by construction: the PHT is a hint and
-    // execute is the golden resolver, so an uninitialised table costs at most
-    // a few cold-start mispredicts and can never produce a wrong retire.
-    (* ram_style = "distributed" *)
-    (* syn_ramstyle = "distributed" *)
-    logic [          1:0] pht_q                                              [PHT_DEPTH];
-    logic [    GHR_W-1:0] ghr_q;
-    logic [     XLEN-1:0] ras_q                                              [RAS_DEPTH];
-    logic [RAS_PTR_W-1:0] ras_ptr_q;  // next push slot (wraps mod RAS_DEPTH)
-    logic [  RAS_PTR_W:0] ras_cnt_q;  // 0..RAS_DEPTH, saturating
+    // The PHT is a FLOP ARRAY with a LUT-mux read -- 128x2 = 256 FF -- and
+    // that is not a choice, it is the only thing this device can build here.
+    // Both of its reads are ASYNCHRONOUS (the decode lookup is combinational,
+    // and the train-side read-modify-write reads a second address in the cycle
+    // it writes), while Gowin's LUT-RAM/SSRAM is synchronous-read only
+    // (SUG949E §8.2, the same limit that keeps the regfile on BSRAM -- see
+    // reg_file.sv). So there is no RAM primitive to map onto.
+    //
+    // This array carried `(* ram_style = "distributed" *)` and
+    // `(* syn_ramstyle = "distributed" *)` until 2026-08-31. Both were dead:
+    // ram_style is the Vivado spelling GowinSynthesis ignores outright, and
+    // "distributed" is not one of its accepted values either (they carry the
+    // _ram suffix -- block_ram / distributed_ram), so it answered
+    // "EX0200: Property syn_ramstyle set invalid for pht_q" and inferred flops
+    // regardless. Removing both attributes changed neither the resource
+    // report nor PnR, which is the expected result of deleting a rejected
+    // property. Everything measured about this table -- the 6.1 ns read at 512
+    // entries that forced the resize to 128, and the 50 MHz closure at 128 --
+    // was therefore measured on flops, and the depth is a timing parameter for
+    // the same reason a wide mux is: the read feeds fetch's launch/inflight
+    // logic in the same cycle.
+    //
+    // No reset port: the weak-not-taken initialisation is an `initial` block,
+    // which an FPGA flop honours as its power-up value. Harmless by
+    // construction either way -- the PHT is a hint and execute is the golden
+    // resolver, so even an uninitialised table costs at most a few cold-start
+    // mispredicts and can never produce a wrong retire.
+    logic   [          1:0] pht_q                                              [PHT_DEPTH];
+    logic   [    GHR_W-1:0] ghr_q;
+    logic   [     XLEN-1:0] ras_q                                              [RAS_DEPTH];
+    logic   [RAS_PTR_W-1:0] ras_ptr_q;  // next push slot (wraps mod RAS_DEPTH)
+    logic   [  RAS_PTR_W:0] ras_cnt_q;  // 0..RAS_DEPTH, saturating
 
+    // Weak not-taken power-up value for every entry. The loop variable is
+    // declared at module scope on purpose: GowinSynthesis does not elaborate a
+    // SystemVerilog-style `for (int i = ...)` declared inside an initial block
+    // and warns "EX3780: Using initial value of 'i' since it is never
+    // assigned", which leaves the table with no initial value at all. A
+    // Verilog-2001 loop variable elaborates there and in Verilator alike.
+    integer                 pht_init_idx;
     initial begin
-        for (int i = 0; i < PHT_DEPTH; i++) pht_q[i] = 2'b01;  // weak not-taken
+        for (pht_init_idx = 0; pht_init_idx < PHT_DEPTH; pht_init_idx = pht_init_idx + 1) begin
+            pht_q[pht_init_idx] = 2'b01;  // weak not-taken
+        end
     end
 
     // -------------------------------------------------------------------
@@ -187,10 +212,10 @@ module branch_predictor (
     // PHT write port
     // -------------------------------------------------------------------
     // Deliberately its own always_ff with a single conditional element
-    // assignment. The whole-array form this replaced
-    // (`for (i) pht_q[i] <= pht_d[i]`) describes PHT_DEPTH individually
-    // enabled registers and cannot infer RAM — at 512 entries that is 1024
-    // flops the fabric has no room for at 50 MHz. Index comes from the de_t
+    // assignment: one indexed write port with a decoder, rather than the
+    // whole-array form it replaced (`for (i) pht_q[i] <= pht_d[i]`), which
+    // spells out PHT_DEPTH individually enabled registers each fed by its own
+    // next-state mux. Index comes from the de_t
     // snapshot so the update uses the history the branch was predicted with,
     // not the (possibly since-shifted) live GHR.
     //

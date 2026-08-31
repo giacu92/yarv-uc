@@ -2,112 +2,190 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/giacu92/yarv-uc)
 
-An **RV32IMAC + Zicsr + Zifencei** soft-processor core targeting a **Gowin
-GW2AR-18C** FPGA (QFN88) on a Tang Nano 20k board. Hobby/learning project,
-built with Claude Code assistance. Implemented and sim-verified (Verilator +
-Spike co-sim) and **brought up on silicon**.
+An **RV32IMAC + Zicsr + Zifencei** soft-processor core for a **Gowin
+GW2AR-18C** FPGA (QFN88) on a Tang Nano 20k. Hobby/learning project, built
+with Claude Code assistance. Sim-verified (Verilator + Spike co-sim) and
+**running on silicon**.
+
+## Architecture
+
+In-order **3-stage pipeline — Fetch / Decode / Execute** over a **Harvard**
+memory system: a read-only I-mem for fetch, a byte-strobed D-mem for the LSU,
+and AXI4-Lite kept only for peripherals. Both memories are 16 KiB
+(`ADDR_W=14`, 8 BSRAM blocks each, 16 of the device's 46). The package also
+carries 8 MiB of SDRAM on a separate die, currently unused.
+
+### Fetch
+
+64-bit, 2-outstanding reads over a native read-only I-mem port, feeding a
+depth-8 instruction buffer of 32-bit words. One 8-byte access delivers two
+words, split into PC-stamped buffer entries; two outstanding reads keep the
+BSRAM issuing through decode stalls (DIV/REM, memory wait) that would idle a
+single-outstanding port. The buffer head presents to decode exactly what the
+old single-word F/D register did, so decode is agnostic to the width behind
+it. A second read port exposes head+1 so decode can stitch a 32-bit
+instruction sitting at a 2-byte-aligned branch target without a bubble.
+
+A redirect — predicted, mispredicted, trap or `mret` — kills the buffer and
+issues the first read at the target **in the same cycle**, rather than waiting
+for the PC register to update. Reads already in flight belong to the killed
+path; because responses come back in order, they are discarded by counting
+them rather than by blocking the issue path, so the new path starts fetching
+immediately. That is worth one cycle on every taken branch.
+
+A PC outside the implemented I-mem cannot be fetched: the memory decodes only
+`ADDR_W` bits, so the read would alias back into real instructions and execute
+them. Fetch raises an instruction access fault instead. On an ordinary cycle
+the check is on the request and blocks it, reading a flopped PC. The redirect
+cycle is the exception: checking the target there would hang an 18-input
+OR-reduce off the predictor's target adder, so the read is issued regardless
+and a second check on the response — where the address is a register and costs
+no timing — discards the aliased data and pushes a fault entry stamped with
+the exact faulting PC.
+
+### Decode
+
+Expand-then-decode: RVC expands to its 32-bit equivalent first, then one
+uniform decoder handles RV32I + M + C + Zilx + Zicsr. A hold buffer carries
+the upper compressed half of a word across cycles.
+
+Hazards resolve by **execute→decode forwarding**: when execute retires a
+writeback to a register the decoding instruction reads, the value is injected
+in place of the stale register-file read. Distance-1 RAW — ALU, div-then-use,
+branch-on-dependent, load-use — costs zero bubbles. Distance 2 and beyond
+needs nothing: the asynchronous register read already sees the committed
+value.
+
+That forward path imposes a rule worth knowing before touching execute: a
+combinational value derived from the D/E operands may only be consumed in the
+cycle it is produced. Operands can arrive from the bypass, so such a value
+sits at the end of the critical path — simulation settles it regardless of
+depth, silicon does not.
+
+### Execute + LSU
+
+RV32I ALU, single-cycle MUL on a DSP, multi-cycle DIV/REM (32-iteration
+restoring FSM), Zilx effective-address, branch resolve with redirect, and CSR
+read-modify-write. One FSM drives DIV/REM and the LSU.
+
+Memory accesses take a register stage: the idle state only *captures* the
+request (address, lane-shifted store data, byte strobes, peripheral select)
+into flops, and the next state drives the bus from those flops. Driving the
+bus straight off the ALU result closed on paper and failed on silicon. The
+stage costs one cycle per access and buys ~4.8 ns of timing by ending the
+`register file → forward → adder → strobe decode → memory port` chain at a
+flop rather than at the tail of the deepest combinational path in the machine.
+
+Stores are posted (retire on launch accept); loads wait for the read
+response. The LSU steers `addr[PERI_ADDR_BIT]` internally: `0` → native
+D-mem, `1` → AXI4-Lite peripheral bridge. Misaligned accesses trap and are
+never launched.
+
+### Branch predictor
+
+gshare 2-bit PHT (128 entries) + 7-bit GHR + 8-entry RAS, **predicting at
+decode**, with execute as the golden resolver.
+
+Lookup depends on the PC and the global history only, never on register data,
+so it stays off the `register file → forward → branch` critical path. JAL and
+conditional-branch targets are computed directly as `pc + imm` — no BTB, and
+therefore no cold-start mispredicts on direct jumps; conditional direction
+comes from the PHT; JALR returns come from the RAS. Other indirect jumps are
+left unpredicted.
+
+A predicted-taken instruction redirects fetch one cycle before execute would.
+Execute still computes the real outcome and compares: a correct prediction
+issues no redirect at all — that is the win — and a mispredict reuses the
+existing flush path. Training fires at resolve only, so squashed wrong-path
+instructions never contaminate the tables. `BP_EN` (default 1) is the A/B
+knob and the fallback.
+
+PHT depth is a **timing** parameter here, not an accuracy one. The table is
+read combinationally at decode and that read feeds fetch's launch logic in the
+same cycle, so a bigger table costs slack directly: 512 entries cost about
+1 ns to buy 0.65% of cycles.
+
+### CSRs, traps and interrupts (M-mode)
+
+Machine-mode Zicsr subset — mstatus / misa / mie / mtvec / mscratch / mepc /
+mcause / mtval / mip, plus `mcycle` and `minstret`. CSRRW/S/C retire with
+`rd ← old CSR`; field semantics are enforced (MPP forced to 11, mtvec MODE
+masked). The read is **registered** — decode presents the address, data lands
+the next cycle — which took the old asynchronous read off the critical path;
+execute holds a CSR op one extra cycle at measured zero cost, because it fits
+inside the existing fetch bubble.
+
+Precise synchronous traps at commit: instruction access fault (1), illegal
+instruction (2), ebreak (3), load/store misaligned (4/6), ecall-M (11).
+`mret` returns; `wfi` halts until an enabled interrupt is pending;
+`fence`/`fence.i` are nops (Harvard has no D→I write path). `mtvec` supports
+direct and vectored mode. A trapping instruction is not retired.
+
+Three interrupt sources: **MSIP** (`msip_peri` MMIO @0x1000_3000), **MTIP**
+(`clint_timer` @0x1000_1000+, 64-bit mtime/mtimecmp), **MEIP** (UART level
+IRQ). Priority MEI > MSI > MTI. A dedicated trap-write port updates
+mepc/mcause/mtval/mstatus atomically on entry.
+
+### Integration
+
+The CPU exposes three ports: native `imem` (read-only), native `dmem`
+(byte-strobed), and an AXI4-Lite master for peripherals. Native→AXI
+conversion lives inside the CPU, so the board top is pure point-to-point
+wiring. Peripherals sit behind a 1→3 crossbar with a DECERR terminator for
+unmapped addresses — UART (TX+RX FIFOs, level IRQ), machine timer, and the
+software-interrupt register.
+
+### Clocking
 
 A 25 MHz MS5351M reference feeds an on-chip rPLL that drives the fabric at
-**50 MHz** (`clk_core = 25 × 10/5`). Synthesis + PnR re-close at **50.017 MHz**
-on the 64-bit fetch-rewrite + target-span design (the pre-rewrite design closed
-at 40.281 MHz). A **branch predictor** (gshare PHT + RAS, prediction-at-decode)
-is integrated, and the design **re-closes 50 MHz with it enabled** (+0.093 ns
-worst slack).
+**50 MHz** (`clk_core = 25 × 10/5`), single clock domain, no CDC. Synthesis
+and PnR meet 50 MHz with the branch predictor enabled, most recently by
++0.002 ns — a tie rather than a margin, on the noise figure given below. A 25 MHz
+PLL-bypass build exists as a fallback and as a diagnostic that removes the
+rPLL from the picture.
 
-## Core
-
-In-order **3-stage pipeline — Fetch / Decode / Execute (F/D/E)** with a
-**Harvard** memory system: a read-only I-mem for fetch, a byte-strobed D-mem
-for the LSU, and AXI4-Lite kept only for peripherals.
-
-- **Fetch** — 64-bit, 2-outstanding fetch over a native read-only I-mem port
-  with a depth-8 (32-bit-word) instruction buffer. One 8-byte access delivers
-  two 32-bit words; 2 outstanding keeps the BSRAM issuing through decode
-  stalls (DIV/REM, mem-wait). The buffer head feeds decode exactly as the
-  old F/D word did, so decode is unmodified. Branch redirect kills the
-  buffer + the ≤2 in-flight reads (drain FSM).
-- **Decode** — expand-then-decode: RVC (C) expands to 32-bit equivalents,
-  then one uniform decoder handles RV32I + M + C + Zilx + Zicsr. Odd-half
-  branch targets and word-spanning instructions are stitched. An
-  execute→decode forward path resolves distance-1 RAW hazards (ALU /
-  DIV-REM / load-use) same-cycle, zero bubble.
-- **Execute + LSU** — ALU (RV32I + single-cycle MUL via DSP + multi-cycle
-  DIV/REM + Zilx effective address), branch resolve with redirect, and a
-  unified LSU FSM for loads/stores/Zilx. The LSU steers
-  `addr[PERI_ADDR_BIT]` internally: `0` → native D-mem, `1` → AXI4-Lite
-  peripheral bridge. Misaligned accesses trap (suppressed, not launched).
-- **Branch predictor** — gshare 2-bit PHT (128 entries) + 7-bit GHR + 8-entry
-  RAS, **prediction-at-decode**, execute as the golden resolver. JAL and
-  conditional-branch targets are direct `pc+imm` (no BTB); conditional
-  direction comes from the PHT; JALR returns use the RAS. Training fires at
-  resolve only, so wrong-path instructions never contaminate it. A correct
-  prediction issues no execute redirect (the win); a mispredict reuses the
-  existing flush/drain. `BP_EN` (default 1) is the A/B knob and fallback.
-  PHT depth is a **timing** parameter, not an accuracy one: the table is read
-  combinationally at decode and that read feeds fetch in the same cycle, so a
-  bigger table costs slack (512 entries cost ~1 ns to buy 0.65% of cycles).
-- **CSR file (Zicsr)** — machine-mode subset (mstatus/misa/mie/mtvec/
-  mscratch/mepc/mcause/mtval/mip) plus `mcycle`/`minstret`. CSRRW/S/C
-  retire with `rd ← old CSR`; field semantics enforced; a dedicated
-  trap-write port writes mepc/mcause/mtval/mstatus atomically on entry.
-- **Traps / exceptions / interrupts (M-mode)** — precise sync traps at
-  commit: illegal (2), ecall-M (11), ebreak (3), load/store-misaligned
-  (4/6), instruction access fault (1). `mret` returns; `wfi` halts until a
-  pending enabled interrupt; `fence`/`fence.i` are nops. `mtvec` direct +
-  vectored. Three interrupt sources — **MSIP** (`msip_peri` MMIO @0x1000_3000),
-  **MTIP** (`clint_timer` @0x1000_1000+, 64-bit mtime/mtimecmp), **MEIP**
-  (UART level IRQ) — behind a 1→3 peripheral mux with a DECERR terminator
-  for unmapped addresses. Priority MEI > MSI > MTI. A trapping instruction
-  is not retired.
-
-The CPU exposes three ports: native `imem` (RO), native `dmem`
-(byte-strobed), and AXI4-Lite `axi_peri`. Native→AXI conversion lives
-inside the CPU; the board top is pure point-to-point wiring.
+Timing on this device is tight enough that several structural choices exist
+only to serve it — the LSU register stage, the registered CSR read, the PHT
+depth, and which side of the bus the fetch range check sits on. Run-to-run
+placement noise is about 0.7 ns on the same path, comparable to the margin
+itself, so a single PnR run is not evidence about an RTL change.
 
 ## Performance
 
+At 50 MHz:
+
 | Benchmark | Result |
 |---|---|
-| CoreMark | **1.98 CoreMark/MHz** (504 977 cycles/iteration, 2K, -O3) |
-| Dhrystone | **0.88 DMIPS/MHz** (644 cycles/iteration) |
-| Quicksort (256 words, print-free) | 53 290 cycles, 29 336 retires |
-| CoreMark co-sim | PASS — 306 366 retires matched vs Spike |
-| Quicksort co-sim | PASS — 29 293 retires matched vs Spike |
+| CoreMark | **2.13 CoreMark/MHz** (468 400 cycles/iteration) |
+| Dhrystone | **0.93 DMIPS/MHz** (608 cycles/iteration) |
+| Quicksort (256 words) | 48 521 cycles (print-free build, `PRINT_ARRAY=0`) |
 
-All at 50 MHz. Against the pre-predictor baseline (1.96 CoreMark/MHz,
-0.84 DMIPS/MHz) three changes contributed:
+The CoreMark figure is a rules-valid run **on the board**: 2000 iterations,
+18.7 s, `crcfinal` 0x4983 matching the published value, sources verbatim from
+upstream EEMBC, built `-O3 -march=rv32imac_zicsr_zifencei -mabi=ilp32
+-ffunction-sections -fdata-sections -mstrict-align -mbranch-cost=10
+-ffp-contract=off -mno-fdiv -Wl,--gc-sections`. Dhrystone uses verbatim SiFive
+sources and is measured in simulation. Quicksort co-simulates against Spike
+retire for retire; CoreMark does too, but only in a dedicated build with the
+banner and cycle counter compiled out, since Spike has no UART, timer or MSIP
+device to diff against.
 
-- **Linker relaxation.** `-Wl,--no-relax` had left every `call` as
-  `auipc ra,X; jalr ra,off(ra)` — an extra instruction *and* an indirect
-  jump the predictor cannot predict. Relaxing to `jal` removed 110 of
-  Dhrystone's 111 static `jalr`/`jr` sites and cut its mispredicts 52%.
-- **Branch predictor.** A correct prediction issues no execute redirect;
-  redirect CPI on CoreMark is 0.053, down from 0.383 unpredicted. The
-  architectural retire stream is identical predictor on or off (verified).
-- **ALU result mux ordered by arrival time.** The adder and the DSP are the
-  last signals to settle, so they take the shallowest mux levels.
+Four changes account for the current numbers over the pre-predictor core: the
+branch predictor (a correct prediction issues no redirect), linker relaxation
+(turning `auipc`+`jalr` call pairs back into predictable `jal`), issuing the
+fetch at the redirect target in the redirect cycle itself (one cycle off every
+taken branch — 3.09 down to 2.09 no-retire cycles per redirect), and ordering
+the ALU result mux by measured arrival time.
 
-Reproduce the A/B with the recipe in `sim/bench_ipc_ab.md`.
+CoreMark now runs at 1.60 cycles per instruction. The largest remaining cost
+by far is the LSU, 0.43 of that across its capture and launch stages, followed
+by the two cycles a taken branch still pays for memory latency and for the
+fetched word becoming visible. A BTB is deliberately *not* on the list: with
+linker relaxation on, Dhrystone has one static `jalr` site and CoreMark two,
+so it would buy nothing here.
 
-CoreMark runs on **verbatim upstream EEMBC sources** (commit 1f483d5,
-provenance hashed in `eembc/UPSTREAM.md`; `make verify-eembc` fails the
-build on any edit). CRCs match the official 2K performance-seed values
-(`list 0xe714` / `matrix 0x1fd7` / `state 0x8e3a`); a 2000-iteration run
-gives `crcfinal` 0x4983. Built `-O3 -mstrict-align` (the core traps on
-misalignment, no fixup). At 50 MHz a rules-valid run is `ITERATIONS`
-814..6979 (≥10 s, under the 32-bit `mcycle` wrap; the minimum scales with
-the clock, the wrap maximum is cycle-based).
-
-The 64-bit/2-outstanding fetch rewrite removed the pre-rewrite fetch
-bottleneck (~2.2 → ~1.8 cycles/instr); the branch predictor then cut the
-redirect cost (the next-largest item) ~7×. Remaining IPC levers, in yield
-order: remove the LSU request register stage (0.42 CPI on CoreMark, the
-largest single item — gated on re-closing 50 MHz without it) and hide the
-predicted-taken refill bubble the predictor introduced (~0.23 CPI). A BTB
-for indirect JALR is **not** on the list: once linker relaxation is on,
-Dhrystone has one static `jalr` site and CoreMark two, so it would buy
-nothing here. See `CLAUDE.md` Open work for the lever analysis. The registered CSR read is free (hides
-in the fetch bubble).
+Methodology, the stall/CPI instrumentation and the A/B recipes live in
+[`sim/README.md`](sim/README.md) and `sim/bench_ipc_ab.md`.
 
 ## Repository layout
 
@@ -116,86 +194,76 @@ src/rtl/pkg/   rv32_pkg.sv          types, opcodes, de_t D/E control struct
 src/rtl/core/  pipeline stages + CPU top + reg file + ALU + trap unit + board top
 src/rtl/bus/   AXI4-Lite interface + master bridge + peripheral crossbar
 src/rtl/utils/ native_ram (Harvard I/D-mem), msip_peri, clint_timer,
-               axi4_lite_uart (TX+RX FIFOs, level IRQ), axi4_lite_xbar_3
+               axi4_lite_uart, axi4_lite_xbar_3
 src/phys/      pin assignment (.cst) + timing constraints (.sdc)
 impl/          Gowin EDA project + synthesis/PnR Tcl + reports
-sim/           Verilator sim + RAM/UART compliance tests + Spike co-sim
-sim/sw/        firmware tree: quicksort, CoreMark, isa/intr/peri oracles
+sim/           Verilator sim, compliance tests, Spike co-sim, firmware oracles
 verible.flags  SystemVerilog formatting policy
-Makefile       format / sim / sw targets
 CLAUDE.md      detailed architecture + build guidance (authoritative)
 ```
 
 ## Quick start
 
-### Simulate (Verilator, local)
+Simulate (Verilator, local):
 
 ```
 sudo apt-get install -y verilator
-make run        # hand-crafted imem.hex/dmem.hex oracle
+make run        # hand-crafted Harvard oracle
 make sw-run     # build the C program + run the sim loading it
 ```
 
-Each run prints a retire/IPC/stall summary. See `sim/README.md` for logs,
-VCD/GTKWave, the RAM and UART compliance tests, the Spike co-sim, and the
-trap/timer/WFI oracles.
-
-### Synthesize / place & route (Gowin EDA, remote host)
-
-The Gowin toolchain runs on the build host (`gw_sh`), not in this WSL env.
-rsync the repo there and run:
+Synthesize and place & route (Gowin EDA, on the build host):
 
 ```
 QT_QPA_PLATFORM=offscreen QT_OPENGL=software LIBGL_ALWAYS_SOFTWARE=1 \
-  gw_sh impl/synth_check.tcl        # synthesize
+  gw_sh impl/synth_check.tcl
 QT_QPA_PLATFORM=offscreen QT_OPENGL=software LIBGL_ALWAYS_SOFTWARE=1 \
-  gw_sh impl/pnr_check.tcl          # place & route -> .fs/.bin
+  gw_sh impl/pnr_check.tcl
 ```
 
-See `CLAUDE.md` for the full remote-build workflow and Gowin CLI quirks.
+See `CLAUDE.md` for the remote-build workflow and the Gowin CLI quirks.
 
 ## Roadmap
 
-Done: Harvard split, LSU + forwarding, Zicsr, M-mode traps + all three
-interrupt sources, UART with FIFOs, silicon bring-up, 40 MHz closure
-(pre-rewrite), CoreMark, 64-bit/2-outstanding fetch + instruction buffer,
-50 MHz PnR re-closure on the fetch-rewrite + target-span design, **branch
-predictor (gshare PHT + GHR + RAS, prediction-at-decode)**, and **50 MHz
-re-closure with the predictor enabled**.
+Done: Harvard split, LSU + forwarding, Zicsr, M-mode traps with all three
+interrupt sources, UART with FIFOs, silicon bring-up, CoreMark, 64-bit
+2-outstanding fetch with instruction buffer, branch predictor, and 50 MHz
+closure with the predictor enabled.
 
-Remaining, in order:
+Next, in order:
 
-1. **Hide the predicted-taken refill bubble** — a correct predicted-taken
-   branch still kills and refills the instruction buffer, ~0.23 CPI on
-   CoreMark that did not exist before the predictor. Fetch into the
-   predicted path instead of flushing.
+1. **Hide the rest of the predicted-taken refill bubble** — issuing at the
+   target in the redirect cycle removed one of its three cycles; the other two
+   are memory latency and the fetched word becoming visible. Fetching into the
+   predicted path without killing the buffer at all would remove them.
 2. **Cache over the in-package 8 MiB SDRAM** — write-back set-associative
-   I/D cache behind the native interfaces; buys capacity (programs > 16 KiB),
-   not speed.
-3. **GPIO** — direction/output/input registers + interrupt.
-4. **PLIC-style interrupt controller** — MEIP is one ORed level with no
-   cause register; an ISR must poll with >1 external source.
-5. **Illegal-CSR-access trap** — unimplemented CSRs currently read 0 / ignore
-   writes silently.
-6. **Vectored-mode interrupt co-sim** — direct mode only is co-simulated.
-7. **RVC spanning bubble** — the branch-target case is zero-bubble; the
-   sequential case (a 32-bit instr straddling a word boundary reached by
-   fall-through) still costs one cycle and needs a wider F/D / dual-issue.
-8. **Co-sim MMIO gap** — the diff stops at the first UART access (Spike has
-   no UART/CLINT/MSIP slave).
+   I/D cache behind the native interfaces. Buys capacity (programs above
+   16 KiB), not speed: BSRAM already answers in one cycle at a 100% hit rate.
+3. **GPIO** — direction/output/input registers plus interrupt.
+4. **PLIC-style interrupt controller** — MEIP is one ORed level with no cause
+   register, so an ISR must poll once there is more than one external source.
+5. **Illegal-CSR-access trap** — unimplemented CSRs read 0 / ignore writes.
+6. **Vectored-mode interrupt co-sim** — only direct mode is co-simulated.
+7. **RVC sequential spanning bubble** — the branch-target case is already
+   zero-bubble; the fall-through case still costs one cycle and needs a wider
+   F/D or dual-issue.
 
-Deferred by choice: S/U mode + delegation, PMP, cross-word sub-word accesses.
+Deferred by choice: S/U mode with delegation, PMP, cross-word sub-word
+accesses.
 
 ## Known limitations
 
 - Machine mode only (no S/U, no medeleg/mideleg, no PMP).
-- MEIP is a single ORed level (no PLIC — ISR polls for the source).
-- Unimplemented CSR addrs silently read 0 / ignore writes (no illegal-CSR trap).
-- `fence.i` is a nop (Harvard has no D→I write path — no self-modifying code).
-- Forward path is distance-1 only (correct: in-order, ≤1 writeback/cycle).
+- MEIP is a single ORed level — no PLIC, so an ISR polls for the source.
+- Unimplemented CSR addresses silently read 0 / ignore writes.
+- `fence.i` is a nop; no self-modifying code.
+- Forward path is distance-1 only (correct: in-order, at most one writeback
+  per cycle).
+- Programs are capped by the 16 KiB I-mem / 16 KiB D-mem until the SDRAM
+  cache lands.
 
 ## Formatting & docs
 
 SystemVerilog is formatted with Verible (`make format` / `format-check` /
-`format-diff`) using `verible.flags`. `CLAUDE.md` is the authoritative
-architecture/build reference — read it for anything beyond this overview.
+`format-diff`) per `verible.flags`. `CLAUDE.md` is the authoritative
+architecture and build reference — read it for anything beyond this overview.

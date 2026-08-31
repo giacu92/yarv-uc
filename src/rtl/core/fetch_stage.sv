@@ -65,17 +65,33 @@ import rv32_pkg::*;
  *     blocked bus_issue until inflight reached 0, so every redirect that
  *     caught a read in flight paid an extra cycle (or two) before the first
  *     request at the target could even be launched. With the counter the
- *     redirect cycle is still gated (bus_issue has !redirect), but the very
- *     next cycle issues at the target while the stale response is still in
- *     flight behind it.
+ *     redirect cycle itself issues at the target (bus_issue drops the
+ *     pc_fault term on a redirect and issue_addr supplies the address)
+ *     while the stale response is still in flight behind it.
  *
  *     req_pc_q (single register, see below) stays safe under this: a launch
- *     may only overwrite it when no *good* response is pending. rready is
- *     low only when count_q >= 7, and count_q >= 7 forces available < 2,
- *     which blocks bus_issue -- so on any launch cycle a pending response is
- *     either absent or consumed that same cycle, before the overwrite takes
- *     effect at the clock edge. A response consumed under stale_q != 0 is
- *     discarded and never reads req_pc_q at all.
+ *     may only overwrite it when no *good* response is pending. Two facts
+ *     make that hold, and neither is local to this file:
+ *       (a) rready is low only when count_q >= 7, and count_q >= 7 forces
+ *           inflight == 0 (the reserved <= 8 invariant), so a response is
+ *           never left waiting while a read is outstanding; and
+ *       (b) the I-mem answers in exactly 1 cycle, so the only cycle on which
+ *           inflight_q is non-zero at a launch is the cycle that response
+ *           lands -- it is consumed with the old req_pc_q before the
+ *           overwrite takes effect at the clock edge.
+ *     A response consumed under stale_q != 0 is discarded and never reads
+ *     req_pc_q at all.
+ *
+ *     Consequence worth knowing before this port is re-pointed: (b) is an
+ *     assumption about the SLAVE, not something this module enforces. Under
+ *     a variable-latency I-mem (a cache over the in-package SDRAM, say)
+ *     inflight_q really would reach 2, and the older response would then be
+ *     split with the younger read's PC stamp -- silently wrong fe_pc, hence
+ *     wrong branch targets and link addresses. Measured on the BSRAM the
+ *     counter never leaves {0,1}, so the second slot is headroom, not a
+ *     path in use. The VERILATOR-only assertion at the bottom of this file
+ *     is what fails if that ever stops being true; a depth-2 shadow FIFO for
+ *     req_pc is the fix if a slower I-mem lands here.
  *
  * Buffer-room gating (overflow-safe): each outstanding read can push up to
  * 2 words, so issue reserves 2 slots per in-flight read.
@@ -136,11 +152,15 @@ import rv32_pkg::*;
  *     always overwritten before head can reach it.
  *   - Pop: buf_pop_cnt feeds head_d/count_d only inside the non-redirect
  *     else branch, which the redirect branch overrides wholesale.
- *   - Held response: rready no longer forces high on a redirect, so a
- *     response landing while count_q >= 7 is left in the I-mem skid instead
- *     of being discarded. inflight then stays non-zero, stale_q is armed to
- *     match, and it is consumed one cycle later and dropped -- count_q is 0
- *     by then, so rready is high anyway. Same net effect, one cycle later.
+ *   - Held response: rready no longer forces high on a redirect, so in
+ *     principle a response landing while count_q >= 7 is left in the I-mem
+ *     skid instead of being discarded -- inflight stays non-zero, stale_q is
+ *     armed to match, and it is consumed and dropped one cycle later, by
+ *     which time count_q is 0 and rready high again. Same net effect, one
+ *     cycle later. In practice the case cannot arise: count_q >= 7 forces
+ *     inflight == 0, so nothing is landing. Left described because the
+ *     harmlessness, not the unreachability, is what licenses dropping the
+ *     redirect term from rready.
  *
  * stall_i: decode back-pressure. While high the head is held (no pop); fetch
  * keeps running ahead into the buffer (up to 8 words), then stops issuing
@@ -432,11 +452,8 @@ module fetch_stage #(
 
         // stale tracks how many outstanding responses still belong to the
         // killed path. An accepted response retires the oldest one; a
-        // redirect re-marks everything still outstanding (inflight_d is
-        // already net of this cycle's launch/rsp_cap, and bus_issue is gated
-        // on !redirect, so on a redirect cycle inflight_d is exactly the set
-        // of reads the new path must ignore). The redirect assignment comes
-        // last so it wins over the decrement.
+        // redirect re-marks everything still outstanding. The redirect
+        // assignment comes last so it wins over the decrement.
         if (rsp_cap && (stale_q != 2'd0)) stale_d = stale_q - 2'd1;
         // NOTE: inflight_q - rsp_cap, NOT inflight_d: the read launched on
         // this very cycle belongs to the NEW path and must not be discarded.
@@ -506,6 +523,39 @@ module fetch_stage #(
     initial
         assert (BUF_DEPTH == 8)
         else $fatal(1, "BUF_DEPTH width assumptions broken");
+
+    // req_pc_q is ONE register while inflight_q is allowed to reach 2, so
+    // the split PC stamp is only correct while a launch never overwrites the
+    // address of a read whose response has not landed yet. That holds on a
+    // 1-cycle BSRAM (see the req_pc_q paragraph in the header) and it is an
+    // assumption about the slave, not something this module enforces -- a
+    // variable-latency I-mem breaks it, and the failure is silent: the older
+    // response gets split at the younger read's PC, so fe_pc, branch targets
+    // and link addresses go wrong with no error signal anywhere. Measured on
+    // the BSRAM this never fires (inflight_q stays in {0,1} on the Harvard
+    // oracle, quicksort, bp_pred and CoreMark). Fix if it ever does: a
+    // depth-2 shadow FIFO for req_pc, not a wider register.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i) begin
+            assert (!(launch && (inflight_q != 2'd0) && !rsp_cap))
+            else
+                $fatal(
+                    1,
+                    "fetch: req_pc_q overwritten with a response still owed (inflight=%0d, issue=%08h, req_pc_q=%08h)"
+                        ,
+                    inflight_q,
+                    issue_addr,
+                    req_pc_q
+                );
+
+            // Buffer-room invariant: reserved = count + 2*inflight <= 8.
+            // `available` is unsigned, so a breach would wrap it to a large
+            // value and let the issue gate overflow the buffer instead of
+            // blocking.
+            assert (({1'b0, count_q} + {2'b0, twice_inflight}) <= 5'd8)
+            else $fatal(1, "fetch: reserved > 8 (count=%0d inflight=%0d)", count_q, inflight_q);
+        end
+    end
 `endif
 
 endmodule
