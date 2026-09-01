@@ -26,12 +26,16 @@ old single-word F/D register did, so decode is agnostic to the width behind
 it. A second read port exposes head+1 so decode can stitch a 32-bit
 instruction sitting at a 2-byte-aligned branch target without a bubble.
 
-A redirect — predicted, mispredicted, trap or `mret` — kills the buffer and
-issues the first read at the target **in the same cycle**, rather than waiting
-for the PC register to update. Reads already in flight belong to the killed
-path; because responses come back in order, they are discarded by counting
-them rather than by blocking the issue path, so the new path starts fetching
-immediately. That is worth one cycle on every taken branch.
+A redirect kills the buffer and issues the first read at the target **in the
+same cycle**, rather than waiting for the PC register to update. Reads already
+in flight belong to the killed path; because responses come back in order, they
+are discarded by counting them rather than by blocking the issue path, so the
+new path starts fetching immediately. The decode-time **prediction** launches
+this way — its target is PC- or flop-derived. Execute redirects (mispredict,
+trap, `mret`) launch the cycle after (`EXEC_REDIR_INCYCLE=0`): their target
+comes off the forwarding path, and putting the register file's read output on
+the instruction memory's address pins — which pay a long physical tail — cost
+more timing than the cycle bought.
 
 A PC outside the implemented I-mem cannot be fetched: the memory decodes only
 `ADDR_W` bits, so the read would alias back into real instructions and execute
@@ -68,13 +72,16 @@ RV32I ALU, single-cycle MUL on a DSP, multi-cycle DIV/REM (32-iteration
 restoring FSM), Zilx effective-address, branch resolve with redirect, and CSR
 read-modify-write. One FSM drives DIV/REM and the LSU.
 
-Memory accesses take a register stage: the idle state only *captures* the
-request (address, lane-shifted store data, byte strobes, peripheral select)
-into flops, and the next state drives the bus from those flops. Driving the
-bus straight off the ALU result closed on paper and failed on silicon. The
-stage costs one cycle per access and buys ~4.8 ns of timing by ending the
-`register file → forward → adder → strobe decode → memory port` chain at a
-flop rather than at the tail of the deepest combinational path in the machine.
+**Loads launch live**: an aligned D-mem load drives the bus straight off the
+ALU result in the idle state, so it costs one no-retire cycle instead of two —
+only the BSRAM's one-cycle response waits. Stores and peripheral accesses
+keep their register stage (`LSU_LIVE_LOAD` gates the split): a posted store
+retires on its own launch, so answering "did this store launch" in the same
+cycle would put the ALU result on the pipeline's control network (PnR:
+-4.956 ns), and behind the peri port sit the AXI bridge, the crossbar and a
+slave's address decode, all combinational in the address phase (PnR:
+-5.533 ns). MMIO sits outside every timed region, so the peri capture cycle
+costs nothing measurable (8/4/0 cycles on quicksort/CoreMark/Dhrystone).
 
 Stores are posted (retire on launch accept); loads wait for the read
 response. The LSU steers `addr[PERI_ADDR_BIT]` internally: `0` → native
@@ -140,7 +147,7 @@ software-interrupt register.
 A 25 MHz MS5351M reference feeds an on-chip rPLL that drives the fabric at
 **50 MHz** (`clk_core = 25 × 10/5`), single clock domain, no CDC. Synthesis
 and PnR meet 50 MHz with the branch predictor enabled, most recently by
-+0.002 ns — a tie rather than a margin, on the noise figure given below. A 25 MHz
++0.024 ns — a pass rather than a margin, on the noise figure given below. A 25 MHz
 PLL-bypass build exists as a fallback and as a diagnostic that removes the
 rPLL from the picture.
 
@@ -156,33 +163,41 @@ At 50 MHz:
 
 | Benchmark | Result |
 |---|---|
-| CoreMark | **2.13 CoreMark/MHz** (468 400 cycles/iteration) |
-| Dhrystone | **0.93 DMIPS/MHz** (608 cycles/iteration) |
-| Quicksort (256 words) | 48 521 cycles (print-free build, `PRINT_ARRAY=0`) |
+| CoreMark | **2.39 CoreMark/MHz** (417 809 cycles/iteration) |
+| Dhrystone | **1.04 DMIPS/MHz** (543 cycles/iteration) |
+| Quicksort (256 words) | 44 833 cycles (print-free build, `PRINT_ARRAY=0`) |
 
 The CoreMark figure is a rules-valid run **on the board**: 2000 iterations,
-18.7 s, `crcfinal` 0x4983 matching the published value, sources verbatim from
+16.71 s, `crcfinal` 0x4983 matching the published value, sources verbatim from
 upstream EEMBC, built `-O3 -march=rv32imac_zicsr_zifencei -mabi=ilp32
 -ffunction-sections -fdata-sections -mstrict-align -mbranch-cost=10
--ffp-contract=off -mno-fdiv -Wl,--gc-sections`. Dhrystone uses verbatim SiFive
-sources and is measured in simulation. Quicksort co-simulates against Spike
-retire for retire; CoreMark does too, but only in a dedicated build with the
-banner and cycle counter compiled out, since Spike has no UART, timer or MSIP
-device to diff against.
+-ffp-contract=off -mno-fdiv -Wl,--gc-sections` with **GCC 13.3.0**, the best of
+a 2026-09-02 sweep — GCC 16.1.0 -O3 measures 420 897 cycles/iteration (2.37),
+the -O2 builds 437 616 / 439 457 (GCC 14.3.0 / 13.3.0, 2.28 / 2.27), and the
+GCC 14.3.0 -O3 default 420 560 (2.37). Dhrystone uses verbatim SiFive sources,
+200 000 runs in 2.17 s = 92 081 Dhrystones/s (52.40 DMIPS). Quicksort
+co-simulates against Spike retire for retire; CoreMark does too, but only in
+a dedicated build with the banner and cycle counter compiled out, since Spike
+has no UART, timer or MSIP device to diff against.
 
-Four changes account for the current numbers over the pre-predictor core: the
+Five changes account for the current numbers over the pre-predictor core: the
 branch predictor (a correct prediction issues no redirect), linker relaxation
 (turning `auipc`+`jalr` call pairs back into predictable `jal`), issuing the
-fetch at the redirect target in the redirect cycle itself (one cycle off every
-taken branch — 3.09 down to 2.09 no-retire cycles per redirect), and ordering
-the ALU result mux by measured arrival time.
+fetch at the redirect target in the redirect cycle itself (on the
+decode-prediction path — one cycle off every predicted-taken branch), removing
+the LSU capture stage from the D-mem load path (one cycle off every load), and
+ordering the ALU result mux by measured arrival time.
 
-CoreMark now runs at 1.60 cycles per instruction. The largest remaining cost
-by far is the LSU, 0.43 of that across its capture and launch stages, followed
-by the two cycles a taken branch still pays for memory latency and for the
-fetched word becoming visible. A BTB is deliberately *not* on the list: with
-linker relaxation on, Dhrystone has one static `jalr` site and CoreMark two,
-so it would buy nothing here.
+CoreMark runs at 1.43 cycles per instruction (CPI 1.434 on the
+default-toolchain build: floor 1.000 + load launch 0.252 + redirect 0.061 +
+decode-bubble 0.010 + other 0.110). The load launch is a floor, not a lever —
+it is the load's issue cycle plus the BSRAM's one-cycle response, and the
+response cycle retires — so removing it needs non-blocking loads, not a
+shorter path. The rest of the no-retire budget goes to the two cycles a
+predicted-taken branch still pays for memory latency and for the fetched word
+becoming visible. A BTB is deliberately *not* on the list: with linker
+relaxation on, Dhrystone has one static `jalr` site and CoreMark two, so it
+would buy nothing here.
 
 Methodology, the stall/CPI instrumentation and the A/B recipes live in
 [`sim/README.md`](sim/README.md) and `sim/bench_ipc_ab.md`.

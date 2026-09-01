@@ -155,17 +155,20 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   -mbranch-cost=10 -ffp-contract=off -mno-fdiv` with `-Wl,--gc-sections` —
   the set comparable published rv32 ports quote. `-mstrict-align` is not
   optional: this core traps on misalignment rather than fixing it up. 11.1 KiB
-  `.text` (of 16) / 4.0 KiB D-mem data. gcc 15.1.0 measured ~2% slower, so
-  the 14.3.0 default stands.
-  **Score: 504 977 cycles/iteration = 1.98 CoreMark/MHz** (single iteration,
-  2K, -O3), measured on the board and matched in sim. Was 531 025 / 1.88
-  before the branch predictor and linker relaxation; redirect CPI is 0.069,
-  down from 0.383 with no predictor. A/B reproduce recipe in `sim/bench_ipc_ab.md`. CRCs `list 0xe714` /
+  `.text` (of 16) / 4.0 KiB D-mem data. A 2026-09-02 sweep: **GCC 13.3.0 -O3
+  best (417 809)**, GCC 16.1.0 -O3 0.7% behind (420 897), -O2 builds ~5%
+  behind (437 616 GCC 14.3.0 / 439 457 GCC 13.3.0); earlier, gcc 15.1.0 had
+  measured ~2% slower than 14.3.0.
+  **Score: 417 809 cycles/iteration = 2.39 CoreMark/MHz** (2000 iterations,
+  2K, -O3, GCC 13.3.0 — best of the 2026-09-02 sweep), measured on the board.
+  Was 420 560 / 2.37 on the GCC 14.3.0 -O3 default; 466 120 / 2.14 before the
+  LSU load-path change; 531 025 / 1.88 before the branch predictor and linker
+  relaxation. A/B reproduce recipe in `sim/bench_ipc_ab.md`. CRCs `list 0xe714` /
   `matrix 0x1fd7` / `state 0x8e3a` = the official 2K performance-seed values;
   `crcfinal` 0x4983 on a 2000-iteration run. At the board's 50 MHz a
   rules-valid run (≥10 s, under the 32-bit `mcycle` wrap — there is no
   `mcycleh`; the 10-s minimum scales with the clock, the wrap maximum is
-  cycle-based) is `ITERATIONS` 814..6979; 2000 iterations takes ~31 s. A shorter
+  cycle-based) is `ITERATIONS` 1197..10277; 2000 iterations takes ~17 s. A shorter
   run ends in upstream's own "ERROR! Must execute for at least 10 secs" — the
   run rule, not a core failure; the four CRC lines say it computed correctly.
   `TOTAL_DATA_SIZE=6000` (6K profile), `IMEM_PAD_WORDS=2048` (16 KiB / 8,
@@ -194,10 +197,11 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   FPU while the toolchain's libgcc is built `ilp32d` — the soft-float helpers
   do not exist to link against. 5.8 KiB `.text` (of 16) / 1.9 KiB `.rodata` +
   10.3 KiB `.bss`.
-  **Score: 644 cycles/iteration = 0.88 DMIPS/MHz at 50 MHz**
-  (`DHRY_ITERS=2000`, -O3). Was 686 / 0.82 before the branch predictor and
-  linker relaxation — Dhrystone gains most from relaxation because it is
-  call-dense.
+  **Score: 543 cycles/iteration = 1.04 DMIPS/MHz at 50 MHz** (200 000 runs,
+  2.17 s, 92 081 Dhrystones/s = 52.40 DMIPS). Was 537 / 1.05 on the GCC 14.3.0
+  -O3 default; 608 / 0.93 post redirect-launch fetch; 686 / 0.82 before the
+  branch predictor and linker relaxation — Dhrystone gains most from
+  relaxation because it is call-dense.
   All 22 of Dhrystone's
   own `should be:` final values match at every iteration count tried. The
   figure is `strcpy`-sensitive by construction — a plain byte loop measures
@@ -206,8 +210,8 @@ cd sim && make run RUN_ARGS="+IINIT=sw/intr/trap/build/imem.hex +DINIT=sw/intr/t
   and says so in `sifive/UPSTREAM.md`.
   A run under 2 s ends in upstream's own "Measured time too small to obtain
   meaningful results"; that is Dhrystone's run rule (`Too_Small_Time`), and it
-  needs `DHRY_ITERS` ≈ 145 772 at 50 MHz (the 32-bit `mcycle` caps the other
-  end at ~6.26 M iterations). The port summary is computed from cycles and has
+  needs `DHRY_ITERS` ≈ 184 163 at 50 MHz (the 32-bit `mcycle` caps the other
+  end at ~7.9 M iterations). The port summary is computed from cycles and has
   no minimum. **Not co-simulated**: `Arr_2_Glob` is 10 000 bytes of `.bss`, so
   `dhry_link.ld` needs the whole 16 KiB D-mem with `DMEM ORIGIN = 0` — which
   is where `.text` must live too, and Spike's single address space cannot hold
