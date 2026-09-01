@@ -8,18 +8,65 @@ package rv32_pkg;
     localparam int unsigned XLEN = 32;
     localparam int unsigned STRB_WIDTH = XLEN / 8;
 
+    // Core clock, and the frequency the board UART divides down to hit
+    // UART_BAUD. MUST track the rPLL settings in top_module: changing one
+    // without the other puts the serial line at the wrong baud, which on a
+    // board looks exactly like a dead core. See the note above the rPLL
+    // instance in top_module.sv, which owns the derivation.
+    localparam int unsigned UART_CLK_HZ = 50_000_000;
+    // BOARD baud. Not the simulation's: sim_top defaults to 10 MBaud (5
+    // clocks per bit) to keep runs short and overrides this through its own
+    // parameter, so do NOT copy the sim default here -- at 50 MHz it makes
+    // BAUDDIV 4 and nothing on a real serial line can read it.
+    localparam int unsigned UART_BAUD = 115200;
+
+    // Branch-predictor enable A/B knob: -GBP_EN=0 disables prediction and
+    // reproduces the pre-predictor core exactly (the baseline). Default 1.
+    localparam int unsigned BP_EN = 1;
+
+    // MUL structure A/B knob (see alu.sv). Functionally identical either way,
+    // so this is a timing knob only -- the retire stream must not move.
+    // MEASURED: 0 is the better one. 1 cost 2.52 ns on the 2026-09-01 PnR
+    // ladder (49.6 -> 44.1 MHz); the note in alu.sv has the breakdown.
+    localparam int unsigned MUL_SHARED_DSP = 0;
+
+    // PHT lookup placement A/B knob: -GBP_PUSH_LOOKUP=0 reads the PHT at
+    // decode with the live GHR (the original form); 1 reads it at
+    // instruction-buffer push time and carries the bit in the entry. Unlike
+    // MUL_SHARED_DSP this one DOES move the retire stream -- the push-time
+    // read sees a slightly older GHR, so predictions differ.
+    localparam int unsigned BP_PUSH_LOOKUP = 0;
+
+    // -GEXEC_REDIR_INCYCLE=1 restores the 2026-08-31 form where an execute
+    // redirect also launches its read in the redirect cycle. Default 0 keeps
+    // the register file off the I-mem address pins (see fetch_stage.sv) and
+    // costs 1 cycle per mispredict / trap / mret.
+    localparam int unsigned EXEC_REDIR_INCYCLE = 0;
+
+    // LSU launch shape. 1 = an aligned D-mem LOAD launches live from
+    // alu_result (one cycle cheaper per load); 0 = every bus op captures into
+    // flops first, which is the pre-2026-09-01 LSU and the shape that closed
+    // 50 MHz at +0.093 ns and ran CoreMark on silicon. See execute_stage.sv.
+    localparam int unsigned LSU_LIVE_LOAD = 1;
+
     // ---------------------------------------------------------------
     // Branch-predictor geometry. One place, because three files have to
     // agree: branch_predictor.sv sizes the PHT/GHR from it, and the
     // bp_lookup_rsp_t / bp_train_t / de_t index fields below are all
     // BP_PHT_IDX_W wide (the gshare index snapshot rides D/E to resolve).
+    // BP_GHR_W must equal BP_PHT_IDX_W: the gshare index is
+    // pc[BP_PHT_IDX_W:1] ^ ghr, a full-width xor with no padding on either
+    // side, and the push-time lookup slices ghr the same way.
     //
     // 128 entries x 2 bits, 7 bits of global history. Sized by timing, not
     // by accuracy: the table is read combinationally at decode and that read
     // feeds fetch's launch/inflight logic in the same cycle, so PHT depth is
     // directly on a critical path (2026-08-31 PnR: a 512-entry table put
-    // pht_index -> RAM out at 6.1 ns, 3.36 ns of it pure routing across the
-    // spread-out primitives, landing that path at -1.024 ns).
+    // pht_index -> read output at 6.1 ns, 3.36 ns of it pure routing across
+    // the spread-out primitives, landing that path at -1.024 ns). The table
+    // is a flop array read through a LUT mux, so depth costs what a wide mux
+    // costs -- Gowin has no async-read RAM to put it in (see the storage note
+    // in branch_predictor.sv).
     //
     // Measured CoreMark cost of shrinking it (ITERATIONS=4, -O3):
     //   512 x 9 -> 2004284 ticks, 18608 mispredicts   (1.99 CoreMark/MHz)
@@ -160,6 +207,36 @@ package rv32_pkg;
         logic [XLEN-1:0] pc;           // PC of the control-flow instr (gshare index src)
         logic            ret_consume;  // a return lookup is consumed this cycle (stats only)
     } bp_lookup_req_t;
+
+    // Fetch -> predictor: the PUSH-TIME lookup (BP_PUSH_LOOKUP=1). Fetch
+    // presents the PC stamp of each 32-bit word it is about to push into the
+    // instruction buffer -- up to two per cycle. Both PCs are combinational
+    // off req_pc_q / pc_q, i.e. flops, so this read has a whole cycle to
+    // itself instead of sitting on the decode -> fetch redirect path.
+    typedef struct packed {
+        logic [XLEN-1:0] pc0;  // PC stamp of the first word pushed this cycle
+        logic [XLEN-1:0] pc1;  // PC stamp of the second (when two are pushed)
+    } bp_push_req_t;
+
+    // Predictor -> fetch: two direction bits per word, one for each halfword
+    // slot the word can be decoded from (pc with bit[1]=0 and bit[1]=1), plus
+    // the GHR snapshot both were read with. Fetch stores these in the buffer
+    // entry; decode selects by src_pc[1] and recomputes the gshare index as
+    // src_pc[BP_PHT_IDX_W:1] ^ ghr, which is the index the bits were read at.
+    //
+    // Two bits per word rather than one because a 32-bit buffer entry can be
+    // decoded from either halfword: the low half normally, the high half after
+    // a redirect into the middle of a word or when the RVC hold buffer carries
+    // it. Reading both costs one extra PHT entry, not one extra port: the two
+    // gshare indices differ in exactly their LSB (see the push lookup in
+    // branch_predictor.sv), so they are an aligned pair.
+    typedef struct packed {
+        logic [BP_GHR_W-1:0] ghr;       // GHR snapshot both words were read with
+        logic                pred0_lo;  // word 0, pc[1]=0
+        logic                pred0_hi;  // word 0, pc[1]=1
+        logic                pred1_lo;  // word 1, pc[1]=0
+        logic                pred1_hi;  // word 1, pc[1]=1
+    } bp_push_rsp_t;
 
     // Predictor -> decode: the looked-up prediction.
     typedef struct packed {

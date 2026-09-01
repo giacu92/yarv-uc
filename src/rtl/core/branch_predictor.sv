@@ -67,6 +67,17 @@ module branch_predictor (
     output wire bp_lookup_rsp_t lookup_rsp_o,
 
     // -------------------------------------------------------------------
+    // Push-time lookup port (fetch, combinational). Used when the CPU is
+    // built with BP_PUSH_LOOKUP=1: fetch reads the direction bits as it
+    // pushes words into the instruction buffer and carries them in the
+    // entry, so the array read is a flop-to-flop path with a whole cycle
+    // instead of a term on decode's redirect path. See the lookup below for
+    // what that costs in accuracy (a slightly stale GHR).
+    // -------------------------------------------------------------------
+    input  wire bp_push_req_t push_req_i,
+    output wire bp_push_rsp_t push_rsp_o,
+
+    // -------------------------------------------------------------------
     // Training port (execute, at resolve). One resolved control-flow
     // instruction per cycle (in-order single-issue). Mutually exclusive
     // kind bits; exactly the PHT/GHR/RAS state for that kind updates.
@@ -160,6 +171,47 @@ module branch_predictor (
     assign lookup_rsp_o.pht_taken = pht_q[lookup_index][1];
     assign lookup_rsp_o.ras_valid = ras_valid;
     assign lookup_rsp_o.ras_top   = ras_q[ras_top_idx];
+
+    // -------------------------------------------------------------------
+    // Push-time lookup (combinational, PC + GHR only)
+    // -------------------------------------------------------------------
+    // Same gshare function as above, evaluated one or two pipeline stages
+    // earlier, for both halfword slots of each pushed word.
+    //
+    // The two indices for a word are an ALIGNED PAIR, which is why reading
+    // both costs one extra entry and not one extra port. With
+    //   index = pc[IDX_W:1] ^ ghr
+    // the only difference between the two slots is pc[1], the index's LSB
+    // source, so
+    //   index(pc[1]=0) = {u,  ghr[0]}
+    //   index(pc[1]=1) = {u, ~ghr[0]}   where u = pc[IDX_W:2] ^ ghr[IDX_W-1:1]
+    // One aligned pair {u,0} / {u,1} covers both, and ghr[0] says which of
+    // the two is the pc[1]=0 slot.
+    //
+    // ACCURACY NOTE, and it is the whole trade of this option: the bits are
+    // read with the GHR as it stands at PUSH time, while the decode-time
+    // lookup reads it as it stands at DECODE. A conditional branch resolving
+    // in between shifts the GHR, so a prediction read at push can be indexed
+    // with history one or two outcomes out of date. Nothing is incorrect --
+    // de_t carries the index the bits were read at, so training updates the
+    // same entry the lookup used, and execute is still the golden resolver --
+    // but gshare's whole point is indexing with current history, so expect
+    // some accuracy loss. The measured numbers are in sim/bench_ipc_ab.md.
+    localparam int unsigned PAIR_W = IDX_W - 1;
+
+    wire [PAIR_W-1:0] push_u0 = push_req_i.pc0[IDX_W:2] ^ ghr_q[IDX_W-1:1];
+    wire [PAIR_W-1:0] push_u1 = push_req_i.pc1[IDX_W:2] ^ ghr_q[IDX_W-1:1];
+
+    wire [       1:0] push0_ctr0 = pht_q[{push_u0, 1'b0}];
+    wire [       1:0] push0_ctr1 = pht_q[{push_u0, 1'b1}];
+    wire [       1:0] push1_ctr0 = pht_q[{push_u1, 1'b0}];
+    wire [       1:0] push1_ctr1 = pht_q[{push_u1, 1'b1}];
+
+    assign push_rsp_o.ghr      = ghr_q;
+    assign push_rsp_o.pred0_lo = ghr_q[0] ? push0_ctr1[1] : push0_ctr0[1];
+    assign push_rsp_o.pred0_hi = ghr_q[0] ? push0_ctr0[1] : push0_ctr1[1];
+    assign push_rsp_o.pred1_lo = ghr_q[0] ? push1_ctr1[1] : push1_ctr0[1];
+    assign push_rsp_o.pred1_hi = ghr_q[0] ? push1_ctr0[1] : push1_ctr1[1];
 
     // -------------------------------------------------------------------
     // 2-bit saturating counter update

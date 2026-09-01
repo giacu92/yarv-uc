@@ -174,7 +174,27 @@ module fetch_stage #(
     // bits, so the access would alias back into real instructions and
     // execute them. Fetch raises an instruction access fault instead. Must
     // match the I-mem actually instantiated at the top level.
-    parameter int IMEM_ADDR_W = 14
+    parameter int IMEM_ADDR_W = 14,
+    // Whether the EXECUTE redirect (mispredict / trap / mret / interrupt)
+    // launches its read in the redirect cycle itself.
+    //   0 = no (default). The read waits for pc_q, one cycle later, exactly as
+    //       before 2026-08-31. Costs 1 cycle per execute redirect.
+    //   1 = yes, the 2026-08-31 behaviour for both redirect sources.
+    // The DECODE prediction always launches in-cycle regardless: its target is
+    // src_pc + imm or the RAS top, i.e. PC- and flop-derived, so it does not
+    // drag the register file onto the I-mem address pins.
+    //
+    // Why the split exists (2026-09-01 PnR, -3.812 ns / 42.0 MHz): with
+    // branch_addr_i on the issue path, the eight worst paths in the design ran
+    //   regfile DO -> forward -> operand -> JALR adder (rs1+imm) ->
+    //   branch_target mux -> branch_addr_o -> issue_addr -> u_imem AD[*]
+    // i.e. the register file's read output reaching the instruction memory's
+    // address pins inside one cycle. Nothing else in the report ended at an
+    // I-mem address pin, and nothing else can: issue_addr is the only path
+    // there, and pc_q / pc_next_block are flops. Dropping branch_addr_i from
+    // that mux removes the whole leg and leaves the predicted redirect -- the
+    // common case at 88-99% accuracy -- still launching in-cycle.
+    parameter int EXEC_REDIR_INCYCLE = 0
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -204,6 +224,14 @@ module fetch_stage #(
     output ifetch_req_t imem_req_o,
     input  ifetch_rsp_t imem_rsp_i,
 
+    // Push-time branch-predictor lookup. Fetch presents the PC stamp of each
+    // word it is about to push; the predictor answers with a direction bit for
+    // each halfword slot of each word plus the GHR snapshot they were read
+    // with, and fetch stores all of it in the buffer entry. That takes the PHT
+    // array read off decode's redirect path -- see BP_PUSH_LOOKUP.
+    output wire bp_push_req_t bp_push_o,
+    input  wire bp_push_rsp_t bp_push_i,
+
     // F/D pipeline register outputs (buffer head): each pipeline stage
     // exposes the PC it is treating, the instruction word, and a valid
     // (stage sigil `fe_`).
@@ -212,17 +240,30 @@ module fetch_stage #(
     output wire            fe_valid_o,  // F/D valid (held level)
     output wire            fe_fault_o,  // F/D entry is an access fault, not an instruction
 
+    // Prediction carried in the head entry (BP_PUSH_LOOKUP=1). One direction
+    // bit per halfword slot -- decode selects by src_pc[1] -- plus the GHR
+    // snapshot they were read with, from which decode recomputes the gshare
+    // index for the D/E snapshot.
+    output wire                fe_pred_lo_o,  // head, pc[1]=0
+    output wire                fe_pred_hi_o,  // head, pc[1]=1
+    output wire [BP_GHR_W-1:0] fe_ghr_o,      // head, GHR at push
+
     // Buffer head+1 read port (same-cycle RVC spanning stitch). Exposes the
     // word right behind the head so decode can stitch a 32-bit instr sitting
     // at a 2-byte-aligned branch target (offset 2 / 6) without a bubble: the
     // stitch consumes head[31:16] + head+1[15:0] in the cycle the target word
     // is seen. Gated by fe_next_valid_o (count>=2); decode drives fe_pop2_i
     // only then, so pop-2 <= count (no underflow).
-    output wire [XLEN-1:0] fe_next_instr_o,  // buffer[head+1] word
-    output wire [XLEN-1:0] fe_next_pc_o,     // buffer[head+1] PC
-    output wire            fe_next_valid_o,  // count >= 2
-    output wire            fe_next_fault_o,  // buffer[head+1] fault flag
-    input  wire            fe_pop2_i         // decode: pop 2 this cycle (target stitch)
+    output wire [    XLEN-1:0] fe_next_instr_o,    // buffer[head+1] word
+    output wire [    XLEN-1:0] fe_next_pc_o,       // buffer[head+1] PC
+    output wire                fe_next_valid_o,    // count >= 2
+    output wire                fe_next_fault_o,    // buffer[head+1] fault flag
+    // head+1's high-half prediction + GHR snapshot. The same-cycle target
+    // stitch re-stashes head+1's upper half into decode's hold buffer, so the
+    // prediction for that halfword has to travel with it.
+    output wire                fe_next_pred_hi_o,
+    output wire [BP_GHR_W-1:0] fe_next_ghr_o,
+    input  wire                fe_pop2_i           // decode: pop 2 this cycle (target stitch)
 );
 
     // -----------------------------------------------------------------
@@ -237,9 +278,16 @@ module fetch_stage #(
     logic redir_launched_q, redir_launched_d;  // redirect cycle already issued at the target
 
     // Depth-8 32-bit-word instruction buffer (FIFO).
-    logic [XLEN-1:0] buf_instr_q[BUF_DEPTH];
-    logic [XLEN-1:0] buf_pc_q   [BUF_DEPTH];
-    logic            buf_fault_q[BUF_DEPTH];
+    logic [    XLEN-1:0] buf_instr_q  [BUF_DEPTH];
+    logic [    XLEN-1:0] buf_pc_q     [BUF_DEPTH];
+    logic                buf_fault_q  [BUF_DEPTH];
+    // Push-time prediction, carried per entry: one direction bit per halfword
+    // slot + the GHR snapshot they were read with. 9 bits x 8 entries = 72
+    // flops. Unused (and pruned, along with the predictor's push read port)
+    // when the CPU is built with BP_PUSH_LOOKUP=0.
+    logic                buf_pred_lo_q[BUF_DEPTH];
+    logic                buf_pred_hi_q[BUF_DEPTH];
+    logic [BP_GHR_W-1:0] buf_ghr_q    [BUF_DEPTH];
     logic [2:0] head_q, head_d;
     logic [2:0] tail_q, tail_d;
     logic [3:0] count_q, count_d;  // 0..BUF_DEPTH
@@ -290,7 +338,14 @@ module fetch_stage #(
     // This is what keeps the 8-byte advance off the predictor's target: the
     // adder runs on pc_q instead of on redirect_addr. The stream of issued
     // addresses is identical to advancing pc_q on the redirect cycle itself.
-    wire [XLEN-1:0] issue_addr = redirect ? redirect_addr : redir_launched_q ? pc_next_block : pc_q;
+    // In-cycle launch address. Only a source whose target is PC-derived may
+    // appear here: pred_addr_i is src_pc+imm or the RAS top, both off the
+    // register file. branch_addr_i is NOT, and putting it here is what took
+    // the 2026-09-01 run to -3.812 ns (see EXEC_REDIR_INCYCLE).
+    wire incycle_launch = (EXEC_REDIR_INCYCLE != 0) ? redirect : pred_redirect;
+    wire [XLEN-1:0] incycle_addr = (EXEC_REDIR_INCYCLE != 0) ? redirect_addr : pred_addr_i;
+    wire [XLEN-1:0]
+        issue_addr = incycle_launch ? incycle_addr : redir_launched_q ? pc_next_block : pc_q;
 
     // Room on a redirect cycle is measured against the buffer the redirect
     // is about to zero, not the one still holding wrong-path words: count
@@ -309,7 +364,15 @@ module fetch_stage #(
     // fault entry when it lands (rsp_fault). Speculating a read that is
     // thrown away costs nothing (the I-mem is read-only and one cycle deep)
     // and keeps the whole range check off the predictor's adder.
-    wire bus_issue = (inflight_q < 2'd2) && (available_issue >= 5'd2) && (redirect || !pc_fault);
+    // An execute redirect that does not launch in-cycle must not launch at
+    // pc_q either: pc_q still holds the wrong-path address until the next
+    // edge. So the issue is suppressed for that one cycle and resumes from
+    // pc_q (= the target) next cycle. branch_valid_i is a module input driven
+    // by a flop-fed comparison in execute, so this term costs nothing on the
+    // address path -- it gates the enable, not the address.
+    wire exec_redir_hold = (EXEC_REDIR_INCYCLE == 0) && branch_valid_i;
+    wire bus_issue = (inflight_q < 2'd2) && (available_issue >= 5'd2) &&
+        (incycle_launch || !pc_fault) && !exec_redir_hold;
     // A fault pushes 1 word and launches no read -> its own >=1 gate. Hold it
     // off a cycle when a response is landing the same cycle so the buffer
     // never pushes more than 2 words in one cycle, and while any read is
@@ -381,6 +444,15 @@ module fetch_stage #(
     wire [1:0] push_cnt = do_rsp_data ?
         (rsp_two ? 2'd2 : 2'd1) : (do_rsp_fault || fault_push) ? 2'd1 : 2'd0;
 
+    // Push-time predictor lookup. Both addresses are combinational off flops
+    // (req_pc_q via rsp_low_pc / rsp_high_pc, or pc_q on a fault push), so the
+    // PHT read they drive has the whole cycle and lands in a flop -- which is
+    // the entire point of doing it here rather than at decode. The request is
+    // unconditional: a lookup for a word that is not pushed is simply
+    // discarded, and gating it would only add logic to the address path.
+    assign bp_push_o.pc0 = push0_pc;
+    assign bp_push_o.pc1 = push1_pc;
+
     // -----------------------------------------------------------------
     // Buffer pop: decode consumes the head when it is not back-pressuring.
     // A same-cycle target-span stitch pops 2 (head + head+1, the stitch word
@@ -448,7 +520,10 @@ module fetch_stage #(
         if (launch) req_pc_d = issue_addr;
 
         // A redirect-cycle launch defers the pc advance to the next cycle.
-        redir_launched_d = redirect && launch;
+        // Only an in-cycle launch does that: when the execute redirect is held
+        // (EXEC_REDIR_INCYCLE=0) pc_q becomes the target and the next cycle
+        // issues AT it, not one block past it.
+        redir_launched_d = incycle_launch && launch;
 
         // stale tracks how many outstanding responses still belong to the
         // killed path. An accepted response retires the oldest one; a
@@ -484,14 +559,20 @@ module fetch_stage #(
             count_q          <= count_d;
             // Buffer writes: push0 at tail, push1 at tail+1 (3-bit wrap).
             if (push_cnt >= 2'd1) begin
-                buf_instr_q[tail_q] <= push0_word;
-                buf_pc_q[tail_q]    <= push0_pc;
-                buf_fault_q[tail_q] <= push0_fault;
+                buf_instr_q[tail_q]   <= push0_word;
+                buf_pc_q[tail_q]      <= push0_pc;
+                buf_fault_q[tail_q]   <= push0_fault;
+                buf_pred_lo_q[tail_q] <= bp_push_i.pred0_lo;
+                buf_pred_hi_q[tail_q] <= bp_push_i.pred0_hi;
+                buf_ghr_q[tail_q]     <= bp_push_i.ghr;
             end
             if (push_cnt >= 2'd2) begin
-                buf_instr_q[tail_q+3'd1] <= push1_word;
-                buf_pc_q[tail_q+3'd1]    <= push1_pc;
-                buf_fault_q[tail_q+3'd1] <= push1_fault;
+                buf_instr_q[tail_q+3'd1]   <= push1_word;
+                buf_pc_q[tail_q+3'd1]      <= push1_pc;
+                buf_fault_q[tail_q+3'd1]   <= push1_fault;
+                buf_pred_lo_q[tail_q+3'd1] <= bp_push_i.pred1_lo;
+                buf_pred_hi_q[tail_q+3'd1] <= bp_push_i.pred1_hi;
+                buf_ghr_q[tail_q+3'd1]     <= bp_push_i.ghr;
             end
         end
     end
@@ -500,20 +581,25 @@ module fetch_stage #(
     // F/D outputs (buffer head). fe_valid is a held level (head stays until
     // decode consumes it via !stall_i, or a redirect kills the buffer).
     // -----------------------------------------------------------------
-    assign fe_instr_o = buf_instr_q[head_q];
-    assign fe_pc_o    = buf_pc_q[head_q];
-    assign fe_valid_o = (count_q != 4'd0);
-    assign fe_fault_o = buf_fault_q[head_q];
+    assign fe_instr_o   = buf_instr_q[head_q];
+    assign fe_pc_o      = buf_pc_q[head_q];
+    assign fe_valid_o   = (count_q != 4'd0);
+    assign fe_fault_o   = buf_fault_q[head_q];
+    assign fe_pred_lo_o = buf_pred_lo_q[head_q];
+    assign fe_pred_hi_o = buf_pred_hi_q[head_q];
+    assign fe_ghr_o     = buf_ghr_q[head_q];
 
     // Buffer head+1 read port (same-cycle target-span stitch). head_next is a
     // 3-bit wrap, always a valid 0..7 index even when count<2; decode gates on
     // fe_next_valid_o. A redirect zeros count -> both fe_valid_o and
     // fe_next_valid_o drop, so no extra kill logic.
     wire [2:0] head_next = head_q + 3'd1;
-    assign fe_next_instr_o = buf_instr_q[head_next];
-    assign fe_next_pc_o    = buf_pc_q[head_next];
-    assign fe_next_fault_o = buf_fault_q[head_next];
-    assign fe_next_valid_o = (count_q >= 4'd2);
+    assign fe_next_instr_o   = buf_instr_q[head_next];
+    assign fe_next_pc_o      = buf_pc_q[head_next];
+    assign fe_next_fault_o   = buf_fault_q[head_next];
+    assign fe_next_valid_o   = (count_q >= 4'd2);
+    assign fe_next_pred_hi_o = buf_pred_hi_q[head_next];
+    assign fe_next_ghr_o     = buf_ghr_q[head_next];
 
 `ifdef VERILATOR
     // The split assumes the I-mem aligns the read address down to 8 bytes

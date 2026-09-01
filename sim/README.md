@@ -207,8 +207,8 @@ then an empty buffer is the fetch path's fault:
 | bucket | signal | meaning |
 |---|---|---|
 | `load-wait` | `mem_running` | load issued, waiting for `rvalid` |
-| `lsu-launch` | `mem_launch & ~store_done` | driving the request, slave not yet ready |
-| `lsu-capture` | `mem_stage_req` | the LSU register stage's own capture cycle |
+| `lsu-launch` | `(mem_bus_drive \| peri_capture) & ~store_done` | LSU issuing: D-mem drive, peri capture, or peri drive |
+| `lsu-mistrap` | `misaligned_trap` | misaligned access raising its sync trap (`EX_MEM_TRAP`) |
 | `div/rem` | `div_running \| alu_start` | multi-cycle divide |
 | `csr-read` | `csr_start` | the registered CSR read (`EX_CSR_WAIT`) |
 | `wfi-halt` | `wfi_stall` | halted until an interrupt is pending |
@@ -273,6 +273,34 @@ rm -rf obj_dir && make VPARAMS="-GBP_EN=0"     # predictor off (A/B baseline)
 rm -rf obj_dir && make                          # predictor on (default)
 ```
 
+Two more structural knobs landed 2026-09-01, both defaulting to the new form
+and both there so a PnR run can move one variable at a time:
+
+```
+rm -rf obj_dir && make VPARAMS="-GMUL_SHARED_DSP=0"   # three 32x32 products (old MUL)
+rm -rf obj_dir && make VPARAMS="-GBP_PUSH_LOOKUP=0"   # PHT read at decode (old placement)
+```
+
+`MUL_SHARED_DSP` is behaviour-neutral, so the retire stream and the cycle
+count must not move — `sw/isa/mul_ops` checks it both ways.
+`BP_PUSH_LOOKUP=1` reads the PHT when fetch pushes a word into the buffer and
+carries the direction bit in the entry, which takes the array read off the
+decode -> fetch redirect path and makes `BP_PHT_DEPTH` timing-neutral. It DOES
+move the prediction (the bit is read with a slightly older GHR), so cycle
+counts shift a little; the retire stream cannot move, and the oracles check
+that. Measured, same images:
+
+| config (`BP_PHT_DEPTH` x `BP_GHR_W`) | quicksort | CoreMark cyc/iter | Dhrystone cyc/iter | cm accuracy | cm MPKI |
+|---|---|---|---|---|---|
+| decode lookup, 128x7 | 40154 | 401976 | 486 | 88.24% | 23.79 |
+| push lookup, 128x7 (default) | 40135 | 402827 | 485 | 87.84% | 24.59 |
+| push lookup, 512x9 | 40057 | **398441** | 485 | 91.57% | 17.07 |
+| decode lookup, 512x9 | 40067 | 398093 | 485 | 91.89% | 16.41 |
+
+The stale GHR costs ~0.2% of CoreMark cycles at 128 and *gains* 0.2% on
+Dhrystone; the win is that 512 entries become affordable, which is worth
+0.88% of CoreMark cycles over the 128-entry baseline.
+
 With the predictor on, the **`redirect` bucket drops ~5×** (a correct
 prediction issues no execute redirect) but a new **`imem-starve` + `other`
 ~0.23 CPI** appears — the kill+refill bubble on every *correct* predicted-taken
@@ -297,17 +325,79 @@ predicted-taken / mispredicts / accuracy / MPKI, plus a `RAS:` hit/miss line.
 The full A/B (quicksort/CoreMark/Dhrystone, `BP=1` vs `BP=0`) and the
 copy-paste reproduce recipe are in [`bench_ipc_ab.md`](bench_ipc_ab.md).
 
-Three identities hold in every run, and they are the instrumentation's own
-proof that it is neither losing nor double-counting cycles: `lsu-capture` ==
-mem-ops (one capture cycle per load *and* store), `lsu-launch` == loads (a
-store retires on the launch accept, so that cycle is a retire and never
-enters the histogram), and `div/rem` == 33 × divides (the 32-iteration
-restoring FSM plus one).
+Two identities hold in every run, and they are the instrumentation's own
+proof that it is neither losing nor double-counting cycles: `lsu-launch` ==
+loads (a store both issues and retires in `EX_IDLE`, so its cycle is a retire
+and never enters the histogram), and `div/rem` == 33 × divides (the
+32-iteration restoring FSM plus one). `lsu-mistrap` is 0 in every benchmark —
+a misaligned access always traps, so it only appears in the trap oracles.
+
+Before 2026-09-01 there was a third identity, `lsu-capture` == mem-ops, from
+the LSU capture stage that used to sit in front of the launch. The bucket is
+gone with the stage; the tables above that still name it are the historical
+measurements listed with their dates.
 
 Dhrystone has the worst CPI of the three not because the core does worse on
 it but because it has the highest load/store density (31.4% — `strcpy` and
 `strcmp` a byte at a time) plus the only divides. quicksort has the most
 expensive redirect term because it is the branchiest.
+
+### After removing the D-mem LSU capture stage (2026-09-01, shipping)
+
+The `lsu-capture` bucket was one cycle on every memory access — the price of a
+launch path that started at a flop instead of at the end of
+`regfile -> forward -> ALU`. Removing it on the **D-mem** path (the bus is
+driven combinationally from `alu_result` in `EX_IDLE` again; only the
+*later-cycle* consumers, the load byte select and a misaligned trap's `mtval`,
+still read a latched copy of the address) deletes that cycle outright.
+
+Two things keep a capture cycle, and neither by choice:
+
+- the **peri** path, because behind that port sit the AXI bridge, the crossbar
+  and a slave's own address decode, all combinational in the address phase.
+  Removing it too failed PnR at -5.533 ns / 39.164 MHz. Costs nothing
+  measurable: MMIO is outside every timed region.
+- **stores**, because a posted store retires on its own launch, so "did this
+  store launch" is a question `stall_o` must answer in the same cycle -- and
+  answering it needs the effective address. Driving that from `alu_result` put
+  the machine's deepest combinational value on the pipeline's control network
+  and failed PnR at -4.956 ns / 40.1 MHz.
+
+A **load** never retires on its launch (it waits for `rvalid`), so nothing about
+its launch reaches `stall_o`, and that is the one case that stays live. It is
+78% of the win: CoreMark has 62778 loads against 17815 stores.
+
+Same tree, same firmware images, one parameter (`LSU_LIVE_LOAD`):
+
+| | quicksort | CoreMark | Dhrystone |
+|---|---|---|---|
+| cycles, `LSU_LIVE_LOAD=0` | 49605 | 474767 / iter | 600 / iter |
+| cycles, `LSU_LIVE_LOAD=1` | **44833** | **420560 / iter** | **537 / iter** |
+| CPI, =0 | 1.691 | 1.622 | 1.735 |
+| CPI, =1 | **1.528** | **1.434** | **1.569** |
+| score, =0 | — | 2.10 CM/MHz | 0.94 DMIPS/MHz |
+| score, =1 | — | **2.37 CM/MHz** | **1.05 DMIPS/MHz** |
+
+−9.6% / −11.4% / −10.5% cycles at an unchanged 50 MHz. Both columns close
+timing; `=1` is what ships and is board-verified.
+
+quicksort is built `PRINT_ARRAY=0`, so it retires exactly 29336 instructions
+on both sides and the cycle delta is the whole effect. CoreMark and Dhrystone
+retire slightly *more* instructions with the live load, because their UART
+`TX_READY` poll loops spin more times per byte when the core runs the loop
+faster — a benchmark artefact, not a workload difference, and the reason cycles
+per iteration is the number to compare rather than IPC.
+
+A D-mem load now costs 1 no-retire cycle (its issue) instead of 2. Stores and
+peri accesses still cost their capture cycle, folded into `lsu-launch`.
+`load-wait` stays 0: the BSRAM answers the cycle after the accept and that
+cycle retires.
+
+**`lsu-launch` 0.252 CPI is now a floor, not a lever.** A load costs its issue
+cycle plus the memory's one-cycle response, and the response cycle retires; the
+issue cycle cannot be removed by shortening a path. It goes away only with
+non-blocking loads — a second outstanding access, so the next instruction
+issues while the first load's data is in flight.
 
 Two things to read off it. **The fetch path is no longer a limiter** —
 `imem-starve` is 2 cycles in a 1.5 M-cycle run, so outside a redirect the

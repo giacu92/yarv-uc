@@ -30,15 +30,35 @@ import rv32_pkg::*;
  */
 module sim_top #(
     // UART clock/baud, overridable from the Verilator command line
-    // (-GUART_CLK_HZ=... -GUART_BAUD=...). The defaults keep the sim fast
+    // (-GUART_CLK_HZ=... -GUART_BAUD=...). Deliberately NOT taken from
+    // rv32_pkg, unlike the four structural knobs below: the package carries
+    // the BOARD baud (115200) and the sim wants a fast one.
+    // The defaults keep the sim fast
     // (5 clocks per bit); pass the board's real numbers
     // (25_000_000 / 115_200 -> 217 clocks per bit) to check the RX
     // sampling phase at the divisor the hardware actually uses.
-    parameter int unsigned UART_CLK_HZ = 50_000_000,
-    parameter int unsigned UART_BAUD   = 10_000_000,
+    parameter int unsigned UART_CLK_HZ        = 50_000_000,
+    parameter int unsigned UART_BAUD          = 10_000_000,
     // Branch-predictor enable A/B knob: -GBP_EN=0 disables prediction and
     // reproduces the pre-predictor core exactly (the baseline). Default 1.
-    parameter int          BP_EN       = 1
+    parameter int          BP_EN              = rv32_pkg::BP_EN,
+    // MUL structure A/B knob: -GMUL_SHARED_DSP=0 restores the three-product
+    // form (see alu.sv). Functionally identical, so this is a timing knob
+    // only -- the retire stream must not move.
+    parameter int          MUL_SHARED_DSP     = rv32_pkg::MUL_SHARED_DSP,
+    // PHT lookup placement A/B knob: -GBP_PUSH_LOOKUP=0 reads the PHT at
+    // decode with the live GHR (the original form); 1 reads it at
+    // instruction-buffer push time and carries the bit in the entry. Unlike
+    // MUL_SHARED_DSP this one DOES move the retire stream -- the push-time
+    // read sees a slightly older GHR, so predictions differ.
+    parameter int          BP_PUSH_LOOKUP     = rv32_pkg::BP_PUSH_LOOKUP,
+    // -GEXEC_REDIR_INCYCLE=1 restores the 2026-08-31 form where an execute
+    // redirect also launches its read in the redirect cycle. Default 0 keeps
+    // the register file off the I-mem address pins (see fetch_stage.sv) and
+    // costs 1 cycle per mispredict / trap / mret.
+    parameter int          EXEC_REDIR_INCYCLE = rv32_pkg::EXEC_REDIR_INCYCLE,
+    // -GLSU_LIVE_LOAD=0 captures every bus op (the pre-2026-09-01 LSU).
+    parameter int          LSU_LIVE_LOAD      = rv32_pkg::LSU_LIVE_LOAD
 ) (
     input  wire       clk_i,
     input  wire       rstn_i,
@@ -101,8 +121,12 @@ module sim_top #(
     // the implemented I-mem from one outside it, which is the difference
     // between fetching an instruction and taking an access fault.
     rv32imac_zicsr_zifencei #(
-        .IMEM_ADDR_W(14),
-        .BP_EN      (BP_EN)
+        .IMEM_ADDR_W       (14),
+        .BP_EN             (BP_EN),
+        .MUL_SHARED_DSP    (MUL_SHARED_DSP),
+        .BP_PUSH_LOOKUP    (BP_PUSH_LOOKUP),
+        .EXEC_REDIR_INCYCLE(EXEC_REDIR_INCYCLE),
+        .LSU_LIVE_LOAD     (LSU_LIVE_LOAD)
     ) u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),

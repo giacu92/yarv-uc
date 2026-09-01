@@ -90,7 +90,16 @@ module decode_stage #(
     // zeroed, no predicted redirect) so execute resolves every control-flow
     // instruction exactly as before the predictor existed — the A/B baseline
     // and a safety fallback. The predictor block may stay instantiated.
-    parameter int BP_EN = 1
+    parameter int BP_EN = 1,
+    // Where the PHT direction bit comes from.
+    //   1 = the buffer entry, read at PUSH time by fetch and carried in the
+    //       entry (default). Takes the PHT array read off this stage's
+    //       redirect path, which makes PHT depth timing-neutral; costs a
+    //       slightly stale GHR (see branch_predictor.sv).
+    //   0 = the decode-time lookup port, read with the live GHR.
+    // Functionally safe either way -- de_t carries the index the bits were
+    // read at, so training always updates the entry the lookup used.
+    parameter int BP_PUSH_LOOKUP = 1
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -107,14 +116,26 @@ module decode_stage #(
     // it becomes a precise trap with this PC as mtval.
     input wire            fe_fault_i,
 
+    // Prediction carried in the head entry (BP_PUSH_LOOKUP=1): one direction
+    // bit per halfword slot, selected by the PC being decoded, plus the GHR
+    // snapshot the bits were read with. Ignored when BP_PUSH_LOOKUP=0.
+    input wire                fe_pred_lo_i,
+    input wire                fe_pred_hi_i,
+    input wire [BP_GHR_W-1:0] fe_ghr_i,
+
     // Buffer head+1 (same-cycle RVC spanning stitch). Exposes the word right
     // behind the head so a 32-bit instr at a 2-byte-aligned branch target
     // (offset 2 / 6) stitches in the cycle the target word is seen, no bubble.
     // fe_next_valid_i = count>=2; fe_pop2_o tells fetch to drop both entries.
-    input wire [XLEN-1:0] fe_next_instr_i,
-    input wire [XLEN-1:0] fe_next_pc_i,
-    input wire            fe_next_valid_i,
-    input wire            fe_next_fault_i,
+    input wire [    XLEN-1:0] fe_next_instr_i,
+    input wire [    XLEN-1:0] fe_next_pc_i,
+    input wire                fe_next_valid_i,
+    input wire                fe_next_fault_i,
+    // head+1's high-half prediction + GHR snapshot: the same-cycle target
+    // stitch re-stashes head+1's upper half, so its prediction travels with it
+    // into the hold buffer.
+    input wire                fe_next_pred_hi_i,
+    input wire [BP_GHR_W-1:0] fe_next_ghr_i,
 
     // Register-file read port (decode drives addresses; data returns
     // combinationally the same cycle).
@@ -522,13 +543,23 @@ module decode_stage #(
     // Hold buffer: when a 32-bit word's low half is compressed, decode it
     // this cycle and stash the upper half for next cycle.
     // =================================================================
-    logic        hold_q;
-    logic [31:0] hold_word_q;
-    logic [31:0] hold_pc_q;
+    logic                hold_q;
+    logic [        31:0] hold_word_q;
+    logic [        31:0] hold_pc_q;
+    // Prediction that travels with a stashed halfword (BP_PUSH_LOOKUP=1).
+    // Every stashed PC has bit[1]=1 by construction -- buffer_upper stashes
+    // fe_pc+2, span_complete fe_pc+2, target_span_complete fe_next_pc+2, and
+    // target_span_wait stashes an odd-half target PC that already has bit[1]
+    // set -- so the bit stashed is always the entry's HIGH-half prediction and
+    // one bit is enough.
+    logic                hold_pred_q;
+    logic [BP_GHR_W-1:0] hold_ghr_q;
 
-    logic        hold_d;
-    logic [31:0] hold_word_d;
-    logic [31:0] hold_pc_d;
+    logic                hold_d;
+    logic [        31:0] hold_word_d;
+    logic [        31:0] hold_pc_d;
+    logic                hold_pred_d;
+    logic [BP_GHR_W-1:0] hold_ghr_d;
 
     // =================================================================
     // D/E pipeline register
@@ -675,7 +706,15 @@ module decode_stage #(
     logic         [        XLEN-1:0] pred_target;
     pred_source_t                    pred_source;
     logic         [BP_PHT_IDX_W-1:0] pred_pht_index;
-    logic         [        XLEN-1:0] pred_dir_target;  // src_pc + imm (PC-relative target)
+    // PHT direction / index / GHR for the instruction being decoded, resolved
+    // from either the carried-in-entry source or the decode-time lookup port.
+    logic                            pht_taken_src;
+    logic         [    BP_GHR_W-1:0] pht_ghr_src;
+    logic         [BP_PHT_IDX_W-1:0] pht_index_src;
+    logic         [        XLEN-1:0] pred_dir_target;  // src_pc + pred_imm (PC-relative)
+    // Branch/JAL immediate for the predictor's adder only, selected straight
+    // off the opcode field instead of out of the decoder's case tree.
+    logic         [        XLEN-1:0] pred_imm;
 
     // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
     // and driven with a default every cycle in the decode always_comb below:
@@ -1282,19 +1321,60 @@ module decode_stage #(
         is_return_cf = is_cf & (branch_type == BR_JALR) & (rs1_field == 5'd1 || rs1_field == 5'd5) &
             (rd_field == 5'd0);
 
-        // Direct PC-relative target for JAL and conditional branches (imm is
-        // imm_j / imm_b respectively, set above). JALR targets are rs1+imm --
-        // not PC-relative -- so pred_dir_target is not used for JALR.
-        pred_dir_target = src_pc + imm;
+        // Direct PC-relative target for JAL and conditional branches. JALR
+        // targets are rs1+imm -- not PC-relative -- so this is not used there.
+        //
+        // Deliberately NOT `src_pc + imm`. `imm` is the output of the whole
+        // opcode case tree above, and this adder feeds fetch's issue_addr and
+        // pc_q, so that tree ends up in front of a 32-bit carry chain and then
+        // in front of the I-mem address pins. Measured on the 2026-09-01
+        // 48.965 MHz run, second-worst path group (-0.307 ns):
+        //   buffer head 2.271 -> c_expand/src_instr32 5.509 -> [case tree]
+        //   -> imm 15.836 -> pred_dir_target 18.634 -> pc_q 22.543
+        // 10.3 ns of it is src_instr32 -> imm through the decoder.
+        //
+        // The predictor only ever needs two of the immediates, and both are
+        // pure bit permutations of src_instr32 with a sign extension -- no case
+        // tree involved. Selecting between them takes ONE comparison on the
+        // opcode field, available immediately after c_expand. So the adder now
+        // hangs off src_instr32 directly and the decoder is off this path.
+        //
+        // Equivalence with execute, which resolves as `de_i.pc + de_i.imm`: for
+        // a conditional branch the decoder sets imm = imm_b, for JAL imm =
+        // imm_j, and those are the only two cases where pred_dir_target is
+        // consumed (PRED_PHT and PRED_DIRECT). Every other opcode leaves it a
+        // don't-care, gated by pred_source. A mismatch here would not be a
+        // wrong retire -- execute is the golden resolver -- but it would
+        // mispredict every direct branch, which sw/isa/bp_pred catches.
+        pred_imm = (src_instr32[6:0] == OPC_JAL) ? imm_j : imm_b;
+        pred_dir_target = src_pc + pred_imm;
 
         // Build the prediction. pred_valid marks a classified control-flow
         // instruction (records NT predictions and unpredicted JALR for uniform
         // mispredict accounting in execute); pred_taken is the speculated
         // direction; pred_target is the taken target (valid when pred_taken).
-        pred_valid = is_cf;
-        pred_source = PRED_NONE;
-        pred_taken = 1'b0;
-        pred_target = '0;
+        // Direction bit + gshare index, from whichever source this build
+        // uses. The push-time form reads two flops (the entry's two halfword
+        // predictions, selected by the PC being decoded) and one xor; the
+        // decode-time form reads the PHT array. src_pc[1] is the uniform
+        // selector: a stashed halfword always has bit[1]=1 and always carried
+        // the HIGH-half bit, so the hold case needs no separate rule beyond
+        // taking the stashed copy rather than the head's.
+        if (BP_PUSH_LOOKUP != 0) begin
+            pht_taken_src = (span_complete || is_hold_plain) ?
+                hold_pred_q : (src_pc[1] ? fe_pred_hi_i : fe_pred_lo_i);
+            pht_ghr_src = (span_complete || is_hold_plain) ? hold_ghr_q : fe_ghr_i;
+            pht_index_src = src_pc[BP_PHT_IDX_W:1] ^ pht_ghr_src;
+        end else begin
+            pht_taken_src = bp_lookup_i.pht_taken;
+            pht_ghr_src   = '0;
+            pht_index_src = bp_lookup_i.pht_index;
+        end
+
+        pred_valid     = is_cf;
+        pred_source    = PRED_NONE;
+        pred_taken     = 1'b0;
+        pred_target    = '0;
         pred_pht_index = '0;
         if (is_cf) begin
             if (is_return_cf) begin
@@ -1306,9 +1386,9 @@ module decode_stage #(
             end else if (is_cond_cf) begin
                 // Conditional: direction from the gshare PHT, target pc+imm.
                 pred_source    = PRED_PHT;
-                pred_taken     = bp_lookup_i.pht_taken;
+                pred_taken     = pht_taken_src;
                 pred_target    = pred_dir_target;
-                pred_pht_index = bp_lookup_i.pht_index;
+                pred_pht_index = pht_index_src;
             end else if (branch_type == BR_JAL) begin
                 // Unconditional JAL / c.j / c.jal: always taken, pc+imm.
                 pred_source = PRED_DIRECT;
@@ -1384,6 +1464,8 @@ module decode_stage #(
         hold_d      = hold_q;
         hold_word_d = hold_word_q;
         hold_pc_d   = hold_pc_q;
+        hold_pred_d = hold_pred_q;
+        hold_ghr_d  = hold_ghr_q;
 
         if (flush_i) begin
             hold_d = 1'b0;  // execute redirect: drop any stashed half
@@ -1412,6 +1494,8 @@ module decode_stage #(
             hold_d      = 1'b1;
             hold_word_d = fe_instr_i[31:16];
             hold_pc_d   = fe_pc_i + 32'd2;
+            hold_pred_d = fe_pred_hi_i;
+            hold_ghr_d  = fe_ghr_i;
         end else if (is_hold_plain) begin
             // Compressed upper half consumed; clear.
             hold_d = 1'b0;
@@ -1426,6 +1510,8 @@ module decode_stage #(
             hold_d      = 1'b1;
             hold_word_d = fe_next_instr_i[31:16];
             hold_pc_d   = fe_next_pc_i + 32'd2;
+            hold_pred_d = fe_next_pred_hi_i;
+            hold_ghr_d  = fe_next_ghr_i;
         end else if (target_span_wait) begin
             // Branch target at offset 2/6 is a 32-bit instr's low half, but
             // head+1 is absent or faults: stash the low half and wait for the
@@ -1434,12 +1520,16 @@ module decode_stage #(
             hold_d      = 1'b1;
             hold_word_d = fe_instr_i[31:16];
             hold_pc_d   = fe_pc_i;
+            hold_pred_d = fe_pred_hi_i;
+            hold_ghr_d  = fe_ghr_i;
         end else if (buffer_upper) begin
             // Decoded a fresh low compressed half; stash the upper half
             // (PC = word_pc + 2). Its [1:0] flags a spanning low.
             hold_d      = 1'b1;
             hold_word_d = fe_instr_i[31:16];
             hold_pc_d   = fe_pc_i + 32'd2;
+            hold_pred_d = fe_pred_hi_i;
+            hold_ghr_d  = fe_ghr_i;
         end else begin
             hold_d = 1'b0;  // nothing to stash
         end
@@ -1523,11 +1613,15 @@ module decode_stage #(
             hold_q      <= 1'b0;
             hold_word_q <= 32'd0;
             hold_pc_q   <= 32'd0;
+            hold_pred_q <= 1'b0;
+            hold_ghr_q  <= '0;
             de_q        <= '0;
         end else begin
             hold_q      <= hold_d;
             hold_word_q <= hold_word_d;
             hold_pc_q   <= hold_pc_d;
+            hold_pred_q <= hold_pred_d;
+            hold_ghr_q  <= hold_ghr_d;
             de_q        <= de_next;
         end
     end

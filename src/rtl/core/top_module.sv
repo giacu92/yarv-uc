@@ -94,7 +94,10 @@ module top_module (
     // dead core. At 50 MHz BAUDDIV resets to CLK_FREQ_HZ/BAUD_RATE-1 = 433,
     // giving 50e6/434 = 115 207 Hz against a nominal 115 200 (+0.006%, well
     // inside RS-232 tolerance).
-    localparam int unsigned CLK_CORE_HZ = 50_000_000;
+    //
+    // The number itself lives in rv32_pkg as UART_CLK_HZ, which is what the
+    // UART instance below reads. It is deliberately NOT duplicated here: a
+    // second copy is the exact failure this comment block is about.
 
     wire clk_core;
     wire pll_lock;
@@ -123,8 +126,7 @@ module top_module (
     );
 
     // Falling back to the 25 MHz PLL-bypass build is three lines: comment
-    // the rPLL out and restore
-    //   localparam int unsigned CLK_CORE_HZ = 25_000_000;
+    // the rPLL out, set rv32_pkg::UART_CLK_HZ to 25_000_000, and restore
     //   wire clk_core = clk_i;
     //   wire pll_lock = 1'b1;
     // then re-comment the SDC's create_generated_clock and set
@@ -221,7 +223,12 @@ module top_module (
     // the implemented I-mem from one outside it, which is the difference
     // between fetching an instruction and taking an access fault.
     rv32imac_zicsr_zifencei #(
-        .IMEM_ADDR_W(14)
+        .IMEM_ADDR_W       (14),
+        .BP_EN             (rv32_pkg::BP_EN),
+        .MUL_SHARED_DSP    (rv32_pkg::MUL_SHARED_DSP),
+        .BP_PUSH_LOOKUP    (rv32_pkg::BP_PUSH_LOOKUP),
+        .EXEC_REDIR_INCYCLE(rv32_pkg::EXEC_REDIR_INCYCLE),
+        .LSU_LIVE_LOAD     (rv32_pkg::LSU_LIVE_LOAD)
     ) u_cpu (
         .clk_i      (clk_core),
         .rstn_i     (rstn_core),
@@ -319,12 +326,12 @@ module top_module (
     //   m2 MSIP_PERI_ADDR (0x1000_3000, 4 KiB)
     // -----------------------------------------------------------------
     axi4_lite_xbar_3 #(
-        .BASE0(UART_BASE),
-        .SIZE0(UART_SIZE),
-        .BASE1(MTIMER_BASE),
-        .SIZE1(MTIMER_SIZE),
-        .BASE2(MSIP_PERI_ADDR),
-        .SIZE2(MSIP_PERI_SIZE)
+        .BASE0(rv32_pkg::UART_BASE),
+        .SIZE0(rv32_pkg::UART_SIZE),
+        .BASE1(rv32_pkg::MTIMER_BASE),
+        .SIZE1(rv32_pkg::MTIMER_SIZE),
+        .BASE2(rv32_pkg::MSIP_PERI_ADDR),
+        .SIZE2(rv32_pkg::MSIP_PERI_SIZE)
     ) u_peri_xbar (
         .clk_i (clk_core),
         .rstn_i(rstn_core),
@@ -379,8 +386,8 @@ module top_module (
     end
 
     axi4_lite_uart #(
-        .CLK_FREQ_HZ(CLK_CORE_HZ),
-        .BAUD_RATE  (115200)
+        .CLK_FREQ_HZ(rv32_pkg::UART_CLK_HZ),
+        .BAUD_RATE  (rv32_pkg::UART_BAUD)
     ) uart_i (
         .clk_i (clk_core),
         .rstn_i(rstn_core),

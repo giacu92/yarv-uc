@@ -227,6 +227,7 @@ int main(int argc, char** argv) {
     }
     if (const char *e = getenv("INSTR_LOG")) instr_log = atoi(e) != 0;
 
+
     Vsim_top* top = new Vsim_top;
     // NO_VCD=1 skips the waveform dump. A board-accurate UART run (217
     // clocks per bit) needs millions of cycles, which would produce a
@@ -313,8 +314,8 @@ int main(int argc, char** argv) {
     // fault.
     enum {
         SC_LOAD_WAIT,  // EX_MEM_WAIT: load issued, waiting for rvalid
-        SC_LSU_LAUNCH, // EX_MEM_LAUNCH: driving the request, slave not yet ready
-        SC_LSU_CAPTURE,// EX_IDLE capture cycle (the LSU register stage's own cost)
+        SC_LSU_LAUNCH, // LSU issuing: D-mem drive, peri capture, or peri drive
+        SC_LSU_MISTRAP,// EX_MEM_TRAP: misaligned access, raising its sync trap
         SC_DIV,        // DIV/REM multi-cycle
         SC_CSR,        // EX_CSR_WAIT: the registered CSR read
         SC_WFI,        // halted in wfi until an interrupt is pending
@@ -328,7 +329,7 @@ int main(int argc, char** argv) {
     };
     static const char *const sc_name[SC_N] = {
         "load-wait     (EX_MEM_WAIT)", "lsu-launch    (bus accept)",
-        "lsu-capture   (reg stage)",   "div/rem       (multi-cycle)",
+        "lsu-mistrap   (misaligned)",  "div/rem       (multi-cycle)",
         "csr-read      (EX_CSR_WAIT)", "wfi-halt",
         "rvc-hold      (upper half)",  "rvc-span      (word straddle)",
         "redirect      (flush + refill)", "imem-starve   (fetch behind)",
@@ -345,8 +346,9 @@ int main(int argc, char** argv) {
 
     // Event counters, so a bucket can be read per operation rather than
     // only as a total (e.g. load-wait cycles divided by loads).
-    long n_mem_ops = 0, n_loads = 0, n_divs = 0, n_csrs = 0, n_redirects = 0;
-    bool pv_mem_req = false, pv_mem_done = false, pv_div = false;
+    long n_loads = 0, n_stores = 0, n_divs = 0, n_csrs = 0, n_redirects = 0;
+
+    bool pv_div = false;
     bool pv_csr = false, pv_redir = false;
     // Branch-predictor event counters. n_bp_resolved = every resolved
     // control-flow instr; n_bp_predt = those predicted taken at decode;
@@ -432,8 +434,13 @@ int main(int argc, char** argv) {
         // all is decided after the edge, from ex_valid.
         bool ev_redir_now = false;
         {
-            const bool ev_mem_req  = XTAP(mem_stage_req) != 0;
+            // One pulse per completed mem op: a load on its rvalid, a
+            // (posted) store on its launch accept. Counting completions
+            // rather than issues is edge-safe now that a store both issues
+            // and retires in EX_IDLE — two back-to-back stores would leave
+            // the issue term high across the boundary and lose a count.
             const bool ev_mem_done = XTAP(mem_done) != 0;
+            const bool ev_store_done = XTAP(store_done) != 0;
             const bool ev_div      = XTAP(alu_start) != 0;
             const bool ev_csr      = XTAP(csr_start) != 0;
             const bool ev_redir    = XTAP(branch_valid_o) != 0;
@@ -452,8 +459,8 @@ int main(int argc, char** argv) {
             // ex_state_q == EX_IDLE), but counting edges keeps the totals
             // right if that ever stops being true. The bp_* counters must NOT
             // use an edge gate -- see their declaration.
-            if (ev_mem_req && !pv_mem_req) ++n_mem_ops;
-            if (ev_mem_done && !pv_mem_done) ++n_loads;   // only loads reach EX_MEM_WAIT
+            if (ev_mem_done) ++n_loads;    // only loads reach EX_MEM_WAIT
+            if (ev_store_done) ++n_stores;  // posted store, at its accept
             if (ev_div && !pv_div) ++n_divs;
             if (ev_csr && !pv_csr) ++n_csrs;
             if (ev_redir && !pv_redir) ++n_redirects;
@@ -462,7 +469,7 @@ int main(int argc, char** argv) {
             if (ev_bp_res) ++n_bp_resolved;
             if (ev_bp_predt && ev_bp_res) ++n_bp_predt;  // predicted-taken, at resolve
             if (ev_bp_mis) ++n_bp_mispred;  // mispredict implies cf_resolving
-            pv_mem_req = ev_mem_req; pv_mem_done = ev_mem_done; pv_div = ev_div;
+            pv_div = ev_div;
             pv_csr = ev_csr; pv_redir = ev_redir;
 
             // NOT applied here: the redirect cycle is normally the branch's
@@ -476,8 +483,13 @@ int main(int argc, char** argv) {
             // A store retires on the launch accept, so that cycle is a
             // retire and never reaches the histogram; a load's accept
             // cycle does, and belongs to the launch bucket.
-            else if (XTAP(mem_launch) && !XTAP(store_done)) sc_this = SC_LSU_LAUNCH;
-            else if (ev_mem_req)                         sc_this = SC_LSU_CAPTURE;
+            // Covers every issue cycle: the live D-mem load drive, the
+            // capture cycle for a peri access or a D-mem store, and the
+            // captured drive from those flops. A store's accept cycle is a
+            // retire and never reaches the histogram.
+            else if ((XTAP(mem_bus_drive) || XTAP(mem_capture)) && !XTAP(store_done))
+                sc_this = SC_LSU_LAUNCH;
+            else if (XTAP(misaligned_trap))              sc_this = SC_LSU_MISTRAP;
             else if (XTAP(div_running) || ev_div)        sc_this = SC_DIV;
             else if (ev_csr)                             sc_this = SC_CSR;
             else if (XTAP(wfi_stall))                    sc_this = SC_WFI;
@@ -714,12 +726,12 @@ int main(int argc, char** argv) {
         // expensive ones, and only the second is a memory-system problem.
         printf("events: mem-ops %ld (loads %ld, stores %ld), div/rem %ld, "
                "csr %ld, redirects %ld\n",
-               n_mem_ops, n_loads, n_mem_ops - n_loads, n_divs, n_csrs, n_redirects);
-        if (n_mem_ops)
+               n_loads + n_stores, n_loads, n_stores, n_divs, n_csrs, n_redirects);
+        if (n_loads + n_stores)
             printf("        %.2f no-retire cyc per mem-op, %.2f per load "
                    "(wait only)\n",
                    1.0 * (sc_count[SC_LOAD_WAIT] + sc_count[SC_LSU_LAUNCH]
-                          + sc_count[SC_LSU_CAPTURE]) / n_mem_ops,
+                          + sc_count[SC_LSU_MISTRAP]) / (n_loads + n_stores),
                    n_loads ? 1.0 * sc_count[SC_LOAD_WAIT] / n_loads : 0.0);
         if (n_redirects)
             printf("        %.2f no-retire cyc per redirect\n",
@@ -768,8 +780,8 @@ int main(int argc, char** argv) {
         printf("density: ");
         if (n_redirects)
             printf("1 redirect per %.2f instr", 1.0 * retired / n_redirects);
-        if (n_mem_ops)
-            printf(", mem-ops %.1f%% of instr", 100.0 * n_mem_ops / retired);
+        if (n_loads + n_stores)
+            printf(", mem-ops %.1f%% of instr", 100.0 * (n_loads + n_stores) / retired);
         if (n_divs)
             printf(", div/rem %.2f%%", 100.0 * n_divs / retired);
         printf("\n");

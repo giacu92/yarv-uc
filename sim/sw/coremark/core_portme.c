@@ -55,11 +55,69 @@ static inline ee_u32 rdcycle(void)
 
 static CORE_TICKS start_ticks, stop_ticks;
 
+/* ------------------------------------------------------------------
+ * Trap reporter.
+ *
+ * Neither start.S nor this port used to install an mtvec, so mtvec kept
+ * its reset value of 0 -- which on this Harvard split is _start. Any
+ * exception therefore re-entered the program from the top and reprinted
+ * the banner, and a fault inside the timed loop looked like the board
+ * rebooting in a loop with no other symptom. That is exactly what a
+ * 2026-09-01 board run showed: banner, "running...", banner, forever.
+ *
+ * The handler exists to make that self-reporting: it prints mcause /
+ * mepc / mtval and parks, so one board run names the fault and the PC
+ * instead of leaving the restart to be guessed at. It is diagnostic, not
+ * a recovery path -- it deliberately does NOT mret, because returning to
+ * a faulting instruction would just re-trap and returning past it would
+ * hide the problem.
+ *
+ * Aligned 4-byte, direct mode (mtvec MODE=00 needs BASE[1:0]=00).
+ * __attribute__((naked)): no prologue may run before mepc is read, and
+ * the handler never returns, so it needs no frame at all.
+ * ------------------------------------------------------------------ */
+static void __attribute__((naked, aligned(4))) trap_report(void)
+{
+    __asm__ volatile(
+        "csrr a0, mcause\n"
+        "csrr a1, mepc\n"
+        "csrr a2, mtval\n"
+        "j    trap_report_c\n");
+}
+
+void trap_report_c(ee_u32 mcause, ee_u32 mepc, ee_u32 mtval);
+void trap_report_c(ee_u32 mcause, ee_u32 mepc, ee_u32 mtval)
+{
+    printf("\n  *** TRAP  mcause=0x%08x mepc=0x%08x mtval=0x%08x\n",
+           (unsigned)mcause, (unsigned)mepc, (unsigned)mtval);
+    printf("  (4/6 = load/store misaligned, 2 = illegal, 1 = instr access, "
+           "5/7 = load/store access)\n");
+    printf("  parked.\n");
+    for (;;) {
+    }
+}
+
 void portable_init(core_portable *p, int *argc, char *argv[])
 {
     (void)argc;
     (void)argv;
     p->portable_id = 1;
+
+#if !COSIM
+    /* Install the trap reporter before anything else can fault.
+     *
+     * NOT in the co-sim build. There, Spike has no UART / CLINT / MSIP, so the
+     * first MMIO access is an access fault on its side and a normal store on
+     * the core's -- the documented end of comparability. With mtvec at its
+     * reset value of 0 both sides stop being compared there and cosim_diff
+     * reports a clean PASS. With a handler installed, Spike instead VECTORS
+     * into it and keeps executing (mcause=5 into a0), so the divergence shows
+     * up as a control-flow MISMATCH at that same retire instead of a stop:
+     *   spike: pc 0x28 x10 = 0x5   rtl: pc 0x1c0 x14 = 0x1
+     * Same event, worse diagnosis. The reporter is a board instrument; the
+     * co-sim build has no board and no UART to report on. */
+    __asm__ volatile("csrw mtvec, %0" : : "r"(&trap_report));
+#endif
 
 #if !COSIM
     /* A banner before the run, because the whole benchmark is silent: at

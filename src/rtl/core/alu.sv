@@ -23,7 +23,14 @@ import rv32_pkg::*;
 // ---------------------------------------------------------------
 
 
-module alu (
+module alu #(
+    // MUL structure A/B knob. 1 = one shared signed 33x33 product with the
+    // signedness selected on the OPERANDS (default); 0 = the historical form,
+    // three separate 32x32 products with a 4-way mux on their RESULTS.
+    // Functionally identical -- this exists so a PnR run can move one
+    // variable at a time (see the note above the MUL block).
+    parameter int unsigned MUL_SHARED_DSP = 1
+) (
     input wire clk_i,
     input wire rst_ni,
 
@@ -129,28 +136,98 @@ module alu (
     // -----------------------------------------------------------
     // MUL — single-cycle (DSP inference)
     // -----------------------------------------------------------
-    logic signed [2*XLEN-1:0] mul_ss;
-    logic        [2*XLEN-1:0] mul_uu;
-    logic signed [2*XLEN-1:0] mul_su;
+    // The DSP output is the LATEST signal in this module (3.78 ns after its
+    // operands on the 2026-08-31 PnR run), so what matters is how many mux
+    // levels sit BEHIND it, not how many sit in front.
+    //
+    // The historical form (MUL_SHARED_DSP=0) computed three products --
+    // signed*signed, unsigned*unsigned, signed*unsigned -- and picked between
+    // their results with a 4-way mux, which is ~2 LUT levels on top of the
+    // 2-3 the final result mux already costs. That whole stack is behind the
+    // DSP. CLAUDE.md measured it at ~6 mux levels off alu_result and put it
+    // in reserve as worth 1.5-2 ns.
+    //
+    // MEASURED RESULT (2026-09-01 PnR): the shared form is WORSE by 2.52 ns
+    // (49.6 MHz -> 44.1 MHz), so MUL_SHARED_DSP defaults to 0 and the
+    // three-product form below is the one that ships. It lost on both halves
+    // of the prediction:
+    //
+    //   - The operand-side sign extension was predicted free because only bit
+    //     XLEN depends on the select. It is not: the operand path settles at
+    //     8.366 ns and the DSP input is not reached until 10.759, against
+    //     8.564 -> 10.249 for the three-product form. **+0.7 ns**, and it lands
+    //     on the LATE path, which is the one that could not afford it.
+    //   - The post-DSP mux did not shrink. 15.414 -> 20.232 through SEVEN
+    //     alu_result hops, against 14.009 -> 18.372 through six. **+0.46 ns.**
+    //     The intended structure -- one low/high select behind the DSP, then
+    //     the existing final mux -- is not what GowinSynthesis built: it folds
+    //     the 66-bit product's two candidate slices into the same mux tree as
+    //     every other ALU candidate, so writing the select as one level in RTL
+    //     does not make it one level in fabric.
+    //
+    // The resource goal WAS met -- it maps to a single MULT36X36 instead of
+    // three 32x32 -- which is the part worth remembering: on this device the
+    // DSP count and the DSP's contribution to the critical path are close to
+    // independent, and folding multipliers together buys area, not slack.
+    //
+    // The shared form (kept for the A/B) uses the fact that signedness is a property
+    // of the OPERANDS, not of the product: extend both to XLEN+1 bits with
+    // the sign bit each op wants (0 for an unsigned operand) and one signed
+    // multiply serves all four. The extension is a single 2:1 on bit XLEN
+    // whose select comes from alu_op_i -- a flopped de_q field, ready long
+    // before the operands finish forwarding -- so it is free, and bits
+    // [XLEN-1:0] pass through untouched. Behind the DSP only the low/high
+    // word select remains (1 level).
+    //
+    //   MUL     : low word,  signedness irrelevant (a*b mod 2^XLEN)
+    //   MULH    : high word, signed   x signed
+    //   MULHSU  : high word, signed   x unsigned
+    //   MULHU   : high word, unsigned x unsigned
+    //
+    // It also folds three 32x32 multipliers into one 33x33, which should cut
+    // DSP occupancy and the routing between the blocks. Check the resource
+    // table after synthesis: a 33-bit operand pads to 36 in the MULT18X18
+    // tiling, so the single product is not necessarily a third of the area.
+    wire [XLEN-1:0] mul_result;
+    wire is_mul_op = (alu_op_i == ALU_MUL) || (alu_op_i == ALU_MULH) || (alu_op_i == ALU_MULHSU) ||
+        (alu_op_i == ALU_MULHU);
 
-    assign mul_ss = $signed(operand_a_i) * $signed(operand_b_i);
-    assign mul_uu = operand_a_i * operand_b_i;
-    assign mul_su = $signed(operand_a_i) * $signed({1'b0, operand_b_i});
+    if (MUL_SHARED_DSP != 0) begin : g_mul_shared
+        // Operand signedness, decoded from alu_op_i alone (early). MUL takes
+        // the low word, where signedness cannot matter, so it rides with the
+        // signed ops rather than getting a case of its own.
+        wire                     a_signed = (alu_op_i != ALU_MULHU);
+        wire                     b_signed = (alu_op_i == ALU_MUL) || (alu_op_i == ALU_MULH);
 
-    logic [XLEN-1:0] mul_result;
-    always_comb begin
-        unique case (alu_op_i)
-            ALU_MUL:    mul_result = mul_ss[XLEN-1:0];
-            ALU_MULH:   mul_result = mul_ss[2*XLEN-1:XLEN];
-            ALU_MULHSU: mul_result = mul_su[2*XLEN-1:XLEN];
-            ALU_MULHU:  mul_result = mul_uu[2*XLEN-1:XLEN];
-            default:    mul_result = '0;
-        endcase
+        // Only bit XLEN depends on the select; [XLEN-1:0] pass straight to the
+        // DSP. Both extended operands are correct 33-bit signed values, so the
+        // 66-bit signed product holds the exact 64-bit result in [2*XLEN-1:0]
+        // for all four ops (signed x signed fits in +-2^62, signed x unsigned
+        // in +-2^63, unsigned x unsigned in 2^64).
+        wire signed [    XLEN:0] a_ext = {a_signed & operand_a_i[XLEN-1], operand_a_i};
+        wire signed [    XLEN:0] b_ext = {b_signed & operand_b_i[XLEN-1], operand_b_i};
+        wire signed [2*XLEN+1:0] prod = a_ext * b_ext;
+
+        // The only mux level behind the DSP.
+        wire                     take_hi = (alu_op_i != ALU_MUL);
+        assign mul_result = take_hi ? prod[2*XLEN-1:XLEN] : prod[XLEN-1:0];
+    end else begin : g_mul_three
+        wire signed [2*XLEN-1:0] mul_ss = $signed(operand_a_i) * $signed(operand_b_i);
+        wire [2*XLEN-1:0] mul_uu = operand_a_i * operand_b_i;
+        wire signed [2*XLEN-1:0] mul_su = $signed(operand_a_i) * $signed({1'b0, operand_b_i});
+
+        logic [XLEN-1:0] sel;
+        always_comb begin
+            unique case (alu_op_i)
+                ALU_MUL:    sel = mul_ss[XLEN-1:0];
+                ALU_MULH:   sel = mul_ss[2*XLEN-1:XLEN];
+                ALU_MULHSU: sel = mul_su[2*XLEN-1:XLEN];
+                ALU_MULHU:  sel = mul_uu[2*XLEN-1:XLEN];
+                default:    sel = '0;
+            endcase
+        end
+        assign mul_result = sel;
     end
-
-    logic is_mul_op;
-    assign is_mul_op = (alu_op_i == ALU_MUL) || (alu_op_i == ALU_MULH) ||
-        (alu_op_i == ALU_MULHSU) || (alu_op_i == ALU_MULHU);
 
     // -----------------------------------------------------------
     // DIV/REM — multi-cycle, restoring division, 32 iterations.
@@ -287,7 +364,8 @@ module alu (
     // -----------------------------------------------------------
     // Ordered by measured arrival: MUL (DSP, latest) gets the final mux,
     // the adder the one behind it, everything genuinely early sits deepest.
-    // See the arrival-time note at the top of the base-RV32I block.
+    // See the arrival-time note at the top of the base-RV32I block, and the
+    // MUL block for what was done to shorten what sits behind the DSP.
     logic [XLEN-1:0] early_result;
 
     always_comb begin

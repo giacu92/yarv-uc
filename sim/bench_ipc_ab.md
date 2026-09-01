@@ -135,7 +135,9 @@ stream at similar IPC is still less work. Compare cycles, not IPC, across a code
 change.
 
 Not attributable to either change: LSU stays the dominant cost in every cell
-(`lsu-launch` + `lsu-capture` = 0.42-0.52 CPI, vs redirect now 0.004-0.129).
+(`lsu-launch` + `lsu-capture` = 0.42-0.52 CPI, vs redirect now 0.004-0.129). **The
+LSU capture stage was removed on the load path on 2026-09-01 and `lsu-capture`
+no longer exists as a bucket; see the section in sim/README.md.**
 
 CoreMark CRCs are byte-identical across all four cells (`seedcrc` 0xe9f5, `crclist`
 0xe714, `crcmatrix` 0x1fd7, `crcstate` 0x8e3a) — the workload did not change, only the
