@@ -63,6 +63,15 @@
 // Taps inside the execute stage (one level below the CPU top).
 #define XTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_execute__DOT__##field)
 
+// The D-mem storage array. Every self-checking oracle in sw/ ends by storing
+// a pass/fail marker to a fixed D-mem word, so reading that word out is the
+// exact result -- as opposed to inferring it from the retire trace, where the
+// `li` that materialises the marker shows up whether or not the store that
+// follows it ever ran.
+// Must match sim_top's u_dmem ADDR_W (14 -> 16 KiB -> 4096 words).
+#define DMEM_WORDS 4096u
+#define DMEM_WORD(w) (top->rootp->sim_top__DOT__u_dmem__DOT__mem[(w)])
+
 // Taps inside the decode and fetch stages. Note the instance names differ:
 // the CPU top instantiates decode as u_decode but fetch as fetch_stage_i.
 #define DTAP(field) (top->rootp->sim_top__DOT__u_cpu__DOT__u_decode__DOT__##field)
@@ -813,6 +822,29 @@ int main(int argc, char** argv) {
         printf("WFI-HALT FAIL at cycle %d: %s\n", wfi_fail_cyc, wfi_fail_why);
     } else {
         printf("WFI-halt check: OK\n");
+    }
+
+    // PROBE=<byte addr>[,<byte addr>...] prints those D-mem words, which is
+    // how `make regress` reads an oracle's pass marker. Word index = addr/4;
+    // out-of-range addresses print as ---- rather than reading past the array.
+    if (const char *pl = getenv("PROBE")) {
+        std::string spec(pl);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t comma = spec.find(',', pos);
+            std::string one = spec.substr(pos, comma == std::string::npos
+                                                  ? std::string::npos
+                                                  : comma - pos);
+            pos = (comma == std::string::npos) ? spec.size() : comma + 1;
+            if (one.empty()) continue;
+            const unsigned long addr = strtoul(one.c_str(), nullptr, 0);
+            const unsigned long word = addr / 4;
+            if (word < DMEM_WORDS)
+                printf("probe[0x%08lx] = 0x%08x\n", addr, DMEM_WORD(word));
+            else
+                printf("probe[0x%08lx] = ---- (outside the %lu-word D-mem)\n",
+                       addr, (unsigned long)DMEM_WORDS);
+        }
     }
 
     // Let a few final cycles ripple for the waveform tail.

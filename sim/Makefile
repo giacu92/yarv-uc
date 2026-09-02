@@ -64,10 +64,118 @@ $(TOP): sim_main.cpp $(RTL) $(HEX_PREREQ)
 run: $(TOP)
 	./$(TOP) $(RUN_ARGS)
 
+# ----------------------------------------------------------------------
+# regress — run every self-checking test and report pass/fail
+# ----------------------------------------------------------------------
+#
+#   make regress                                run every test
+#   make regress VPARAMS="-GLSU_LIVE_LOAD=0"    ... against an A/B config
+#
+# Needs the firmware built: `make -C sw` builds all of it. A test whose images
+# are missing is reported SKIP, not FAIL, so a partial tree still runs.
+#
+# Three kinds of check, because the tests genuinely differ in how they report:
+#
+#   probe@<addr>=<hex>  Read a D-mem word back out of the RTL (PROBE, see
+#                       sim_main.cpp) and compare. This is the exact result.
+#                       Do NOT substitute a grep of the retire trace: the `li`
+#                       that materialises 0x600D retires whether or not the
+#                       store after it ever ran, so a trace grep passes a test
+#                       that died between the two.
+#   trace:<reg>=<hex>   Last writeback of that register in the retire trace.
+#                       For quicksort, whose main() RETURNS 0x600D in a0 and
+#                       never stores it -- start.S just parks. Its real
+#                       verification is `make cosim`, which compares every one
+#                       of 29293 retires against Spike; this is a smoke check
+#                       plus a cycle number.
+#   park                Clean park + WFI-halt invariant only. The hand-crafted
+#                       Harvard oracle has no marker at all -- it is a
+#                       load/store and RAW round-trip covered by the cosim.
+#
+# Every test also fails on a WFI-HALT FAIL regardless of its marker.
+#
+# uart_echo is special-cased at the end: it needs UART_RX stimulus, and its
+# pass condition is the "GOOD" its firmware transmits, not a memory word.
+REGRESS_TESTS := \
+	quicksort:quicksort:200000:trace:x10=600d \
+	bp_pred:isa/bp_pred:20000:probe@0x2000=600d \
+	mul_ops:isa/mul_ops:20000:probe@0x2000=600d \
+	div_ops:isa/div_ops:20000:probe@0x2000=600d \
+	rvc_scramble:isa/rvc_scramble:20000:probe@0x2000=600d \
+	span_target:isa/span_target:20000:probe@0x2000=600d \
+	ifault:isa/ifault:20000:probe@0x2000=600d \
+	isa_probe:isa/isa_probe:200000:park \
+	trap:intr/trap:20000:probe@0x2000=600d \
+	wfi_trap:intr/wfi_trap:20000:probe@0x2000=600d \
+	timer:intr/timer:20000:probe@0x2000=600d
+
+regress: $(TOP)
+	@fail=0; skip=0; pass=0; \
+	printf '%-15s %-6s %s\n' TEST RESULT DETAIL; \
+	for t in $(REGRESS_TESTS); do \
+	    name=$$(echo "$$t" | cut -d: -f1); \
+	    dir=$$(echo  "$$t" | cut -d: -f2); \
+	    maxc=$$(echo "$$t" | cut -d: -f3); \
+	    check=$$(echo "$$t" | cut -d: -f4-); \
+	    if [ ! -f "sw/$$dir/build/imem.hex" ]; then \
+	        printf '%-15s %-6s %s\n' "$$name" SKIP "no build/ -- run: make -C sw/$$dir"; \
+	        skip=$$((skip+1)); continue; \
+	    fi; \
+	    probe=; want=; reg=; \
+	    case "$$check" in \
+	      probe@*) probe=$$(echo "$$check" | sed 's/^probe@\([^=]*\)=.*/\1/'); \
+	               want=$$(echo "$$check" | sed 's/.*=//');; \
+	      trace:*) reg=$$(echo  "$$check" | sed 's/^trace:\([^=]*\)=.*/\1/'); \
+	               want=$$(echo "$$check" | sed 's/.*=//');; \
+	    esac; \
+	    out=$$(PROBE=$$probe NO_VCD=1 MAX_CYC=$$maxc RTL_TRACE=.regress.trace ./$(TOP) \
+	           +IINIT=sw/$$dir/build/imem.hex +DINIT=sw/$$dir/build/dmem.hex 2>&1); \
+	    cyc=$$(echo "$$out" | sed -n 's/^retired [0-9]* instructions in \([0-9]*\) cycles.*/\1/p'); \
+	    bad=; \
+	    echo "$$out" | grep -q 'WFI-HALT FAIL' && bad="WFI-HALT FAIL"; \
+	    echo "$$out" | grep -q 'parked at' || bad="$$bad no clean park"; \
+	    got=; \
+	    if [ -n "$$probe" ]; then \
+	        got=$$(echo "$$out" | sed -n 's/^probe\[.*\] = 0x0*\([0-9a-fA-F]*\)$$/\1/p' | tail -1); \
+	    elif [ -n "$$reg" ]; then \
+	        got=$$(sed -n "s/^0x[0-9a-f]* $$reg 0x0*\([0-9a-f]*\)$$/\1/p" .regress.trace | tail -1); \
+	    fi; \
+	    if [ -n "$$want" ] && [ "$$got" != "$$want" ]; then \
+	        bad="$$bad marker=0x$${got:-none} want=0x$$want"; \
+	    fi; \
+	    if [ -z "$$bad" ]; then \
+	        printf '%-15s %-6s %s\n' "$$name" PASS "$$cyc cyc"; pass=$$((pass+1)); \
+	    else \
+	        printf '%-15s %-6s %s\n' "$$name" FAIL "$$cyc cyc --$$bad"; fail=$$((fail+1)); \
+	    fi; \
+	done; \
+	rm -f .regress.trace; \
+	if [ -f sw/peri/uart_echo/build/imem.hex ]; then \
+	    out=$$(UART_RX='abcdefgh' NO_VCD=1 MAX_CYC=400000 ./$(TOP) \
+	           +IINIT=sw/peri/uart_echo/build/imem.hex \
+	           +DINIT=sw/peri/uart_echo/build/dmem.hex 2>&1); \
+	    cyc=$$(echo "$$out" | sed -n 's/^retired [0-9]* instructions in \([0-9]*\) cycles.*/\1/p'); \
+	    if tr -d '\n\r' < sim_uart_tx.txt | grep -q 'GOOD$$'; then \
+	        printf '%-15s %-6s %s\n' uart_echo PASS "$$cyc cyc, TX ends GOOD"; pass=$$((pass+1)); \
+	    else \
+	        printf '%-15s %-6s %s\n' uart_echo FAIL "TX does not end GOOD"; fail=$$((fail+1)); \
+	    fi; \
+	else \
+	    printf '%-15s %-6s %s\n' uart_echo SKIP "no build/"; skip=$$((skip+1)); \
+	fi; \
+	out=$$(NO_VCD=1 MAX_CYC=4000 ./$(TOP) 2>&1); \
+	if echo "$$out" | grep -q 'WFI-halt check: OK' && echo "$$out" | grep -q 'parked at'; then \
+	    printf '%-15s %-6s %s\n' harvard_oracle PASS "parks clean"; pass=$$((pass+1)); \
+	else \
+	    printf '%-15s %-6s %s\n' harvard_oracle FAIL "no clean park"; fail=$$((fail+1)); \
+	fi; \
+	echo; echo "$$pass passed, $$fail failed, $$skip skipped"; \
+	[ $$fail -eq 0 ]
+
 wave: sim_top.vcd
 	gtkwave sim_top.vcd
 
 clean:
 	rm -rf obj_dir *.vcd *.fst *.log
 
-.PHONY: run wave clean
+.PHONY: run regress wave clean

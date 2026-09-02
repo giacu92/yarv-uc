@@ -8,6 +8,7 @@
 #   make format-check  fail (exit 1) if any file is not formatted
 #   make format-diff   show a unified diff of what `make format` would do
 #   make sim           build + run the Verilator sim
+#   make regress       run every self-checking oracle, one line each
 #   make wave          build + run the sim, then open the VCD in gtkwave
 #   make clean         delegate to sim/Makefile
 #   make run           delegate to sim/Makefile
@@ -32,7 +33,7 @@ GTKWAVE       ?= gtkwave
 # VCD written by the sim.
 SIM_VCD       := sim/sim_top.vcd
 
-.PHONY: format format-check format-diff sim wave help clean run sw sw-run cosim
+.PHONY: format format-check format-diff sim regress wave help clean run sw sw-all sw-run cosim
 
 help:
 	@echo "Targets:"
@@ -40,10 +41,12 @@ help:
 	@echo "  format-check  exit 1 if any file is unformatted (CI/pre-commit)"
 	@echo "  format-diff   print a unified diff of pending formatting changes"
 	@echo "  sim           build + run the Verilator sim"
+	@echo "  regress       run every self-checking oracle (needs: make sw-all)"
 	@echo "  wave          build + run the sim, then open the VCD in gtkwave"
 	@echo "  run           build + run the Verilator sim"
 	@echo "  clean         remove simulation build artefacts + waveforms"
 	@echo "  sw            build the quicksort C program -> sim/sw/quicksort/build/{imem,dmem}.hex"
+	@echo "  sw-all        build every program and oracle under sim/sw"
 	@echo "  sw-run        build the C program and run the sim loading it"
 	@echo "  cosim         build Spike + sw, run both, diff vs golden Spike"
 	@echo ""
@@ -79,6 +82,14 @@ format-diff: $(SV_SOURCES)
 # Build + run the Verilator simulation.
 sim:
 	$(MAKE) -C sim run
+
+# Run every self-checking oracle and print one line per test. Each one reports
+# through a D-mem marker, a register return value, or its UART output -- see
+# the `regress` comment in sim/Makefile for which and why. Exits non-zero on
+# any failure, so it works as a pre-commit / CI gate. Needs the firmware
+# built: `make sw-all`.
+regress:
+	$(MAKE) -C sim regress
 
 # Open the waveforms. A fresh simulation is run first.
 wave: sim
@@ -117,6 +128,11 @@ run:
 #
 sw:
 	$(MAKE) -C sim/sw/quicksort
+
+# Build every program and oracle under sim/sw (what `make regress` needs).
+# Set RISCV_PREFIX if the toolchain is not at the path sw_build.mk defaults to.
+sw-all:
+	$(MAKE) -C sim/sw
 
 sw-run: sw
 	$(MAKE) -C sim run RUN_ARGS="+IINIT=sw/quicksort/build/imem.hex +DINIT=sw/quicksort/build/dmem.hex"
