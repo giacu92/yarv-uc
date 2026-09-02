@@ -427,6 +427,50 @@ cd sw/<group>/<name> && make
 cd .. && make run RUN_ARGS="+IINIT=sw/<group>/<name>/build/imem.hex +DINIT=sw/<group>/<name>/build/dmem.hex"
 ```
 
+### `make regress` — all of them at once
+
+```
+make sw-all            # build every program and oracle (from the repo root)
+make regress           # run them all, one line per test, non-zero exit on any failure
+make regress VPARAMS="-GLSU_LIVE_LOAD=0"    # ... against an A/B configuration
+```
+
+```
+TEST            RESULT DETAIL
+quicksort       PASS   44833 cyc
+div_ops         PASS   3554 cyc
+...
+uart_echo       PASS   29150 cyc, TX ends GOOD
+harvard_oracle  PASS   parks clean
+
+13 passed, 0 failed, 0 skipped
+```
+
+Three kinds of check, because the tests really do report differently, and the
+distinction matters:
+
+- **`probe@<addr>=<value>`** — the marker word is read back out of the RTL's
+  D-mem array (`PROBE=<byte addr>` on the sim binary prints it; word index =
+  addr/4). This is the *exact* result. **Do not substitute a grep of the retire
+  trace**: the `li` that materialises `0x600D` retires whether or not the store
+  after it ever ran, so a trace grep passes a test that died between the two.
+- **`trace:<reg>=<value>`** — the last writeback of that register. Only
+  quicksort, whose `main()` *returns* `0x600D` in `a0` and never stores it
+  (`start.S` just parks). Its real verification is `make cosim`, which compares
+  all 29293 retires against Spike; `regress` is a smoke check and a cycle
+  number.
+- **`park`** — clean park plus the WFI-halt invariant, nothing else. The
+  hand-crafted Harvard oracle has no marker at all, and `isa_probe` reports
+  through UART strings meant for a human.
+
+Every test also fails on a `WFI-HALT FAIL` or a missing clean park, whatever
+its marker says. Missing images are `SKIP`, not `FAIL`, so a partly built tree
+still gives a useful run. The list lives in `REGRESS_TESTS` in `sim/Makefile`.
+
+`regress` was checked against a deliberately broken build: with the
+pre-2026-09-02 divider restored it reports `div_ops FAIL marker=0xbad` and
+exits non-zero. A test harness that has never failed has not been tested.
+
 - **`sw/peri/uart_echo/`** — the only end-to-end test of MEIP
   (`uart_irq_o`→`meip_i`→`mip.MEIP`→`trap_unit` + `wfi` wake). Echoes 4 bytes
   by polling, then 4 more from a machine-interrupt handler. Result @0x3000.

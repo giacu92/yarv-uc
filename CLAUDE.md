@@ -112,7 +112,9 @@ Builds fetch+decode+execute+native I/D-mem+peri bridge, `--public-flat-rw`.
 ```bash
 cd sim && make run                    # Harvard oracle
 make sw-run                           # build C prog + run (from repo root)
+make sw-all && make regress           # build every oracle, then run them all
 ```
+**`make regress` (2026-09-02) is the one command that runs the whole oracle set** — 13 tests, one line each, non-zero exit on any failure, and `VPARAMS=` forwards to an A/B configuration. It reads each oracle's marker **out of the RTL's D-mem array** (`PROBE=<addr>` on the sim binary), not out of the retire trace: the `li` that materialises `0x600D` retires whether or not the store after it ran, so a trace grep passes a test that died between the two. Three check kinds, because the tests genuinely differ — `probe@addr=value` for the ten marker oracles, `trace:x10=600d` for quicksort (its `main()` *returns* the value in `a0` and never stores it; `make cosim` is its real verification), and `park` for the hand-crafted Harvard oracle and `isa_probe`, which have no marker. Verified non-vacuous: with the pre-fix divider restored it reports `div_ops FAIL marker=0xbad`. It does NOT cover the four `sim/hw` TBs or the cosims — run those separately.
 Build artefacts gitignored.
 
 ### Test harnesses (build in own dir, run from `sim/` with `+IINIT=.../build/imem.hex +DINIT=.../dmem.hex`)
