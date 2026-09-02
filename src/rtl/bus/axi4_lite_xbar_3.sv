@@ -74,7 +74,6 @@ module axi4_lite_xbar_3 #(
     wire  [1:0] wr_sel_live = decode(s_axi.awaddr);
     wire  [1:0] rd_sel_live = decode(s_axi.araddr);
     wire  [1:0] wr_sel_eff = wr_busy_q ? wr_sel_q : wr_sel_live;
-    wire  [1:0] rd_sel_eff = rd_busy_q ? rd_sel_q : rd_sel_live;
 
     wire        aw_hs = s_axi.awvalid && s_axi.awready;
     wire        b_hs = s_axi.bvalid && s_axi.bready;

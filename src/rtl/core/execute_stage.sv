@@ -487,7 +487,6 @@ module execute_stage #(
     // EX_IDLE), so the term is unreachable today; it is here because the cost
     // is one AND and the failure it prevents is silent memory corruption.
     wire captured_drive = mem_launch_state & de_i.valid & ~misaligned_trap;
-    wire peri_bus_drive = captured_drive & is_peri_rsp;
     // The captured D-mem launch carries STORES only when LSU_LIVE_LOAD=1 (an
     // aligned D-mem load goes live and never reaches this state); it carries
     // BOTH directions when LSU_LIVE_LOAD=0. So the write enable must come from

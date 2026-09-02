@@ -9,6 +9,7 @@
 #   make format-diff   show a unified diff of what `make format` would do
 #   make sim           build + run the Verilator sim
 #   make regress       run every self-checking oracle, one line each
+#   make lint          advisory dead-wire / unused-signal lint
 #   make wave          build + run the sim, then open the VCD in gtkwave
 #   make clean         delegate to sim/Makefile
 #   make run           delegate to sim/Makefile
@@ -33,7 +34,7 @@ GTKWAVE       ?= gtkwave
 # VCD written by the sim.
 SIM_VCD       := sim/sim_top.vcd
 
-.PHONY: format format-check format-diff sim regress wave help clean run sw sw-all sw-run cosim
+.PHONY: format format-check format-diff sim regress lint wave help clean run sw sw-all sw-run cosim
 
 help:
 	@echo "Targets:"
@@ -42,6 +43,7 @@ help:
 	@echo "  format-diff   print a unified diff of pending formatting changes"
 	@echo "  sim           build + run the Verilator sim"
 	@echo "  regress       run every self-checking oracle (needs: make sw-all)"
+	@echo "  lint          advisory: dead wires / unread bits / unused params"
 	@echo "  wave          build + run the sim, then open the VCD in gtkwave"
 	@echo "  run           build + run the Verilator sim"
 	@echo "  clean         remove simulation build artefacts + waveforms"
@@ -90,6 +92,14 @@ sim:
 # built: `make sw-all`.
 regress:
 	$(MAKE) -C sim regress
+
+# Advisory lint for dead wires / unread bits / unused parameters. Verilator's
+# UNUSEDSIGNAL family is off by default (it lives under -Wall), so this is not
+# the same as dropping -Wno-UNUSED from the build's VFLAGS -- that changes
+# nothing. Not a gate: about two thirds of the output is benign by design.
+# See the `lint` comment in sim/Makefile for what to act on.
+lint:
+	$(MAKE) -C sim lint
 
 # Open the waveforms. A fresh simulation is run first.
 wave: sim

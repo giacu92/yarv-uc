@@ -109,6 +109,43 @@ REGRESS_TESTS := \
 	wfi_trap:intr/wfi_trap:20000:probe@0x2000=600d \
 	timer:intr/timer:20000:probe@0x2000=600d
 
+# ----------------------------------------------------------------------
+# lint — dead wires, unread bits, unused parameters
+# ----------------------------------------------------------------------
+#
+# NOT part of the build, and deliberately not a gate: it is advisory, run it
+# after an RTL change.
+#
+# The build's `-Wno-UNUSED` is NOT what hides these. UNUSEDSIGNAL /
+# UNUSEDPARAM / UNDRIVEN are off by default in Verilator (they live under
+# -Wall), so dropping -Wno-UNUSED from VFLAGS changes nothing -- the checks
+# have to be asked for, which is what this target does.
+#
+# It found a real dead wire the 2026-09-02 review had missed
+# (`peri_bus_drive`), so it earns its place. But roughly two thirds of what it
+# reports is benign BY DESIGN and will not go away:
+#
+#   - unread BITS of a wide signal: `de_i`'s fields that execute does not
+#     read, `mul_uu[31:0]` / `mul_su[31:0]` (only the high word is ever
+#     selected), the `off[31:12]` slices in decode's RVC immediate helpers,
+#     `mip_i` / `mie_i` reserved bits.
+#   - parameterised-away logic: `native_ram`'s `req_wdata_i` / `req_wstrb_i` /
+#     `launch_write` are unused in the READ_ONLY elaboration.
+#   - signals that exist only for a consumer Verilator cannot see: the
+#     `mem_probe_w` VCD window, and `mem_bus_drive`, which sim_main.cpp reads
+#     through --public-flat-rw for the stall histogram.
+#   - documented absences: `reg_file`'s `rstn_i` (no runtime reset, single
+#     write port), `axi4_lite_if`'s `aclk` / `aresetn`.
+#
+# So read it, do not chase it to zero. What to act on is a WHOLE signal
+# reported unused that nothing outside the RTL reads.
+lint: $(HEX_PREREQ)
+	verilator --lint-only --top-module sim_top \
+	    -Wwarn-UNUSEDSIGNAL -Wwarn-UNUSEDPARAM -Wwarn-UNDRIVEN \
+	    -Wno-WIDTH -Wno-UNOPTFLAT -Wno-LATCH -Wno-INITIALDLY -Wno-TIMESCALEMOD \
+	    -I../src/rtl/pkg -I../src/rtl/core -I../src/rtl/bus -I../src/rtl/utils \
+	    $(RTL) 2>&1 | grep -vE '^(- V e r|- Verilator:)' || true
+
 regress: $(TOP)
 	@fail=0; skip=0; pass=0; \
 	printf '%-15s %-6s %s\n' TEST RESULT DETAIL; \
@@ -178,4 +215,4 @@ wave: sim_top.vcd
 clean:
 	rm -rf obj_dir *.vcd *.fst *.log
 
-.PHONY: run regress wave clean
+.PHONY: run regress lint wave clean
