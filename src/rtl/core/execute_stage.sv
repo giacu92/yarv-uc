@@ -39,7 +39,7 @@ import rv32_pkg::*;
  * cycle it is valid in EX_IDLE (wvalid=1, bridge wready=1 in its idle),
  * then the pipe stalls in EX_MEM_WAIT until the read response (rvalid,
  * load) retires it. The D-mem path has no capture cycle: its request is
- * driven combinationally from alu_result in EX_IDLE, and the address is
+ * driven combinationally from the ALU's EA tap in EX_IDLE, and the address is
  * latched in parallel with the launch for the consumers that read it in a
  * LATER cycle (the load byte select and a misaligned trap's mtval). The
  * PERI path keeps a capture cycle, because behind it sit the bridge, the
@@ -63,10 +63,14 @@ import rv32_pkg::*;
  */
 
 module execute_stage #(
-    // Forwarded to the ALU: MUL structure A/B knob (see alu.sv).
-    parameter int unsigned MUL_SHARED_DSP = 1,
-    // Whether an aligned D-mem LOAD launches its bus request live from
-    // alu_result in EX_IDLE.
+    // Forwarded to the ALU: MUL structure A/B knob (see alu.sv). Default 0 --
+    // the shared-DSP form measured -2.52 ns on the 2026-09-01 PnR run, and
+    // rv32_pkg::MUL_SHARED_DSP is 0. The default used to be 1, i.e. the
+    // measured-worse form, which only stayed harmless because every real
+    // instantiation overrides it from the package.
+    parameter int unsigned MUL_SHARED_DSP = 0,
+    // Whether an aligned D-mem LOAD launches its bus request live from the
+    // effective address in EX_IDLE.
     //   1 = yes (default). Saves one cycle on every D-mem load; the address
     //       and the launch enable are combinational out of
     //       regfile -> forward -> ALU.
@@ -75,7 +79,7 @@ module execute_stage #(
     //       misaligned check reads the REGISTERED address. That is the
     //       pre-2026-09-01 LSU exactly -- the shape that closed 50 MHz at
     //       +0.093 ns on 2026-08-31 and ran CoreMark on silicon. Nothing
-    //       derived from alu_result reaches the D-mem address pins, stall_o,
+    //       derived from the live EA reaches the D-mem address pins, stall_o,
     //       or the trap path. The safe fallback.
     // Stores capture either way: a posted store retires on its own launch, so
     // "did it launch" would otherwise reach stall_o (see the fork below).
@@ -171,21 +175,24 @@ module execute_stage #(
 
     logic [XLEN-1:0] operand_a, operand_b;
 
+    // Both muxes are on the design's worst path (regfile -> forward ->
+    // operand -> DSP -> alu_result -> wb_data -> forward), so their WIDTH is a
+    // timing parameter, not just tidiness. Every input below is a flop field
+    // of de_i: nothing that has to be computed this cycle -- no adder output,
+    // no CSR read -- reaches an operand any more. See alu_src_a_t /
+    // alu_src_b_t in rv32_pkg for what was removed and why.
     always_comb begin
         unique case (de_i.alu_src_a)
             ALU_A_RS1: operand_a = de_i.rs1_data;
             ALU_A_PC:  operand_a = de_i.pc;
-            ALU_A_CSR: operand_a = csr_rdata_i;  // read CSR value
             ALU_A_RS2: operand_a = de_i.rs2_data;
             default:   operand_a = '0;
         endcase
         unique case (de_i.alu_src_b)
-            ALU_B_RS1:  operand_b = de_i.rs1_data;
-            ALU_B_IMM:  operand_b = de_i.imm;
-            ALU_B_RS2:  operand_b = de_i.rs2_data;
-            ALU_B_PC4:  operand_b = pc_link;
-            ALU_B_ZERO: operand_b = '0;
-            default:    operand_b = '0;
+            ALU_B_RS1: operand_b = de_i.rs1_data;
+            ALU_B_IMM: operand_b = de_i.imm;
+            ALU_B_RS2: operand_b = de_i.rs2_data;
+            default:   operand_b = '0;
         endcase
     end
 
@@ -194,7 +201,7 @@ module execute_stage #(
     //
     // EX_IDLE      : ready. A DIV/REM launches (alu_start) -> EX_DIV_BUSY.
     //                An aligned D-MEM LOAD drives the bus this cycle,
-    //                combinationally from alu_result (dmem_load_drive), and
+    //                combinationally from the EA tap (dmem_load_drive), and
     //                stays here re-driving until the slave accepts, then goes
     //                to EX_MEM_WAIT. Every other bus op -- a peri access in
     //                either direction, or a D-mem STORE -- captures its
@@ -253,7 +260,7 @@ module execute_stage #(
     // What did NOT come back on the D-mem side is the silicon bug that
     // motivated the flop.
     // Driving the bus from a live value is sound because de_i is HELD by
-    // stall_o for as long as the request is outstanding, so alu_result is a
+    // stall_o for as long as the request is outstanding, so the EA is a
     // stable function of flop outputs -- it only has to settle within the
     // cycle, which is a timing requirement, not a correctness one. What is
     // NOT sound is reading that live value in a LATER cycle, and two
@@ -276,8 +283,11 @@ module execute_stage #(
 
     // A CSR op now takes two cycles: one to present the address to the
     // registered CSR read, one to retire with the data it returned.
+    // de_i.csr_wren is decode's "CSR op present" flag and decode already
+    // squashes it (with reg_write / mem_read / mem_write) when the encoding is
+    // illegal, so no ~illegal term is needed on top of it here.
     logic is_csr_op;
-    assign is_csr_op = de_i.csr_wren & ~de_i.illegal;
+    assign is_csr_op = de_i.csr_wren;
 
     logic csr_start;
     logic csr_ready;
@@ -293,7 +303,7 @@ module execute_stage #(
     // The alignment check is SPLIT, and the split is what keeps the trap off
     // the critical path now that the capture flop is gone:
     //
-    //   - the LAUNCH GATE reads the live alu_result[1:0] in EX_IDLE. It is a
+    //   - the LAUNCH GATE reads the live EA's low two bits in EX_IDLE. It is a
     //     two-bit test whose only consumer is wvalid, so it adds a couple of
     //     LUT levels to the launch path and nothing to the redirect path. It
     //     has to be live: a misaligned store must never reach the bus, and a
@@ -301,9 +311,10 @@ module execute_stage #(
     //     (reading UART RXDATA pops a byte).
     //   - the TRAP fires one cycle later, from EX_MEM_TRAP, off the
     //     registered mem_addr_q. Raising it in EX_IDLE would put
-    //     regfile -> ALU (through the MUL DSP, the slowest alu_result
-    //     contributor) -> misaligned -> trap-vectored-entry -> pc_q on one
-    //     cycle, which was the 40 MHz limiter (-0.975 ns).
+    //     regfile -> ALU -> misaligned -> trap-vectored-entry -> pc_q on one
+    //     cycle, which was the 40 MHz limiter (-0.975 ns). (The EA tap has
+    //     since taken the MUL result mux out of that chain, but the trap entry
+    //     still ends at pc_q and still does not belong in one cycle.)
     //
     // Cost: a misaligned access spends one extra cycle before trapping.
     // Invisible to the retire trace (a trapping op never retires) and free on
@@ -324,6 +335,15 @@ module execute_stage #(
 
     logic            alu_result_valid;
     logic [XLEN-1:0] alu_result;
+
+    // Effective address, tapped off the ALU's adder ahead of the result mux
+    // (alu.sv ea_o). Identical to alu_result for every memory op -- asserted
+    // below -- but two mux levels earlier, and its low two bits come straight
+    // off the bottom of the carry chain. EVERY address-derived LSU signal
+    // reads this, not alu_result: the D-mem address pins, the misaligned
+    // launch gate, the D-mem-vs-peri fork, the store strobes and the store
+    // lane shift.
+    logic [XLEN-1:0] lsu_ea;
 
     // A mem op is asking for the bus this cycle. Held high across a stalled
     // launch (peri bridge busy -> wready low) because de_i is held by stall_o,
@@ -370,7 +390,7 @@ module execute_stage #(
     //           that produced the outstanding access was latched a cycle or
     //           more ago; the flop is the only sound source (see the load
     //           byte select below).
-    wire                       is_peri_live = alu_result[PERI_ADDR_BIT];
+    wire                       is_peri_live = lsu_ea[PERI_ADDR_BIT];
     wire                       is_peri_rsp = mem_is_peri_q;
 
     // Effective LSU response for the wait / response phase. Selected from the
@@ -381,20 +401,22 @@ module execute_stage #(
     assign lsu_rsp_wait = is_peri_rsp ? peri_rsp_i : mem_rsp_i;
 
     // Misaligned-access LAUNCH GATE, off the LIVE effective address. Two bits
-    // of alu_result into wvalid; the trap it schedules is raised a cycle later
-    // from the registered address (see EX_MEM_TRAP). Gated by is_mem_op so a
-    // non-mem op reusing mem_size as a decode don't-care (MS_W) is not falsely
-    // flagged.
+    // of the EA into wvalid; the trap it schedules is raised a cycle later
+    // from the registered address (see EX_MEM_TRAP).
     // Two forms, because the two builds read the address at different times.
-    //   _live : off alu_result. Only LSU_LIVE_LOAD=1 uses it, and only to
+    //   _live : off the live EA. Only LSU_LIVE_LOAD=1 uses it, and only to
     //           filter the live load launch -- a misaligned access must never
     //           reach a slave. The TRAP is still raised a cycle later off the
     //           REGISTERED address, from EX_MEM_TRAP.
     //   _q    : off mem_addr_q. LSU_LIVE_LOAD=0 uses this and raises the trap
     //           from EX_MEM_LAUNCH, exactly as the design did before
-    //           2026-09-01; alignment then touches alu_result nowhere.
+    //           2026-09-01; alignment then touches the live EA nowhere.
+    //
+    // NOT gated by is_mem_op: every consumer below already ANDs with
+    // mem_req_pending (which carries is_mem_op) or with a state that only a
+    // mem op can reach, so the guard was a redundant AND on the launch gate --
+    // the one place in this file where the live EA feeds a bus enable.
     function automatic logic misaligned_of(input logic [XLEN-1:0] a);
-        if (!is_mem_op) return 1'b0;
         unique case (de_i.mem_size)
             MS_B:    return 1'b0;
             MS_H:    return a[0];
@@ -403,7 +425,7 @@ module execute_stage #(
         endcase
     endfunction
 
-    wire mem_misaligned_live = misaligned_of(alu_result);
+    wire mem_misaligned_live = misaligned_of(lsu_ea);
     wire mem_misaligned_q = misaligned_of(mem_addr_q);
 
     wire mem_misaligned_launch = (LSU_LIVE_LOAD != 0) & mem_req_pending & mem_misaligned_live;
@@ -417,7 +439,7 @@ module execute_stage #(
     // An aligned pending request forks, and the fork is chosen so that only
     // ONE case drives the bus live: an aligned D-mem LOAD.
     //
-    //   D-mem load  : driven from EX_IDLE, live from alu_result.
+    //   D-mem load  : driven from EX_IDLE, live from the EA tap.
     //   everything   : captured this cycle, driven from EX_MEM_LAUNCH next
     //   else          cycle (peri load, peri store, D-mem store).
     //
@@ -428,8 +450,8 @@ module execute_stage #(
     // which is flop-only, already holds decode. A STORE is posted and retires
     // on its accept, so "did this store launch" is exactly the question
     // stall_o has to answer in the same cycle, and answering it needs the
-    // effective address: is it misaligned (alu_result[1:0]), is it peri
-    // (alu_result[PERI_ADDR_BIT]), did the slave accept. That put the deepest
+    // effective address: is it misaligned (EA[1:0]), is it peri
+    // (EA[PERI_ADDR_BIT]), did the slave accept. That put the deepest
     // combinational value in the machine on the pipeline's CONTROL network:
     //
     //   regfile DO -> forward -> operand_a -> DSP (3.76 ns) -> alu_result
@@ -458,7 +480,7 @@ module execute_stage #(
     // is a flop and de_i is held by stall_o, but "held" is a property of other
     // logic, and what this drives is a WRITE to memory. If de_i were ever
     // cleared under this state (decode zeroes de_next on flush_i regardless of
-    // stall_o), an ungated version would keep we/wvalid high while alu_result
+    // stall_o), an ungated version would keep we/wvalid high while the EA
     // collapsed to 0 -- a write of stale data to address 0. No flush can
     // currently reach EX_MEM_LAUNCH (a mem op is not control flow, so
     // mispredict is 0, and every trap/mret/interrupt trigger requires
@@ -478,13 +500,16 @@ module execute_stage #(
     wire dmem_captured_drive = captured_drive & ~is_peri_rsp;
     wire dmem_store_we = dmem_captured_drive & de_i.mem_write;
 
-    // Any launch is driving a bus this cycle (read by the stall/retire terms
-    // below and by the sim stall histogram).
+    // Any launch is driving a bus this cycle. No RTL consumer -- this is the
+    // tap the sim's stall histogram reads (sim_main.cpp, `lsu-launch`).
     wire mem_bus_drive = dmem_load_drive | captured_drive;
 
+    // A live D-mem load only ever talks to the D-mem, so it reads mem_rsp_i
+    // directly. A captured launch reads the port the REGISTERED target bit
+    // selects, which is the same select lsu_rsp_wait already carries -- so it
+    // reuses that mux rather than building a second copy of it.
     wire dmem_load_hs = dmem_load_drive & mem_rsp_i.wready;
-    wire captured_hs = captured_drive & (is_peri_rsp ? peri_rsp_i.wready : mem_rsp_i.wready);
-    wire mem_launch_hs = dmem_load_hs | captured_hs;
+    wire captured_hs = captured_drive & lsu_rsp_wait.wready;
 
     // Posted store: once the bridge accepts AW+W (mem_launch_hs on a
     // write), it owns the write->B round trip on its own; the LSU
@@ -500,7 +525,7 @@ module execute_stage #(
 
     // A store only ever launches from EX_MEM_LAUNCH, so its retire pulse is
     // flop-derived: the state, the registered target bit, and the slave's
-    // wready. No term of it descends from alu_result, which is the whole
+    // wready. No term of it descends from the live EA, which is the whole
     // point (see the fork above).
     logic store_done;
     assign store_done = captured_hs & de_i.mem_write;
@@ -521,7 +546,7 @@ module execute_stage #(
     // misaligned trap that fires from it.
     // Every term here is flop-derived. mem_req_pending is de_i + state +
     // freeze; mem_launch_state and EX_MEM_TRAP are states; store_done is the
-    // captured handshake. Keeping alu_result out of this expression is what
+    // captured handshake. Keeping the live EA out of this expression is what
     // the store capture exists for.
     assign
         stall_o = alu_start | div_running | ((mem_req_pending | mem_launch_state) & ~store_done) |
@@ -576,7 +601,8 @@ module execute_stage #(
         .shamt_i       (de_i.mem_shamt),
         .start_i       (alu_start),
         .result_valid_o(alu_result_valid),
-        .result_o      (alu_result)
+        .result_o      (alu_result),
+        .ea_o          (lsu_ea)
     );
 
     // =================================================================
@@ -662,8 +688,8 @@ module execute_stage #(
     wire [XLEN-1:0] trap_cause = take_interrupt ? int_cause_i : sync_cause;
     wire [XLEN-1:0] trap_tval = take_interrupt ? 32'd0 : sync_tval;
     // mepc: faulting instr pc (sync trap), or the suppressed instr pc
-    // (interrupt), or the WFI-wake pc (interrupt taken after WFI).
-    wire [XLEN-1:0] wfi_next_pc = de_i.pc + (de_i.is_compressed ? 32'd2 : 32'd4);
+    // (interrupt), or the WFI-wake pc (interrupt taken after WFI). The wake
+    // pc is pc + (2|4), which is pc_link -- the same adder, not a second one.
     wire [XLEN-1:0] trap_mepc = wfi_halt_q ? wfi_next_pc_q : de_i.pc;
 
     // Export the triggers + payload to the trap unit (CPU top).
@@ -699,7 +725,7 @@ module execute_stage #(
     // pulses, when rdata is valid.
     //
     // The byte offset comes from a copy of the effective address latched in
-    // the launch cycle, NOT from the live alu_result. alu_result is combinational out
+    // the launch cycle, NOT from the live EA. The EA is combinational out
     // of the D/E operands, and those operands can be fed by the
     // execute->decode forward path, so reading it a cycle (or several)
     // later means the byte select depends on the whole
@@ -771,8 +797,14 @@ module execute_stage #(
     logic result_ready;
     assign result_ready = is_mem_op ? mem_op_done : (is_csr_op ? csr_ready : alu_result_valid);
 
-    assign wb_en_o = de_i.valid & de_i.reg_write & ~de_i.illegal & ~freeze &
-        result_ready & ~misaligned_trap & ~trap_redirect_req;
+    // Two terms this used to carry are provably redundant, and both sat on the
+    // path that ends in decode's forward mux:
+    //   ~de_i.illegal    : decode zeroes reg_write when the encoding is
+    //                      illegal, so de_i.reg_write already covers it.
+    //   ~misaligned_trap : misaligned_trap is a term OF sync_trap_req, which
+    //                      is a term OF trap_redirect_req, so
+    //                      ~trap_redirect_req implies it.
+    assign wb_en_o      = de_i.valid & de_i.reg_write & ~freeze & result_ready & ~trap_redirect_req;
 
     // =================================================================
     // CSR read-modify-write (Zicsr). The old CSR value is csr_rdata_i
@@ -798,8 +830,9 @@ module execute_stage #(
     // Same retire predicate as the regfile writeback (result_ready=1 for
     // a CSR op). de_i.csr_wren is decode's "CSR op present" flag, already
     // squashed by illegal in decode.
-    assign csr_op_valid = de_i.valid & de_i.csr_wren & ~de_i.illegal & ~freeze &
-        result_ready & ~misaligned_trap & ~trap_redirect_req;
+    // Same two redundancies as wb_en_o above: decode squashes csr_wren on an
+    // illegal encoding, and ~trap_redirect_req implies ~misaligned_trap.
+    assign csr_op_valid = de_i.valid & de_i.csr_wren & ~freeze & result_ready & ~trap_redirect_req;
 
     always_comb begin
         unique case (de_i.csr_op)
@@ -832,22 +865,24 @@ module execute_stage #(
     // wstrb[byte]). rready is asserted in EX_MEM_WAIT on a load so the
     // bridge forwards it to the AXI R channel and the read completes.
     // =================================================================
-    // Byte strobes and the lane-aligned write data, computed from alu_result
+    // Byte strobes and the lane-aligned write data, computed from the live EA
     // and consumed by the bus in the SAME cycle they are produced — the rule
-    // the forward path imposes on anything downstream of alu_result.
+    // the forward path imposes on anything downstream of the EA. Both depend
+    // on EA[1:0] only, which the EA tap delivers off the bottom of the adder's
+    // carry chain rather than out of the ALU result mux.
     logic [STRB_WIDTH-1:0] store_wstrb;
     always_comb begin
-        // Byte strobes for a store of de_i.mem_size at alu_result.
+        // Byte strobes for a store of de_i.mem_size at the EA.
         unique case (de_i.mem_size)
-            MS_B: store_wstrb = 4'b0001 << alu_result[1:0];
-            MS_H: store_wstrb = 4'b0011 << {alu_result[1], 1'b0};
+            MS_B: store_wstrb = 4'b0001 << lsu_ea[1:0];
+            MS_H: store_wstrb = 4'b0011 << {lsu_ea[1], 1'b0};
             MS_W: store_wstrb = 4'b1111;
             default: store_wstrb = 4'b1111;
         endcase
     end
 
     logic [XLEN-1:0] store_wdata;
-    assign store_wdata = de_i.rs2_data << {alu_result[1:0], 3'b000};
+    assign store_wdata = de_i.rs2_data << {lsu_ea[1:0], 3'b000};
 
     // Latch the request alongside the launch decision. For a D-mem op this is
     // only for the later-cycle consumers (load byte select, misaligned mtval,
@@ -864,10 +899,10 @@ module execute_stage #(
             mem_wstrb_q   <= '0;
             mem_is_peri_q <= 1'b0;
         end else if (mem_req_pending) begin
-            mem_addr_q    <= alu_result;
+            mem_addr_q    <= lsu_ea;
             mem_wdata_q   <= store_wdata;
             mem_wstrb_q   <= store_wstrb;
-            mem_is_peri_q <= alu_result[PERI_ADDR_BIT];
+            mem_is_peri_q <= lsu_ea[PERI_ADDR_BIT];
         end
     end
 
@@ -886,33 +921,143 @@ module execute_stage #(
         end
     end
 
-    // The premise that makes a live launch sound: de_i is held for as long as
-    // the request is outstanding, so the latched address still equals the one
-    // alu_result computes. If this ever fails, the load byte select and the
-    // request have parted company — the 2026-08-25 silicon bug, in reverse.
+    // The redundancies the retire / writeback / redirect predicates above rely
+    // on, checked rather than argued:
+    //   1. an illegal instruction never commits and never writes back -- so
+    //      dropping ~de_i.illegal from op_commits / wb_en_o / csr_op_valid is
+    //      free (decode zeroes reg_write / csr_wren, and illegal implies
+    //      exception implies sync_trap_req);
+    //   2. misaligned_trap implies trap_redirect_req -- so ~misaligned_trap is
+    //      free wherever ~trap_redirect_req is already a term;
+    //   3. alu_result_valid is a constant 1 for a control-flow instruction --
+    //      so dropping it from cf_resolving does not change when a branch
+    //      resolves. Every control-flow opcode decodes to ALU_ADD; only a
+    //      DIV/REM can be un-ready.
     always_ff @(posedge clk_i) begin
-        if (rstn_i && (ex_state_q inside {EX_MEM_WAIT, EX_MEM_LAUNCH}) && de_i.valid) begin
-            assert (mem_addr_q == alu_result)
+        if (rstn_i) begin
+            assert (!(op_commits && de_i.illegal))
+            else $fatal(1, "illegal instruction committed (pc=%08x)", de_i.pc);
+            assert (!(wb_en_o && de_i.illegal))
+            else $fatal(1, "illegal instruction wrote back (pc=%08x)", de_i.pc);
+            assert (!(csr_op_valid && de_i.illegal))
+            else $fatal(1, "illegal instruction wrote a CSR (pc=%08x)", de_i.pc);
+            assert (!(misaligned_trap && !trap_redirect_req))
+            else $fatal(1, "misaligned_trap without trap_redirect_req (pc=%08x)", de_i.pc);
+            assert (!((de_i.branch_type != BR_NONE) && !alu_result_valid))
             else
                 $fatal(
                     1,
-                    "%s: mem_addr_q %08x != alu_result %08x (de_i moved)",
+                    "control-flow op with alu_result_valid=0 (pc=%08x alu_op=%0d)",
+                    de_i.pc,
+                    de_i.alu_op
+                );
+        end
+    end
+
+    // misaligned_trap is the ONE trap source not gated by ~freeze, and it
+    // cannot be: with LSU_LIVE_LOAD=0 the same signal suppresses the captured
+    // launch (captured_drive), so gating it on ~freeze would let a misaligned
+    // store reach the bus while the pipe is frozen. Instead the trap relies on
+    // freeze never being high in EX_MEM_TRAP, which holds for two independent
+    // reasons: stall_i is tied 0 at the CPU top, and wfi_stall requires
+    // wfi_halt_q, which mem_req_pending is gated against -- so a mem op
+    // cannot even launch, let alone reach EX_MEM_TRAP, while the WFI halt is
+    // active.
+    //
+    // If either premise ever changes -- someone drives stall_i -- the trap
+    // would be raised during a freeze, and the EX_MEM_TRAP -> EX_IDLE
+    // transition would then drop the state while sync_trap_req was still
+    // suppressed, LOSING the exception. That is a silent wrong-execution bug,
+    // so it is checked here rather than left to be discovered.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && (ex_state_q == EX_MEM_TRAP)) begin
+            assert (!freeze)
+            else
+                $fatal(
+                    1,
+                    "EX_MEM_TRAP under freeze (stall_i=%0b wfi_stall=%0b): the misaligned trap at pc=%08x would be lost"
+                        ,
+                    stall_i,
+                    wfi_stall,
+                    de_i.pc
+                );
+        end
+    end
+
+    // EX_MEM_LAUNCH has no exit that does not go through de_i.valid: the
+    // captured drive is gated on it, so if de_i were ever cleared under that
+    // state the handshake could never complete and stall_o would hold the pipe
+    // there forever. The argument that it cannot happen is that every flush
+    // source (mispredict, sync trap, mret, interrupt) requires either a
+    // control-flow op or EX_IDLE, and a captured mem op is neither -- an
+    // argument about OTHER logic, so check it here.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && (ex_state_q inside {EX_MEM_LAUNCH, EX_MEM_WAIT, EX_MEM_TRAP})) begin
+            assert (de_i.valid && is_mem_op)
+            else
+                $fatal(
+                    1,
+                    "%s with de_i.valid=%0b is_mem_op=%0b: LSU state has no owner",
+                    ex_state_q.name(),
+                    de_i.valid,
+                    is_mem_op
+                );
+        end
+    end
+
+    // The premise that makes a live launch sound: de_i is held for as long as
+    // the request is outstanding, so the latched address still equals the one
+    // the EA computes. If this ever fails, the load byte select and the
+    // request have parted company — the 2026-08-25 silicon bug, in reverse.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && (ex_state_q inside {EX_MEM_WAIT, EX_MEM_LAUNCH}) && de_i.valid) begin
+            assert (mem_addr_q == lsu_ea)
+            else
+                $fatal(
+                    1,
+                    "%s: mem_addr_q %08x != lsu_ea %08x (de_i moved)",
                     ex_state_q.name(),
                     mem_addr_q,
-                    alu_result
+                    lsu_ea
+                );
+        end
+    end
+
+    // The EA tap is only a shortcut if it agrees with the ALU result mux on
+    // every op that uses it. It does iff a memory op's alu_op is always
+    // ALU_ADD or ALU_LX (sel_adder=1, is_mul_op=0 -- see alu.sv ea_o). Check
+    // that rather than trust the decoder to keep it true.
+    always_ff @(posedge clk_i) begin
+        if (rstn_i && de_i.valid && is_mem_op) begin
+            assert (lsu_ea == alu_result)
+            else
+                $fatal(
+                    1,
+                    "mem op with lsu_ea %08x != alu_result %08x (pc=%08x alu_op=%0d)",
+                    lsu_ea,
+                    alu_result,
+                    de_i.pc,
+                    de_i.alu_op
                 );
         end
     end
 `endif
 
     // Harvard: steer the request to D-mem or the peri bridge. Both ports get
-    // FULL ZERO DEFAULTS and exactly one branch drives, so an idle port is
-    // genuinely all-zero and no field of a request ever comes from a different
-    // cycle than the rest of it.
+    // FULL ZERO DEFAULTS and exactly one branch drives, so no field of a
+    // request ever comes from a different cycle than the rest of it.
+    //
+    // Note what that does and does not say. An UNSELECTED port is all-zero;
+    // the SELECTED one keeps driving its registered payload with wvalid=0
+    // between accesses, because mem_addr_q / mem_wdata_q / mem_wstrb_q only
+    // change on mem_req_pending. That is the quiet state, not a leak: the
+    // bus holds one op's values until the next op captures, so it neither
+    // toggles per cycle nor ever mixes two ops' fields. The property that
+    // matters is single-cycle-lifetime, not literal zero.
     //
     // This shape is not a style preference, it is the fix for a 2026-09-01 FPGA
     // failure. An intermediate version dropped the defaults and drove the
-    // payload fields unconditionally -- addr live from alu_result, wdata/wstrb
+    // payload fields unconditionally -- addr live from the EA, wdata/wstrb
     // from the capture flops -- on the argument that a slave only acts on
     // wvalid, which is true of native_ram and of the AXI bridge in isolation.
     // The result passed every simulation (all oracles, both cosims, CoreMark to
@@ -947,10 +1092,16 @@ module execute_stage #(
             // strobes, so those stay at their zero defaults rather than
             // exposing the previous captured op's flops.
             mem_req_o.wvalid = 1'b1;
-            mem_req_o.addr   = alu_result;
+            mem_req_o.addr   = lsu_ea;
         end else if (is_peri_rsp) begin
+            // we is gated by the drive, matching mem_req_o.we below. The
+            // bridge only reads we under wvalid, so an ungated version was
+            // functionally safe -- but it left we=1 alongside wvalid=0 and a
+            // registered address belonging to an older op, which is the exact
+            // shape of mixed-lifetime bundle that cost a board bring-up here
+            // (see the note above). One AND buys the invariant back.
             peri_req_o.wvalid = captured_drive;
-            peri_req_o.we     = de_i.mem_write;
+            peri_req_o.we     = captured_drive & de_i.mem_write;
             peri_req_o.addr   = mem_addr_q;  // registered EA
             peri_req_o.wdata  = mem_wdata_q;
             peri_req_o.wstrb  = mem_wstrb_q;
@@ -1005,8 +1156,13 @@ module execute_stage #(
     // A control-flow instruction is resolving this cycle (eligible to train
     // and to mispredict-check). ~trap_redirect_req: a branch squashed by an
     // interrupt re-runs after mret instead of resolving now.
-    wire cf_resolving = de_i.valid & ~de_i.illegal & (de_i.branch_type != BR_NONE) & ~freeze &
-        alu_result_valid & ~trap_redirect_req;
+    // alu_result_valid is NOT a term here. It can only be 0 for a DIV/REM, and
+    // every control-flow opcode decodes to ALU_ADD, so it is a constant 1
+    // whenever branch_type != BR_NONE -- an extra input on the redirect path
+    // (branch_valid_o gates fetch's pc_q / count_q / head_q and decode's hold
+    // buffer) for no information. Asserted below.
+    wire cf_resolving = de_i.valid & ~de_i.illegal &
+        (de_i.branch_type != BR_NONE) & ~freeze & ~trap_redirect_req;
 
     // Predicted-taken flag carried from decode. pred_t=0 covers both "predicted
     // not-taken" and "no prediction" (BP_EN=0 / unpredicted JALR) — both reduce
@@ -1019,9 +1175,13 @@ module execute_stage #(
     // predicted taken but actually taken (redirect to the resolved target —
     // the legacy path, including every JALR call/indirect which is never
     // target-predicted). A correct taken prediction produces no redirect.
-    wire mispredict = cf_resolving &
-        ((pred_t & ~branch_taken) | (pred_t & branch_taken & (branch_target != de_i.pred_target)) |
-         (~pred_t & branch_taken));
+    // The first and third disjuncts are (pred_t & ~taken) | (~pred_t & taken),
+    // i.e. one XOR; the target check only adds anything when both are 1, where
+    // the XOR is 0. So: direction disagrees, or direction agrees on TAKEN and
+    // the target does not.
+    wire dir_mispredict = pred_t ^ branch_taken;
+    wire tgt_mispredict = pred_t & branch_taken & (branch_target != de_i.pred_target);
+    wire mispredict = cf_resolving & (dir_mispredict | tgt_mispredict);
 
     // Combined fetch redirect: a mispredict OR a trap / mret / interrupt. The
     // trap unit's redirect_addr wins when a trap/mret/interrupt fires; else the
@@ -1073,17 +1233,26 @@ module execute_stage #(
     // not commit. The trap machinery itself (CSR trap-write bundle, fetch
     // redirect) is independent of ex_valid, so traps still fire correctly;
     // only the retire count is suppressed.
+    //
+    // Written as one OR of two terms rather than a 4-deep priority chain.
+    // The chain's three suppressors are exactly the three terms of
+    // trap_redirect_req, and mret is the one of them that DOES commit, so
+    // "mret, or a normal retire with no redirect pending" is the same
+    // function. ~de_i.illegal and ~misaligned_trap drop out with it: an
+    // illegal instruction always raises sync_trap_req (decode sets exception
+    // whenever it sets illegal, and an illegal op never leaves EX_IDLE), and
+    // misaligned_trap is itself a term of sync_trap_req. Both are asserted
+    // below under `ifdef VERILATOR rather than assumed.
     logic op_commits;
-    assign op_commits = take_interrupt ? 1'b0 : sync_trap_req ? 1'b0 :
-        mret_req ? 1'b1 : (de_i.valid & ~de_i.illegal & ~freeze & result_ready & ~misaligned_trap);
+    assign op_commits    = mret_req | (de_i.valid & ~freeze & result_ready & ~trap_redirect_req);
 
-    assign ex_pc_d = op_commits ? de_i.pc : ex_pc_q;
-    assign ex_instr_d = op_commits ? de_i.instr : ex_instr_q;
-    assign ex_valid_d = op_commits;
+    assign ex_pc_d       = op_commits ? de_i.pc : ex_pc_q;
+    assign ex_instr_d    = op_commits ? de_i.instr : ex_instr_q;
+    assign ex_valid_d    = op_commits;
 
-    assign ex_pc_o = ex_pc_q;
-    assign ex_instr_o = ex_instr_q;
-    assign ex_valid_o = ex_valid_q;
+    assign ex_pc_o       = ex_pc_q;
+    assign ex_instr_o    = ex_instr_q;
+    assign ex_valid_o    = ex_valid_q;
 
     // WFI halt next-state: set when WFI retires, cleared as soon as an
     // interrupt is pending+enabled. wfi_next_pc holds the return PC for the
@@ -1097,8 +1266,8 @@ module execute_stage #(
     // freezing the pipe inside the handler with no way to retire the CSR write
     // that would re-enable interrupts -- an unrecoverable deadlock. Clearing
     // on int_pending_i releases the halt whichever event actually wins.
-    assign wfi_halt_d = wfi_retire | (wfi_halt_q & ~int_pending_i);
-    assign wfi_next_pc_d = wfi_retire ? wfi_next_pc : wfi_next_pc_q;
+    assign wfi_halt_d    = wfi_retire | (wfi_halt_q & ~int_pending_i);
+    assign wfi_next_pc_d = wfi_retire ? pc_link : wfi_next_pc_q;
 
     // =================================================================
     // Sequential

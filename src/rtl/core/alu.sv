@@ -24,12 +24,19 @@ import rv32_pkg::*;
 
 
 module alu #(
-    // MUL structure A/B knob. 1 = one shared signed 33x33 product with the
-    // signedness selected on the OPERANDS (default); 0 = the historical form,
-    // three separate 32x32 products with a 4-way mux on their RESULTS.
+    // MUL structure A/B knob. 0 = three separate 32x32 products with a 4-way
+    // mux on their RESULTS (default, and what ships); 1 = one shared signed
+    // 33x33 product with the signedness selected on the OPERANDS.
     // Functionally identical -- this exists so a PnR run can move one
     // variable at a time (see the note above the MUL block).
-    parameter int unsigned MUL_SHARED_DSP = 1
+    //
+    // The default is 0 because 1 MEASURED WORSE: -2.52 ns, 49.6 -> 44.1 MHz
+    // on the 2026-09-01 PnR run (the MUL block records why). It used to
+    // default to 1 here, which was harmless only because rv32_pkg's
+    // MUL_SHARED_DSP = 0 overrides it on every real instantiation -- a
+    // standalone instance of this module, or a new one that forgot to thread
+    // the knob, silently got the slower form.
+    parameter int unsigned MUL_SHARED_DSP = 0
 ) (
     input wire clk_i,
     input wire rst_ni,
@@ -47,7 +54,29 @@ module alu #(
     // not a net — so ports must be `wire`, matching the rest of the project).
     input  wire             start_i,         // pulse: launch the op (DIV/REM only)
     output logic            result_valid_o,
-    output logic [XLEN-1:0] result_o
+    output logic [XLEN-1:0] result_o,
+
+    // Effective-address tap: the adder's own output, taken BEFORE the result
+    // mux. For ALU_ADD / ALU_LX -- the only two alu_op values a load, a store
+    // or a Zilx indexed load ever carries -- this is bit-identical to
+    // result_o, because sel_adder is 1 and is_mul_op is 0 for both, so the two
+    // mux levels in front of result_o are pass-throughs on that path.
+    //
+    // It exists because those two levels are NOT free for the LSU. Everything
+    // the memory port derives from the address -- the D-mem address pins, the
+    // misaligned launch gate, the D-mem-vs-peri fork, the store byte strobes
+    // and the store lane shift -- sat behind the full ALU result mux, which is
+    // shaped for the MUL DSP (the latest signal in the block) and therefore
+    // puts the adder two levels deep. Reading adder_sum directly costs no
+    // logic at all: the net already exists and the mux stays for every other
+    // consumer. The low bits matter most -- the store strobes and lane shift
+    // depend only on EA[1:0], which now come off the bottom of the carry chain
+    // instead of the top of a mux tree.
+    //
+    // execute_stage asserts ea_o == result_o whenever a memory request is
+    // pending, so the equivalence is checked in every simulation rather than
+    // rested on.
+    output wire [XLEN-1:0] ea_o
 );
 
     // -----------------------------------------------------------
@@ -101,6 +130,10 @@ module alu #(
     end
 
     assign adder_sum = {1'b0, operand_a_i} + {1'b0, addend_b} + {{XLEN{1'b0}}, op_is_sub};
+
+    // The EA tap (see the port comment). Pre-mux, so the LSU does not pay for
+    // the MUL-shaped result mux in front of result_o.
+    assign ea_o      = adder_sum[XLEN-1:0];
 
     // ---- compares, read off that same adder --------------------
     // Unsigned: a + ~b + 1 carries out exactly when a >= b, so a < b is the
@@ -216,17 +249,20 @@ module alu #(
         wire [2*XLEN-1:0] mul_uu = operand_a_i * operand_b_i;
         wire signed [2*XLEN-1:0] mul_su = $signed(operand_a_i) * $signed({1'b0, operand_b_i});
 
-        logic [XLEN-1:0] sel;
+        // The 4-way mux on the three products' RESULTS. This is the ~2 LUT
+        // levels that sit BEHIND the DSP and that MUL_SHARED_DSP=1 set out to
+        // remove -- and did not (see the measurement above).
+        logic [XLEN-1:0] mul_sel;
         always_comb begin
             unique case (alu_op_i)
-                ALU_MUL:    sel = mul_ss[XLEN-1:0];
-                ALU_MULH:   sel = mul_ss[2*XLEN-1:XLEN];
-                ALU_MULHSU: sel = mul_su[2*XLEN-1:XLEN];
-                ALU_MULHU:  sel = mul_uu[2*XLEN-1:XLEN];
-                default:    sel = '0;
+                ALU_MUL:    mul_sel = mul_ss[XLEN-1:0];
+                ALU_MULH:   mul_sel = mul_ss[2*XLEN-1:XLEN];
+                ALU_MULHSU: mul_sel = mul_su[2*XLEN-1:XLEN];
+                ALU_MULHU:  mul_sel = mul_uu[2*XLEN-1:XLEN];
+                default:    mul_sel = '0;
             endcase
         end
-        assign mul_result = sel;
+        assign mul_result = mul_sel;
     end
 
     // -----------------------------------------------------------
@@ -253,9 +289,24 @@ module alu #(
     div_state_e div_state_q, div_state_d;
 
     logic [4:0] div_cnt_q, div_cnt_d;
+    // abs(dividend), kept ONLY to answer the divide-by-zero case (REM/REMU
+    // return the dividend). The iteration itself carries the dividend in the
+    // low half of div_rem_q.
     logic [XLEN-1:0] div_a_q;
-    logic div_a_neg_q, div_b_neg_q;
-    logic [2*XLEN-1:0] div_rem_q, div_rem_d;  // {remainder, quotient} shift register
+    // Sign to re-apply to the magnitude, decided at launch. ONE flop, not the
+    // two it replaced: DIV negates iff the operand signs differ, REM iff the
+    // dividend is negative, and no op is both -- so they were always mutually
+    // exclusive and a single bit carries either. Folding them also puts the
+    // divide-by-zero exception in the flop instead of in the result mux: DIV
+    // by zero is -1 regardless of the dividend's sign, so the DIV term is
+    // gated on a non-zero divisor here rather than bypassed downstream.
+    logic div_neg_q;
+    // Divisor was zero. Latched at launch instead of re-deriving
+    // (div_divisor_q == 0) in the result path, which was a 32-bit OR-reduce
+    // (~3 LUT levels) sitting in front of the result mux for a value that is
+    // constant for the whole 34-cycle operation.
+    logic div_bz_q;
+    logic [2*XLEN-1:0] div_rem_q;  // {remainder, quotient} shift register
     logic [XLEN-1:0] div_divisor_q;
 
     // Unsigned operands for the division core; the sign is re-applied on
@@ -272,23 +323,40 @@ module alu #(
     // (GowinSynthesis rejects that, the module is ignored, and the
     // u_alu instantiation cascades to EX3990). Declare them at module
     // scope and drive them with continuous assigns instead.
+    // Both are pure bit selects off div_rem_q -- no logic.
+    //
+    // rem_part is 32 bits, so bit 32 of (2*rem + next_dividend_bit) is
+    // DROPPED by the shift. That is sound, but the reason is not the one it
+    // looks like. The restoring invariant only gives rem < divisor, and a
+    // divisor above 2^31 admits rem >= 2^31, which would overflow. What
+    // actually bounds it is the DIVIDEND: after k iterations the partial
+    // remainder is floor(a / 2^(32-k)) mod divisor, hence also below 2^k, so
+    // entering any of the 32 iterations it is below 2^31 and 2*rem+bit fits
+    // in 32 bits. Verified by instrumenting the loop over 200k operand pairs
+    // with divisor > 2^31: the partial remainder peaks at exactly 0x7FFFFFFF
+    // and bit 32 is never needed.
+    //
+    // So the bound comes from the 32-bit dividend AND the 32-iteration count
+    // together. Widen the dividend, change the iteration count, or reuse this
+    // divider at another width and rem_part must grow to XLEN+1 bits first.
+    // sw/isa/div_ops covers the divisor > 2^31 shapes that would expose it.
     logic [2*XLEN-1:0] shifted;
     logic [  XLEN-1:0] rem_part;
     assign shifted  = div_rem_q << 1;
     assign rem_part = shifted[2*XLEN-1:XLEN];
 
-    // Un solo clock, reset sincrono (coerente col resto della pipeline;
-    // SUG949E §3.2 rule 1: ogni registro deve avere un valore iniziale/di
-    // reset -- prima div_a_q / div_divisor_q / div_a_neg_q / div_b_neg_q /
-    // div_rem_q non ne avevano).
+    // Single clock, synchronous reset, consistent with the rest of the
+    // pipeline. SUG949E section 3.2 rule 1: every register needs a reset or
+    // initial value -- div_a_q / div_divisor_q / div_rem_q and the two sign
+    // flops originally had none.
     always_ff @(posedge clk_i) begin
         if (!rst_ni) begin
             div_state_q   <= DIV_IDLE;
             div_cnt_q     <= '0;
             div_a_q       <= '0;
             div_divisor_q <= '0;
-            div_a_neg_q   <= 1'b0;
-            div_b_neg_q   <= 1'b0;
+            div_neg_q     <= 1'b0;
+            div_bz_q      <= 1'b0;
             div_rem_q     <= '0;
         end else begin
             div_state_q <= div_state_d;
@@ -296,11 +364,19 @@ module alu #(
             if (div_state_q == DIV_IDLE && start_i && is_div_op) begin
                 div_a_q <= div_a_abs;
                 div_divisor_q <= div_b_abs;
-                div_a_neg_q <= (alu_op_i == ALU_DIV) && (operand_a_i[XLEN-1] ^ operand_b_i[XLEN-1]);
-                div_b_neg_q <= (alu_op_i == ALU_REM) && operand_a_i[XLEN-1];
+                // Sign of the result, as one bit. The DIV term carries the
+                // `divisor != 0` guard: with a zero divisor DIV must answer
+                // -1, and -1 is the all-ones magnitude with NO negate --
+                // negating it would give +1. REM needs no such guard,
+                // because its zero-divisor answer IS the signed dividend and
+                // therefore does want the sign back.
+                div_neg_q <= ((alu_op_i == ALU_DIV) &&
+                              (operand_a_i[XLEN-1] ^ operand_b_i[XLEN-1]) && (operand_b_i != '0)) ||
+                    ((alu_op_i == ALU_REM) && operand_a_i[XLEN-1]);
+                div_bz_q <= (operand_b_i == '0);
                 div_rem_q <= {{XLEN{1'b0}}, div_a_abs};
             end else if (div_state_q == DIV_RUN) begin
-                // uno shift-subtract per ciclo
+                // one shift-subtract per cycle
                 if (rem_part >= div_divisor_q) begin
                     // Quotient bit 1 into the LSB; keep shifted[31] (the next
                     // dividend bit now at the top of the quotient half) — the
@@ -337,27 +413,36 @@ module alu #(
     assign div_quot_raw = div_rem_q[XLEN-1:0];
     assign div_rem_raw  = div_rem_q[2*XLEN-1:XLEN];
 
-    logic [XLEN-1:0] div_result;
+    // Quotient vs remainder, off alu_op_i -- a flopped de_q field, and held
+    // for the whole operation by execute's stall, exactly as the four-way
+    // case this replaced relied on.
+    logic div_take_rem;
+    assign div_take_rem = (alu_op_i == ALU_REM) || (alu_op_i == ALU_REMU);
+
+    // MAGNITUDE first, sign second. This ordering is what fixes a real bug
+    // (2026-09-02, caught by the new sw/isa/div_ops oracle): the divider
+    // stores abs(dividend) and re-applied the sign only on the NORMAL path,
+    // so the divide-by-zero path returned the magnitude. RISC-V requires
+    // REM rd, rs1, 0 == rs1, sign included, so `rem -5, 0` answered +5.
+    // Applying one negate to whichever magnitude was selected makes the two
+    // paths share the sign by construction rather than by duplication.
+    //
+    // Signed overflow (INT_MIN / -1) still needs no special case -- see the
+    // note on the DIV/REM block above.
+    //
+    // It is also the cheaper shape: ONE 32-bit negate where there were two,
+    // and the 32-bit (div_divisor_q == 0) reduce is gone from this path (it
+    // is div_bz_q, latched at launch). Depth is unchanged -- the negate moved
+    // from in front of the mux to behind it -- so this trades a carry chain
+    // and an OR-reduce for nothing.
+    logic [XLEN-1:0] div_mag;
     always_comb begin
-        // Div-by-zero: detect on the stored divisor (div_divisor_q holds
-        // abs(operand_b) for DIV/REM, operand_b for DIVU/REMU -- both are
-        // 0 iff operand_b==0). Previously this used div_b_q, a register
-        // that was never written, so the check was stuck at true and every
-        // DIV/REM wrongly took the div-by-zero path.
-        // Signed overflow (INT_MIN / -1) falls out correctly without a
-        // special case -- see the note on the DIV/REM block above.
-        unique case (alu_op_i)
-            ALU_DIV:
-            div_result = (div_divisor_q == 0) ?
-                {XLEN{1'b1}} : (div_a_neg_q ? -div_quot_raw : div_quot_raw);
-            ALU_DIVU: div_result = (div_divisor_q == 0) ? {XLEN{1'b1}} : div_quot_raw;
-            ALU_REM:
-            div_result = (div_divisor_q == 0) ?
-                div_a_q : (div_b_neg_q ? -div_rem_raw : div_rem_raw);
-            ALU_REMU: div_result = (div_divisor_q == 0) ? div_a_q : div_rem_raw;
-            default: div_result = '0;
-        endcase
+        if (div_bz_q) div_mag = div_take_rem ? div_a_q : {XLEN{1'b1}};
+        else div_mag = div_take_rem ? div_rem_raw : div_quot_raw;
     end
+
+    logic [XLEN-1:0] div_result;
+    assign div_result = div_neg_q ? -div_mag : div_mag;
 
     // -----------------------------------------------------------
     // Mux finale + valid

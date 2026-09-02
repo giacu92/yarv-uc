@@ -75,10 +75,11 @@ import rv32_pkg::*;
  *     register variants uses_rs1=1. csr_wren is decode's op-present flag
  *     (squashed by dec_illegal); execute qualifies the actual write.
  *
- * Deferred opcodes (decode to illegal=1, not executed this phase):
- *   OPC_MISC_MEM (fence / fence.i — Zifencei),
- *   OPC_SYSTEM funct3=0 (ecall / ebreak / mret / wfi — no trap machinery),
- *   atomics / any unknown opcode.
+ * Opcodes that decode to illegal=1 (execute raises the illegal-instruction
+ * trap): real atomics and RV64-only Zilx encodings under OPC_AMO, reserved
+ * funct3 values, sfence.vma (no VM), and any unknown opcode. OPC_MISC_MEM
+ * (fence / fence.i) and OPC_SYSTEM funct3=0 (ecall / ebreak / mret / wfi) are
+ * decoded and retired -- they ride sys_op to execute.
  *
  * Naming: ports *_i/_o; internal signals no prefix; flops _q, next-state
  * _d. Module instances keep u_*.
@@ -93,13 +94,14 @@ module decode_stage #(
     parameter int BP_EN = 1,
     // Where the PHT direction bit comes from.
     //   1 = the buffer entry, read at PUSH time by fetch and carried in the
-    //       entry (default). Takes the PHT array read off this stage's
-    //       redirect path, which makes PHT depth timing-neutral; costs a
-    //       slightly stale GHR (see branch_predictor.sv).
-    //   0 = the decode-time lookup port, read with the live GHR.
+    //       entry. Takes the PHT array read off this stage's redirect path,
+    //       which makes PHT depth timing-neutral; costs a slightly stale GHR
+    //       (see branch_predictor.sv).
+    //   0 = the decode-time lookup port, read with the live GHR (default, and
+    //       what rv32_pkg ships -- 1 has never been through PnR).
     // Functionally safe either way -- de_t carries the index the bits were
     // read at, so training always updates the entry the lookup used.
-    parameter int BP_PUSH_LOOKUP = 1
+    parameter int BP_PUSH_LOOKUP = 0
 ) (
     input wire clk_i,
     input wire rstn_i,
@@ -503,7 +505,12 @@ module decode_stage #(
                         // rs2==0: c.jr/c.jalr/c.ebreak. rs2!=0: c.mv/c.add
                         // (selected by c[12]: 0=mv, 1=add).
                         if (rd5 == 5'd0 && rs2_5 == 5'd0) begin
-                            // c.ebreak -> illegal (SYSTEM, not decoded)
+                            // c.ebreak -> ebreak (0x0010_0073). The uniform
+                            // decoder maps that to SYS_EBREAK, so the trap
+                            // reports mcause=3 (breakpoint). Expanding it to
+                            // the zero word instead reported mcause=2
+                            // (illegal instruction) for a legal instruction.
+                            res = mk_i(OPC_SYSTEM, 5'd0, 5'd0, 3'b000, 32'd1);
                         end else if (rs2_5 == 5'd0) begin
                             // c.jr (c[12]=0) / c.jalr (c[12]=1): jalr rd, 0(rs1).
                             // rs1 = c[11:7] (= rd5); rd = x0 for c.jr (discard
@@ -567,37 +574,17 @@ module decode_stage #(
     de_t de_q, de_d, de_next;
 
     // =================================================================
-    // RAW hazard resolution (execute -> decode forwarding)
+    // RAW hazard resolution: execute -> decode forwarding
     //
-    // Replaces the former stall-on-RAW bubble interlock. Decode's live
-    // combinational source addresses (rs1_addr_dec / rs2_addr_dec, forced
-    // to x0 when unused, so an unused source can never match) are compared
-    // against execute's retiring writeback destination. When execute
-    // retires a writeback this cycle (ex_wb_en_i) to a register the decoded
-    // instruction reads, the fresh value is forwarded straight into the
-    // D/E operands instead of the stale async regfile read (see fwd_rs1 /
-    // fwd_rs2 below) — zero bubble, no D/E bubble and no F/D hold. The
-    // legacy raw_haz bubble logic is retained commented-out below for
-    // reference; it is no longer in the stall_o term.
-    // =================================================================
-    // (legacy, DISABLED) RAW hazard bubble interlock — replaced by
-    // fwd_rs1/fwd_rs2 forwarding. Kept for reference.
-    // =================================================================
-    //logic raw_haz;
-    //assign raw_haz = decoded_valid & ~flush_i & ex_wb_en_i & (ex_wb_addr_i != 5'd0) &
-    //    ((rs1_addr_dec != 5'd0 & rs1_addr_dec == ex_wb_addr_i) |
-    //     (rs2_addr_dec != 5'd0 & rs2_addr_dec == ex_wb_addr_i));
-
-    // =================================================================
-    // RAW forwarding (execute -> decode)
-    //
-    // Bypasses the regfile write-then-read: when execute retires a
-    // writeback this cycle to a register the instruction being decoded
-    // reads, inject ex_wb_data_i directly instead of the stale async
-    // read. Covers DIV/REM and load results too — wb_en_o/wb_data_o
-    // are qualified by result_ready in execute, so they're valid
-    // exactly the cycle the result is ready, and decode is already
-    // parked (stall_i) through the whole busy/wait window. No bubble.
+    // There is no stall-on-RAW interlock. Decode's live combinational source
+    // addresses (rs1_addr_dec / rs2_addr_dec, forced to x0 when unused, so an
+    // unused source can never match) are compared against execute's retiring
+    // writeback destination; on a match the fresh value is injected instead of
+    // the stale async regfile read — zero bubble, no D/E bubble, no F/D hold.
+    // Covers DIV/REM and load results too: wb_en_o / wb_data_o are qualified
+    // by result_ready in execute, so they are valid exactly the cycle the
+    // result is ready, and decode is parked (stall_i) through the whole
+    // busy/wait window.
     // =================================================================
     wire fwd_rs1 = ex_wb_en_i & (ex_wb_addr_i != 5'd0) & (rs1_addr_dec == ex_wb_addr_i);
     wire fwd_rs2 = ex_wb_en_i & (ex_wb_addr_i != 5'd0) & (rs2_addr_dec == ex_wb_addr_i);
@@ -612,7 +599,9 @@ module decode_stage #(
     // word itself (fetch no longer exports it as a separate port).
     wire fe_is_compressed = (fe_instr_i[1:0] != 2'b11);
 
-    logic [31:0] src_instr32;
+    logic [31:0] src_instr32;  // the 32-bit word the uniform decoder consumes
+    logic [31:0] src_word32;  // 32-bit source BEFORE expansion (native / stitched)
+    logic [15:0] src_half16;  // 16-bit compressed source halfword
     logic [31:0] src_pc;
     logic src_is_compressed;
     logic buffer_upper;
@@ -631,18 +620,25 @@ module decode_stage #(
     // over flops + inputs.
     // -----------------------------------------------------------------
     wire hold_is_span = (hold_word_q[1:0] == 2'b11);  // stashed low half of a 32-bit instr
-    // A fault entry outranks every other source. If a spanning
-    // instruction was waiting for its upper half, that upper half is
-    // exactly what could not be fetched, so the fault belongs to it and the
-    // stash is dropped rather than stitched against a synthesised word.
-    wire fetch_fault = fe_valid_i && fe_fault_i;
-
-    wire is_hold = hold_q;
-    wire is_hold_plain = !fetch_fault && hold_q && !hold_is_span;  // upper half ready
+    wire hold_plain_pending = hold_q && !hold_is_span;  // stashed compressed upper half
     wire span_pending = hold_q && hold_is_span;  // spanning low half held
-    wire span_complete = !fetch_fault && span_pending && fe_valid_i;  // stitch
-    wire span_wait = !fetch_fault && span_pending && !fe_valid_i;  // waiting for the word
-    wire target_upper = !fetch_fault && !hold_q && fe_valid_i && fe_pc_i[1];  // odd half
+
+    // A fault entry at the head carries no instruction word. It outranks every
+    // other source EXCEPT a stashed compressed upper half: that half is a
+    // COMPLETE instruction older than the faulting PC, so taking the fault
+    // first would drop it and make the trap imprecise (one instruction missing
+    // from the retire stream). stall_o already holds F/D while a plain stash is
+    // consumed, so the fault entry is still at the head next cycle and traps
+    // then. A SPANNING stash is the opposite case: the upper half it is waiting
+    // for is exactly what could not be fetched, so the fault belongs to it and
+    // the stash is dropped rather than stitched against a synthesised word.
+    wire fetch_fault = fe_valid_i && fe_fault_i;
+    wire take_fault = fetch_fault && !hold_plain_pending;
+
+    wire is_hold_plain = hold_plain_pending;  // upper half ready
+    wire span_complete = !take_fault && span_pending && fe_valid_i;  // stitch
+    wire span_wait = !take_fault && span_pending && !fe_valid_i;  // waiting for the word
+    wire target_upper = !take_fault && !hold_q && fe_valid_i && fe_pc_i[1];  // odd half
     wire target_span = target_upper && (fe_instr_i[17:16] == 2'b11);  // 32-bit at target
     // Same-cycle stitch: the target word's low half (head[31:16]) is the
     // 32-bit instr's low half, and head+1's low half (fe_next_instr_i[15:0])
@@ -693,14 +689,26 @@ module decode_stage #(
     logic      [XLEN-1:0] exc_tval;
 
     // ---- Branch-prediction (prediction-at-decode) ----
-    // Control-flow classification off the already-decoded branch_type + rd/rs1
-    // fields (no register data). is_return = JALR reading a link register
-    // (x1/x5) with rd=x0. The direct pc+imm target is computed for JAL and
-    // conditional branches (both PC-relative); JALR targets are rs1+imm
-    // (data-dependent) so they are not predicted here -- returns use the RAS,
-    // calls/indirect fall to execute (a call still pushes the RAS at resolve,
-    // where execute re-derives the kind from branch_type/rd).
-    logic is_cf, is_cond_cf, is_return_cf;
+    // Control-flow classification and the PC-relative immediate are decoded
+    // straight off the SOURCE HALVES (src_word32 / src_half16), in parallel
+    // with c_expand and with the opcode case tree rather than behind them --
+    // see the block that drives them for why, and the `ifdef VERILATOR` check
+    // at the end of the file for the proof that the two decoders agree.
+    // is_return = JALR reading a link register (x1/x5) with rd=x0. The direct
+    // pc+imm target is computed for JAL and conditional branches (both
+    // PC-relative); JALR targets are rs1+imm (data-dependent) so they are not
+    // predicted here -- returns use the RAS, calls/indirect fall to execute (a
+    // call still pushes the RAS at resolve, where execute re-derives the kind
+    // from branch_type/rd).
+    logic is_cf, is_return_cf;
+    // Shallow classification: kind of control flow, per source form.
+    logic cf_c_jal, cf_c_cond, cf_c_jalr, cf_c_ret;  // compressed halfword
+    logic cf_n_jal, cf_n_cond, cf_n_jalr, cf_n_ret;  // native 32-bit word
+    logic cf_jal, cf_cond, cf_jalr, cf_ret;  // selected by src_is_compressed
+    // The two signals fetch actually sees, in their flattest form: an OR of
+    // three ANDs for the direction and a single 2:1 for the address.
+    logic                            cf_taken;
+    logic         [        XLEN-1:0] cf_target;
     logic                            pred_valid;
     logic                            pred_taken;
     logic         [        XLEN-1:0] pred_target;
@@ -712,9 +720,11 @@ module decode_stage #(
     logic         [    BP_GHR_W-1:0] pht_ghr_src;
     logic         [BP_PHT_IDX_W-1:0] pht_index_src;
     logic         [        XLEN-1:0] pred_dir_target;  // src_pc + pred_imm (PC-relative)
-    // Branch/JAL immediate for the predictor's adder only, selected straight
-    // off the opcode field instead of out of the decoder's case tree.
-    logic         [        XLEN-1:0] pred_imm;
+    // Branch/JAL immediate for the predictor's adder only. Four candidates,
+    // all pure bit permutations of a source half plus a sign extension.
+    logic [XLEN-1:0] pred_cj_imm, pred_cb_imm;  // compressed CJ / CB
+    logic [XLEN-1:0] pred_n_imm_j, pred_n_imm_b;  // native J / B
+    logic [XLEN-1:0] pred_imm;
 
     // Zilx indexed-load decode helpers (OPC_AMO). Hoisted to module scope
     // and driven with a default every cycle in the decode always_comb below:
@@ -729,78 +739,76 @@ module decode_stage #(
 
     always_comb begin
         // ---- Source selection ----
-        // Priority: spanning stitch > compressed hold > odd-half branch
-        // target > fresh F/D low half. A spanning 32-bit instr's low
-        // halfword is stashed in the hold buffer (or sits at an odd-half
-        // branch target); its upper halfword is the next fetch word's
-        // low half, stitched in here when that word arrives (span_complete).
-        if (fetch_fault) begin
-            // No instruction word exists. src_instr32 is a don't-care; the
+        // Priority: fault (unless a plain stash outranks it -- see take_fault)
+        // > spanning stitch > compressed hold > odd-half branch target > fresh
+        // F/D low half. A spanning 32-bit instr's low halfword is stashed in
+        // the hold buffer (or sits at an odd-half branch target); its upper
+        // halfword is the next fetch word's low half, stitched in here when
+        // that word arrives (span_complete).
+        //
+        // The chain picks a SOURCE, not a decoded word: src_word32 for a
+        // native or stitched 32-bit instruction, src_half16 for a compressed
+        // one, src_is_compressed says which, and c_expand runs once after.
+        // Defaults, so every branch drives all four (no latch) and the
+        // don't-care branches sit at a defined 0 instead of holding.
+        src_word32        = 32'd0;
+        src_half16        = 16'd0;
+        src_pc            = fe_pc_i;
+        src_is_compressed = 1'b0;
+
+        if (take_fault) begin
+            // No instruction word exists. The word is a don't-care; the
             // exception below carries the cause and the faulting PC.
-            src_instr32       = 32'd0;
-            src_pc            = fe_pc_i;
-            src_is_compressed = 1'b0;
         end else if (span_complete) begin
             // Stitch: low half = hold_word_q[15:0] (bytes 2-3 of word W),
-            // upper half = fe_instr_i[15:0] (bytes 0-1 of word W+1). PC
-            // is the spanning instr's own PC (hold_pc_q). The stitched
-            // word is a real 32-bit instr -> is_compressed = 0.
-            src_instr32       = {fe_instr_i[15:0], hold_word_q[15:0]};
-            src_pc            = hold_pc_q;
-            src_is_compressed = 1'b0;
+            // upper half = fe_instr_i[15:0] (bytes 0-1 of word W+1). PC is the
+            // spanning instr's own PC (hold_pc_q). A real 32-bit instr, so it
+            // bypasses c_expand.
+            src_word32 = {fe_instr_i[15:0], hold_word_q[15:0]};
+            src_pc     = hold_pc_q;
         end else if (span_wait) begin
-            // Spanning low half held, upper-half fetch word not here yet:
-            // no complete instruction this cycle (bubble). src_instr32 is
-            // a don't-care (decoded_valid=0 gates de_d.valid/illegal).
-            src_instr32       = 32'd0;
-            src_pc            = hold_pc_q;
-            src_is_compressed = 1'b0;
+            // Spanning low half held, upper-half fetch word not here yet: no
+            // complete instruction this cycle (bubble). The word is a
+            // don't-care (decoded_valid=0 gates de_d.valid / illegal).
+            src_pc = hold_pc_q;
         end else if (is_hold_plain) begin
-            // Compressed upper half stashed last cycle: decode it.
-            // Recompute is_compressed from THIS half (its [1:0]), not
-            // from fe_is_compressed (which describes the whole word).
-            src_instr32       = c_expand(hold_word_q[15:0]);
+            // Compressed upper half stashed last cycle: decode it. It is
+            // compressed by construction -- a stash with [1:0]==2'b11 is
+            // hold_is_span and routes to the span cases above.
+            src_half16        = hold_word_q[15:0];
             src_pc            = hold_pc_q;
-            src_is_compressed = (hold_word_q[1:0] != 2'b11);
+            src_is_compressed = 1'b1;
+        end else if (target_span_complete) begin
+            // Same-cycle stitch: the target word's upper half (head[31:16]) is
+            // the 32-bit instr's low half, head+1's low half is its upper half.
+            // PC is the target PC. head+1's upper half is re-stashed (hold
+            // next-state) as the next instruction.
+            src_word32 = {fe_next_instr_i[15:0], fe_instr_i[31:16]};
+        end else if (target_span_wait) begin
+            // Branch target at offset 2/6 is a 32-bit instr's low half but
+            // head+1 is absent or faults: no emit this cycle (bubble), stash
+            // the low half, stitch next cycle (the old span path). A fault at
+            // head+1 lands here -> trap next cycle.
         end else if (target_upper) begin
-            if (target_span_complete) begin
-                // Same-cycle stitch: target word's upper half (head[31:16])
-                // is the 32-bit instr's low half; head+1's low half
-                // (fe_next_instr_i[15:0]) is its upper half. PC is the
-                // target PC (fe_pc_i). A real 32-bit word -> bypasses
-                // c_expand. head+1's upper half is re-stashed (hold
-                // next-state) as the next instruction.
-                src_instr32       = {fe_next_instr_i[15:0], fe_instr_i[31:16]};
-                src_pc            = fe_pc_i;
-                src_is_compressed = 1'b0;
-            end else if (target_span_wait) begin
-                // Branch target at offset 2/6 is a 32-bit instr's low half
-                // but head+1 is absent or faults: no emit this cycle (bubble),
-                // stash the low half, stitch completes next cycle (the old
-                // span path). A fault at head+1 lands here -> trap next cycle.
-                src_instr32       = 32'd0;
-                src_pc            = fe_pc_i;
-                src_is_compressed = 1'b0;
-            end else begin
-                // Compressed target in the upper half (fe_pc_i[1]=1). The
-                // low half was branched over and is discarded; do NOT
-                // stash it.
-                src_instr32       = c_expand(fe_instr_i[31:16]);
-                src_pc            = fe_pc_i;
-                src_is_compressed = (fe_instr_i[17:16] != 2'b11);
-            end
+            // Compressed target in the upper half (fe_pc_i[1]=1). The low half
+            // was branched over and is discarded; do NOT stash it. target_span
+            // was taken above, so [17:16] != 2'b11 here.
+            src_half16        = fe_instr_i[31:16];
+            src_is_compressed = 1'b1;
+        end else if (fe_is_compressed) begin
+            // Fresh F/D low half (fe_pc_i[1]=0), compressed.
+            src_half16        = fe_instr_i[15:0];
+            src_is_compressed = 1'b1;
         end else begin
-            // Fresh F/D low half (fe_pc_i[1]=0).
-            if (fe_is_compressed) begin
-                src_instr32       = c_expand(fe_instr_i[15:0]);
-                src_pc            = fe_pc_i;
-                src_is_compressed = 1'b1;
-            end else begin
-                src_instr32       = fe_instr_i;
-                src_pc            = fe_pc_i;
-                src_is_compressed = 1'b0;
-            end
+            // Fresh F/D low half, native 32-bit.
+            src_word32 = fe_instr_i;
         end
+
+        // ONE c_expand instance. It used to be called from three separate
+        // branches of the chain above, which inlines the whole RVC case tree
+        // three times and then muxes 32 bits of tree output; selecting the
+        // halfword first costs a 16-bit mux and leaves a single tree.
+        src_instr32 = src_is_compressed ? c_expand(src_half16) : src_word32;
 
         // Stash the upper half of a fresh word whose low half was
         // consumed this cycle (a fresh compressed instr at offset 0).
@@ -808,15 +816,19 @@ module decode_stage #(
         // target_span in the hold next-state). The compressed-vs-spanning
         // distinction is derived from the stashed halfword's [1:0], so
         // buffer_upper needs no span flag of its own.
-        buffer_upper = (!is_hold) && !target_upper && fe_valid_i && fe_is_compressed;
+        buffer_upper = (!hold_q) && !target_upper && fe_valid_i && fe_is_compressed;
 
-        // A COMPLETE instruction is available this cycle: every case
-        // EXCEPT span_wait (upper-half word not here yet) and target_span_wait
-        // (just stashed the low half, waiting for the stitch). This feeds
-        // de_d.valid and the forward-path compare, so neither wait state
-        // emits a spurious valid or false-triggers a forward.
-        decoded_valid = fetch_fault | span_complete | is_hold_plain | (target_upper && !target_span)
-            | target_span_complete | (fe_valid_i && !hold_q && !target_upper);
+        // A COMPLETE instruction is available this cycle: every case EXCEPT
+        // span_wait (upper-half word not here yet) and target_span_wait (just
+        // stashed the low half, waiting for the stitch). This feeds de_d.valid,
+        // the illegal-trap gate and the predictor's is_cf, so neither wait
+        // state emits a spurious valid, trap or redirect.
+        //
+        // The !hold_q term collapses the three head-of-buffer cases the old
+        // form spelled out separately: with no stash, a valid head yields an
+        // instruction unless it is a target span still waiting for head+1.
+        decoded_valid = take_fault | span_complete | is_hold_plain |
+            (fe_valid_i && !hold_q && !take_fault && !target_span_wait);
 
         // ---- Field extraction ----
         opcode = src_instr32[6:0];
@@ -906,7 +918,13 @@ module decode_stage #(
                 reg_write   = 1'b1;
                 alu_op      = ALU_ADD;
                 alu_src_a   = ALU_A_PC;
-                alu_src_b   = ALU_B_PC4;
+                // ALU_B_IMM, not the pc_link this used to select: JAL's
+                // alu_result is never read (rd gets pc_link via WB_PC4, the
+                // redirect target comes from execute's own branch_target
+                // adder), so the operand is a don't-care -- and selecting
+                // pc_link put an adder output into the operand-B mux, which
+                // feeds the MUL DSP. See alu_src_b_t in rv32_pkg.
+                alu_src_b   = ALU_B_IMM;
                 wb_src      = WB_PC4;
                 branch_type = BR_JAL;
                 imm         = imm_j;
@@ -1287,7 +1305,7 @@ module decode_stage #(
         // rs1/rs2 (avoids reading a bogus field, e.g. LUI's rs1 is imm).
         rs1_addr_dec = uses_rs1 ? rs1_field : 5'd0;
         rs2_addr_dec = uses_rs2 ? rs2_field : 5'd0;
-        csr_addr_dec = is_csr ? src_instr32[31:20] : 12'd0;  // CSR index is 12 bits
+        csr_addr_dec = is_csr ? funct12 : 12'd0;  // CSR index is instr[31:20]
 
         // Any illegal (and present) instruction requests an illegal-instr
         // sync trap in execute. ecall/ebreak set exc_req explicitly above
@@ -1305,64 +1323,135 @@ module decode_stage #(
         // word above: there was no instruction to be illegal. mtval is the
         // address that could not be fetched, which is what makes the trap
         // useful -- it names where the pc went.
-        if (fetch_fault) begin
+        if (take_fault) begin
             exc_req   = 1'b1;
             exc_cause = MCAUSE_INSTR_ACC;
             exc_tval  = fe_pc_i;
         end
 
         // ---- Branch prediction (prediction-at-decode) ----
-        // Classify the control-flow instruction at the head. branch_type is
-        // BR_NONE for a fault (the don't-care word decodes to no opcode) and is
-        // squashed to BR_NONE for an illegal below, so is_cf gates both out.
-        is_cf = decoded_valid & ~dec_illegal & (branch_type != BR_NONE);
-        is_cond_cf = is_cf &
-            (branch_type inside {BR_BEQ, BR_BNE, BR_BLT, BR_BGE, BR_BLTU, BR_BGEU});
-        is_return_cf = is_cf & (branch_type == BR_JALR) & (rs1_field == 5'd1 || rs1_field == 5'd5) &
-            (rd_field == 5'd0);
-
-        // Direct PC-relative target for JAL and conditional branches. JALR
-        // targets are rs1+imm -- not PC-relative -- so this is not used there.
-        //
-        // Deliberately NOT `src_pc + imm`. `imm` is the output of the whole
-        // opcode case tree above, and this adder feeds fetch's issue_addr and
-        // pc_q, so that tree ends up in front of a 32-bit carry chain and then
-        // in front of the I-mem address pins. Measured on the 2026-09-01
-        // 48.965 MHz run, second-worst path group (-0.307 ns):
+        // Everything the predictor exports to fetch is decoded off the SOURCE
+        // HALVES, not off src_instr32 and not out of the opcode case tree.
+        // pred_redirect_valid_o and pred_redirect_addr_o both reach fetch's
+        // issue_addr, and from there the I-mem address pins, in this same
+        // cycle, so every level here is a level on that path. Measured on the
+        // 2026-09-01 48.965 MHz run, second-worst path group (-0.307 ns):
         //   buffer head 2.271 -> c_expand/src_instr32 5.509 -> [case tree]
         //   -> imm 15.836 -> pred_dir_target 18.634 -> pc_q 22.543
-        // 10.3 ns of it is src_instr32 -> imm through the decoder.
+        // i.e. ~3.2 ns of c_expand and ~10.3 ns of decoder in front of a
+        // 32-bit carry chain and then a BSRAM address pin.
         //
-        // The predictor only ever needs two of the immediates, and both are
-        // pure bit permutations of src_instr32 with a sign extension -- no case
-        // tree involved. Selecting between them takes ONE comparison on the
-        // opcode field, available immediately after c_expand. So the adder now
-        // hangs off src_instr32 directly and the decoder is off this path.
+        // This is a second decoder for three bits of information, so it is
+        // only sound while it agrees EXACTLY with the real one. Execute gates
+        // its mispredict recovery on de_i.branch_type (cf_resolving), so an
+        // OVER-prediction -- steering fetch on an instruction the decoder does
+        // not call control flow -- would never be corrected. The `ifdef
+        // VERILATOR` block at the end of the file checks the agreement every
+        // cycle of every run; sw/isa/bp_pred exercises the cases.
         //
-        // Equivalence with execute, which resolves as `de_i.pc + de_i.imm`: for
-        // a conditional branch the decoder sets imm = imm_b, for JAL imm =
-        // imm_j, and those are the only two cases where pred_dir_target is
-        // consumed (PRED_PHT and PRED_DIRECT). Every other opcode leaves it a
-        // don't-care, gated by pred_source. A mismatch here would not be a
-        // wrong retire -- execute is the golden resolver -- but it would
-        // mispredict every direct branch, which sw/isa/bp_pred catches.
-        pred_imm = (src_instr32[6:0] == OPC_JAL) ? imm_j : imm_b;
+        // Exhaustively, the decoder leaves branch_type != BR_NONE for:
+        //   OPC_JAL                          (always legal)
+        //   OPC_JALR   with funct3 == 000    (always legal)
+        //   OPC_BRANCH with funct3 not in {010, 011}
+        // and dec_illegal is 0 in all three. That is why ~dec_illegal is not a
+        // term below: it was redundant, and it pulled the whole illegal cone
+        // (every funct3/funct7 legality test in the case tree) onto the
+        // redirect path.
+        cf_c_jal = (src_half16[1:0] == 2'b01) &
+            ((src_half16[15:13] == 3'b001) | (src_half16[15:13] == 3'b101));  // c.jal / c.j
+        cf_c_cond = (src_half16[1:0] == 2'b01) & (src_half16[15:14] == 2'b11);  // c.beqz / c.bnez
+        // c.jr / c.jalr: quadrant 2, funct3=100, rs2 field 0, rd field != 0
+        // (rd==0 with rs2==0 is c.ebreak). c.jr (c[12]=0) expands to rd=x0 and
+        // is the return form; c.jalr (c[12]=1) expands to rd=x1, never one.
+        cf_c_jalr = (src_half16[1:0] == 2'b10) & (src_half16[15:13] == 3'b100) &
+            (src_half16[6:2] == 5'd0) & (src_half16[11:7] != 5'd0);
+        cf_c_ret = cf_c_jalr & ~src_half16[12] &
+            ((src_half16[11:7] == 5'd1) | (src_half16[11:7] == 5'd5));
+
+        cf_n_jal = (src_word32[6:0] == OPC_JAL);
+        cf_n_jalr = (src_word32[6:0] == OPC_JALR) & (src_word32[14:12] == 3'b000);
+        // The reserved branch funct3 values 010 / 011 are exactly funct3[2:1]==01.
+        cf_n_cond = (src_word32[6:0] == OPC_BRANCH) & (src_word32[14:13] != 2'b01);
+        cf_n_ret = cf_n_jalr & (src_word32[11:7] == 5'd0) &
+            ((src_word32[19:15] == 5'd1) | (src_word32[19:15] == 5'd5));
+
+        cf_jal = src_is_compressed ? cf_c_jal : cf_n_jal;
+        cf_cond = src_is_compressed ? cf_c_cond : cf_n_cond;
+        cf_jalr = src_is_compressed ? cf_c_jalr : cf_n_jalr;
+        cf_ret = src_is_compressed ? cf_c_ret : cf_n_ret;
+
+        is_cf = decoded_valid & (cf_jal | cf_jalr | cf_cond);
+        is_return_cf = decoded_valid & cf_ret;
+
+        // Direct PC-relative target for JAL and conditional branches. JALR
+        // targets are rs1+imm -- not PC-relative -- so this is unused there.
+        // The predictor only ever needs two immediates and both are pure bit
+        // permutations of a source half, so the select is one bit: compressed
+        // c.j/c.jal have funct3[1]=0 and c.beqz/c.bnez funct3[1]=1; native
+        // needs one opcode compare. c_expand packs the CJ / CB offset into a
+        // J / B immediate, so unpacking the raw halfword here reproduces
+        // exactly what `src_pc + imm` would have produced -- which is also
+        // what execute resolves as `de_i.pc + de_i.imm`.
+        pred_cj_imm = {
+            {20{src_half16[12]}},
+            src_half16[12],
+            src_half16[8],
+            src_half16[10],
+            src_half16[9],
+            src_half16[6],
+            src_half16[7],
+            src_half16[2],
+            src_half16[11],
+            src_half16[5],
+            src_half16[4],
+            src_half16[3],
+            1'b0
+        };
+        pred_cb_imm = {
+            {23{src_half16[12]}},
+            src_half16[12],
+            src_half16[6:5],
+            src_half16[2],
+            src_half16[11:10],
+            src_half16[4:3],
+            1'b0
+        };
+        pred_n_imm_j = {
+            {11{src_word32[31]}},
+            src_word32[31],
+            src_word32[19:12],
+            src_word32[20],
+            src_word32[30:21],
+            1'b0
+        };
+        pred_n_imm_b = {
+            {19{src_word32[31]}},
+            src_word32[31],
+            src_word32[7],
+            src_word32[30:25],
+            src_word32[11:8],
+            1'b0
+        };
+        pred_imm = src_is_compressed ? (src_half16[14] ? pred_cb_imm : pred_cj_imm) :
+            ((src_word32[6:0] == OPC_JAL) ? pred_n_imm_j : pred_n_imm_b);
         pred_dir_target = src_pc + pred_imm;
 
-        // Build the prediction. pred_valid marks a classified control-flow
-        // instruction (records NT predictions and unpredicted JALR for uniform
-        // mispredict accounting in execute); pred_taken is the speculated
-        // direction; pred_target is the taken target (valid when pred_taken).
-        // Direction bit + gshare index, from whichever source this build
-        // uses. The push-time form reads two flops (the entry's two halfword
+        // Direction bit + gshare index, from whichever source this build uses.
+        // The push-time form reads two flops (the entry's two halfword
         // predictions, selected by the PC being decoded) and one xor; the
-        // decode-time form reads the PHT array. src_pc[1] is the uniform
-        // selector: a stashed halfword always has bit[1]=1 and always carried
-        // the HIGH-half bit, so the hold case needs no separate rule beyond
-        // taking the stashed copy rather than the head's.
+        // decode-time form reads the PHT array.
+        //
+        // The halfword selector is fe_pc_i[1], not src_pc[1]: in every case
+        // that reaches the selector src_pc IS fe_pc_i (span_complete and
+        // is_hold_plain take the stashed copy instead, and the two wait states
+        // have decoded_valid=0, so their prediction is never consumed). Using
+        // fe_pc_i keeps the src_pc mux off the direction bit. A stashed
+        // halfword always has bit[1]=1 and always carried the HIGH-half bit,
+        // so one stashed bit is enough. Both facts are checked below under
+        // `ifdef VERILATOR`.
         if (BP_PUSH_LOOKUP != 0) begin
             pht_taken_src = (span_complete || is_hold_plain) ?
-                hold_pred_q : (src_pc[1] ? fe_pred_hi_i : fe_pred_lo_i);
+                hold_pred_q : (fe_pc_i[1] ? fe_pred_hi_i : fe_pred_lo_i);
             pht_ghr_src = (span_complete || is_hold_plain) ? hold_ghr_q : fe_ghr_i;
             pht_index_src = src_pc[BP_PHT_IDX_W:1] ^ pht_ghr_src;
         end else begin
@@ -1371,32 +1460,44 @@ module decode_stage #(
             pht_index_src = bp_lookup_i.pht_index;
         end
 
+        // The flat forms fetch sees. cf_jal / cf_cond / cf_ret are mutually
+        // exclusive (different opcodes), so the direction is an OR of ANDs
+        // rather than an if-else chain, and the address is a single 2:1 with
+        // the adder output -- the late input -- on it. Both are qualified by
+        // is_cf at the output, so they are don't-cares otherwise.
+        cf_taken       = cf_jal | (cf_cond & pht_taken_src) | (cf_ret & bp_lookup_i.ras_valid);
+        cf_target      = cf_ret ? bp_lookup_i.ras_top : pred_dir_target;
+
+        // Build the D/E prediction metadata. pred_valid marks a classified
+        // control-flow instruction (records NT predictions and unpredicted
+        // JALR for uniform mispredict accounting in execute); pred_taken is
+        // the speculated direction; pred_target is the taken target (valid
+        // when pred_taken). These all end at a flop, so they keep the gated
+        // shape -- only the two fetch-facing outputs use the flat forms.
         pred_valid     = is_cf;
         pred_source    = PRED_NONE;
         pred_taken     = 1'b0;
         pred_target    = '0;
         pred_pht_index = '0;
         if (is_cf) begin
-            if (is_return_cf) begin
+            pred_taken = cf_taken;
+            if (cf_ret) begin
                 // Return: target from the RAS; taken only if the RAS has an
                 // entry (else fall back to execute, the legacy path).
                 pred_source = PRED_RAS;
-                pred_taken  = bp_lookup_i.ras_valid;
                 pred_target = bp_lookup_i.ras_top;
-            end else if (is_cond_cf) begin
+            end else if (cf_cond) begin
                 // Conditional: direction from the gshare PHT, target pc+imm.
                 pred_source    = PRED_PHT;
-                pred_taken     = pht_taken_src;
                 pred_target    = pred_dir_target;
                 pred_pht_index = pht_index_src;
-            end else if (branch_type == BR_JAL) begin
+            end else if (cf_jal) begin
                 // Unconditional JAL / c.j / c.jal: always taken, pc+imm.
                 pred_source = PRED_DIRECT;
-                pred_taken  = 1'b1;
                 pred_target = pred_dir_target;
             end
             // JALR call / indirect (JALR, not a return): no target prediction
-            // (rs1+imm is data-dependent); pred_taken stays 0 and execute
+            // (rs1+imm is data-dependent); cf_taken is 0 for it and execute
             // resolves it as before the predictor existed.
         end
 
@@ -1456,6 +1557,19 @@ module decode_stage #(
         end
     end
 
+    // Predicted redirect to fetch: fire the cycle a control-flow instruction
+    // at the head is consumed into de_d (~stall_i, ~flush_i) and predicted
+    // taken. Gated by BP_EN; lower priority than execute's redirect (a
+    // trap / mret / interrupt / mispredict flushes decode via flush_i and
+    // overrides). Also used to clear the RVC hold buffer below: a
+    // predicted-taken redirect must drop any stashed half exactly like an
+    // execute flush does, because the half-instruction sitting after the
+    // control-flow instr is wrong-path, and the fetch buffer kill does NOT
+    // see the hold stash -- without this the fall-through half after a
+    // predicted-taken spanning branch survives the redirect and retires.
+    // Declared here because the hold next-state below reads it.
+    wire pred_redirect_fire = (BP_EN != 0) & is_cf & cf_taken & ~stall_i & ~flush_i;
+
     // =================================================================
     // Hold-buffer next-state
     // =================================================================
@@ -1476,7 +1590,7 @@ module decode_stage #(
             // otherwise re-stash that half this cycle (the fetch buffer kill
             // does not reach the hold stash), letting it retire.
             hold_d = 1'b0;
-        end else if (fetch_fault) begin
+        end else if (take_fault) begin
             hold_d = 1'b0;  // the unfetchable half is gone; drop the stash
         end else if (stall_i) begin
             // DIV-REM / mem-wait stall: preserve the stash.
@@ -1549,20 +1663,22 @@ module decode_stage #(
     end
 
     // =================================================================
-    // Back-pressure to fetch (compressed-upper hold or DIV/REM / mem-wait
-    // stall only — RAW is no longer a source of back-pressure; the
-    // forward path resolves it without stalling fetch or bubbling D/E).
-    // The hold_q && fe_valid_i term fires for a compressed-upper hold
-    // alongside a fresh F/D word (the stash takes priority -> hold F/D).
-    // It is gated on !hold_is_span: a spanning hold with fe_valid is
-    // span_complete, which CONSUMES word W+1 (no stall) -- without the
-    // gate, the stitch would wrongly hold F/D and re-see W+1. span_wait
-    // has fe_valid=0 (no term). The stall_i term carries real
-    // back-pressure.
+    // Back-pressure to fetch: a compressed-upper hold, or execute's DIV/REM /
+    // mem-wait stall. RAW is NOT a source of back-pressure -- the forward path
+    // resolves it without stalling fetch or bubbling D/E.
+    //
+    // resource_stall fires when a stashed compressed upper half collides with
+    // a fresh F/D word: the stash takes priority, so hold F/D. The
+    // !hold_is_span folded into hold_plain_pending is what makes that safe --
+    // a SPANNING hold with fe_valid is span_complete, which CONSUMES word W+1,
+    // and stalling there would make the stitch re-see W+1. span_wait has
+    // fe_valid=0 and so contributes no term. The same stall is what parks a
+    // fault entry at the head while the stash ahead of it retires (see
+    // take_fault). Named rather than inlined because sim_main.cpp taps it for
+    // the rvc-hold stall bucket.
     // =================================================================
-    wire resource_stall = (hold_q && !hold_is_span && fe_valid_i);
-    wire backpressure_stall = stall_i;
-    assign stall_o                 = (hold_q && !hold_is_span && fe_valid_i) || stall_i;
+    wire resource_stall = hold_plain_pending && fe_valid_i;
+    assign stall_o                 = resource_stall || stall_i;
 
     // Same-cycle target-span stitch: pop 2 (head + head+1). target_span_complete
     // has hold_q=0 so resource_stall=0; only stall_i back-pressures, which fetch
@@ -1579,31 +1695,24 @@ module decode_stage #(
     assign bp_lookup_o.pc          = src_pc;
     assign bp_lookup_o.ret_consume = is_return_cf & ~stall_i & ~flush_i;
 
-    // Predicted redirect to fetch: fire the cycle a control-flow instruction
-    // at the head is consumed into de_d (~stall_i, ~flush_i) and predicted
-    // taken. Gated by BP_EN; lower priority than execute's redirect (a
-    // trap/mret/interrupt/mispredict flushes decode via flush_i and overrides).
-    // Internal form (also used to clear the RVC hold buffer below): a
-    // predicted-taken redirect must drop any stashed half exactly like an
-    // execute flush does, because the half-instruction sitting after the
-    // control-flow instr is wrong-path. The fetch buffer kill does NOT see
-    // the hold stash, so without this the fall-through half after a
-    // predicted-taken spanning branch survives the redirect and retires.
-    wire pred_redirect_fire = (BP_EN != 0) & is_cf & pred_taken & ~stall_i & ~flush_i;
-    assign pred_redirect_valid_o = pred_redirect_fire;
-    assign pred_redirect_addr_o  = pred_target;
+    // The address fetch launches on. cf_target rather than pred_target: they
+    // are equal whenever pred_redirect_valid_o is high (is_cf & cf_taken), and
+    // cf_target is a single 2:1 off the adder instead of the is_cf/kind-gated
+    // chain the D/E field keeps.
+    assign pred_redirect_valid_o   = pred_redirect_fire;
+    assign pred_redirect_addr_o    = cf_target;
 
     // Register-read addresses drive the reg file.
-    assign rs1_addr_o            = rs1_addr_dec;
-    assign rs2_addr_o            = rs2_addr_dec;
+    assign rs1_addr_o              = rs1_addr_dec;
+    assign rs2_addr_o              = rs2_addr_dec;
 
     // D/E output
-    assign de_o                  = de_q;
+    assign de_o                    = de_q;
 
     // de_* per-stage taps (fields of de_o / de_q).
-    assign de_pc_o               = de_q.pc;
-    assign de_instr_o            = de_q.instr;
-    assign de_valid_o            = de_q.valid;
+    assign de_pc_o                 = de_q.pc;
+    assign de_instr_o              = de_q.instr;
+    assign de_valid_o              = de_q.valid;
 
     // =================================================================
     // Sequential
@@ -1625,6 +1734,93 @@ module decode_stage #(
             de_q        <= de_next;
         end
     end
+
+`ifdef VERILATOR
+    // =================================================================
+    // Predictor fast-path equivalence (simulation only)
+    //
+    // The predictor decodes its own copy of "is this control flow, of what
+    // kind, and what is its PC-relative immediate" off the raw source halves,
+    // so that neither c_expand nor the opcode case tree sits on the path to
+    // fetch's issue_addr. That is only sound while the copy agrees exactly
+    // with the real decoder, and one direction of disagreement is not
+    // self-correcting: execute qualifies its mispredict recovery with
+    // de_i.branch_type (cf_resolving), so a redirect fired for an instruction
+    // the decoder does not call control flow would never be undone.
+    //
+    // Checked here rather than by a directed test because the interesting
+    // inputs are whatever the compiler happens to emit. Every oracle, cosim
+    // and benchmark run is therefore also an equivalence proof over the
+    // instruction words it executes.
+    // =================================================================
+    logic slow_is_cf, slow_is_cond_cf, slow_is_return_cf;
+    always_comb begin
+        slow_is_cf = decoded_valid & ~dec_illegal & (branch_type != BR_NONE);
+        slow_is_cond_cf = slow_is_cf &
+            (branch_type inside {BR_BEQ, BR_BNE, BR_BLT, BR_BGE, BR_BLTU, BR_BGEU});
+        slow_is_return_cf = slow_is_cf & (branch_type == BR_JALR) &
+            (rs1_field == 5'd1 || rs1_field == 5'd5) & (rd_field == 5'd0);
+    end
+
+    always_ff @(posedge clk_i) begin
+        if (rstn_i) begin
+            if (is_cf !== slow_is_cf)
+                $fatal(
+                    1,
+                    "decode: fast is_cf=%b vs decoder %b (pc=%08x instr=%08x)",
+                    is_cf,
+                    slow_is_cf,
+                    src_pc,
+                    src_instr32
+                );
+            if ((decoded_valid & cf_cond) !== slow_is_cond_cf)
+                $fatal(
+                    1,
+                    "decode: fast cond CF=%b vs decoder %b (pc=%08x instr=%08x)",
+                    decoded_valid & cf_cond,
+                    slow_is_cond_cf,
+                    src_pc,
+                    src_instr32
+                );
+            if (is_return_cf !== slow_is_return_cf)
+                $fatal(
+                    1,
+                    "decode: fast is_return_cf=%b vs decoder %b (pc=%08x instr=%08x)",
+                    is_return_cf,
+                    slow_is_return_cf,
+                    src_pc,
+                    src_instr32
+                );
+            // The immediate only has to match where it is consumed: a
+            // PC-relative prediction, i.e. PRED_DIRECT (JAL) or PRED_PHT
+            // (conditional). Execute resolves those as de_i.pc + de_i.imm.
+            if (is_cf && (cf_jal || cf_cond) &&
+                (pred_imm !== ((opcode == OPC_JAL) ? imm_j : imm_b)))
+                $fatal(
+                    1,
+                    "decode: pred_imm=%08x vs decoder imm=%08x (pc=%08x instr=%08x)",
+                    pred_imm,
+                    (opcode == OPC_JAL) ? imm_j : imm_b,
+                    src_pc,
+                    src_instr32
+                );
+            // pht_taken_src selects the halfword slot with fe_pc_i[1] rather
+            // than src_pc[1], which is only equal because src_pc IS fe_pc_i in
+            // every case that reaches that selector.
+            if (is_cf && !(span_complete || is_hold_plain) && (src_pc !== fe_pc_i))
+                $fatal(
+                    1,
+                    "decode: src_pc=%08x != fe_pc=%08x with the head-entry prediction",
+                    src_pc,
+                    fe_pc_i
+                );
+            // Every stashed halfword is a high half, which is what lets the
+            // hold buffer carry one prediction bit instead of two.
+            if (hold_q && !hold_pc_q[1])
+                $fatal(1, "decode: stashed pc=%08x is not a high half", hold_pc_q);
+        end
+    end
+`endif
 
 endmodule
 

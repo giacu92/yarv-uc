@@ -273,16 +273,22 @@ rm -rf obj_dir && make VPARAMS="-GBP_EN=0"     # predictor off (A/B baseline)
 rm -rf obj_dir && make                          # predictor on (default)
 ```
 
-Two more structural knobs landed 2026-09-01, both defaulting to the new form
-and both there so a PnR run can move one variable at a time:
+Two more structural knobs landed 2026-09-01, both there so a PnR run can move
+one variable at a time. Both now DEFAULT TO 0, i.e. to the form that ships —
+`rv32_pkg` has always had them at 0, but the module parameters themselves
+defaulted to 1 until 2026-09-02, so a standalone instantiation silently picked
+up an unshipped configuration. The alternative form is the one you have to ask
+for:
 
 ```
-rm -rf obj_dir && make VPARAMS="-GMUL_SHARED_DSP=0"   # three 32x32 products (old MUL)
-rm -rf obj_dir && make VPARAMS="-GBP_PUSH_LOOKUP=0"   # PHT read at decode (old placement)
+rm -rf obj_dir && make VPARAMS="-GMUL_SHARED_DSP=1"   # one shared 33x33 product
+rm -rf obj_dir && make VPARAMS="-GBP_PUSH_LOOKUP=1"   # PHT read at buffer-push time
 ```
 
 `MUL_SHARED_DSP` is behaviour-neutral, so the retire stream and the cycle
-count must not move — `sw/isa/mul_ops` checks it both ways.
+count must not move — `sw/isa/mul_ops` and `sw/isa/div_ops` check it both
+ways. It defaults to 0 because 1 measured **-2.52 ns** (49.6 -> 44.1 MHz) in
+PnR; see the MUL block in `alu.sv`.
 `BP_PUSH_LOOKUP=1` reads the PHT when fetch pushes a word into the buffer and
 carries the direction bit in the entry, which takes the array read off the
 decode -> fetch redirect path and makes `BP_PHT_DEPTH` timing-neutral. It DOES
@@ -435,6 +441,25 @@ cd .. && make run RUN_ARGS="+IINIT=sw/<group>/<name>/build/imem.hex +DINIT=sw/<g
   `AND`/`OR`, byte loads at each lane, `lw`/`lbu`/`lhu`, byte stores. The
   constant-vs-computed load split is what isolated the silicon load
   byte-select bug. `make UART_TX_PACED=1`.
+- **`sw/isa/mul_ops/`** — M-extension multiply oracle: `MUL` / `MULH` /
+  `MULHSU` / `MULHU` against hand-computed 64-bit references, including
+  `INT_MIN` squared, `INT_MIN * -1`, and an operand-swapped pair that pins
+  `MULHSU`'s asymmetry. Written because nothing else in the tree emitted the
+  three high-word forms at all — gcc only reaches for them on 64-bit
+  arithmetic, which no benchmark does — so the whole signed/unsigned half of
+  the multiplier was unguarded. Run it at `MUL_SHARED_DSP` 0 and 1.
+- **`sw/isa/div_ops/`** — M-extension divide oracle (2026-09-02): `DIV` /
+  `DIVU` / `REM` / `REMU`, 22 operand pairs run through all four forms, plus
+  `rd == rs1` / `rd == rs2`, distance-1 forwarding into and out of the
+  divider, back-to-back divides, and a branch on a quotient. Written to pin a
+  real bug: the divider stores `abs(rs1)` and re-applied the sign only on the
+  normal path, so `REM rd, rs1, 0` returned `abs(rs1)` where RISC-V requires
+  `rs1` unchanged — `rem -5, 0` answered `+5`. Nothing reached it before,
+  because the benchmarks emit only ordinary positive divisions: never a
+  division by zero, never a signed overflow, never an unsigned divisor above
+  2^31. That last shape matters on its own — the divider's partial remainder
+  is 32 bits, and it is sound only because the bound comes from the 32-bit
+  dividend and the 32-iteration count together, not from the divisor.
 - **`sw/isa/rvc_scramble/`** — per-scramble-bit RVC decode oracle for
   `c_expand()`: every RVC immediate form with each bit set in isolation, a
   `mtvec` handler turning a mis-decoded jump into FAIL.

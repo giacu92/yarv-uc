@@ -58,13 +58,18 @@ module rv32imac_zicsr_zifencei #(
     // operands (default, fewer mux levels behind the DSP); 0 = three 32x32
     // products with a 4-way mux on their results (the historical form).
     // Functionally identical -- exists so PnR can move one variable per run.
-    parameter int MUL_SHARED_DSP = 1,
-    // Where the PHT direction bit is read. 1 = at instruction-buffer PUSH
-    // time, carried in the entry (default) -- takes the PHT array read off
-    // decode's redirect path and makes PHT depth timing-neutral, at the cost
-    // of a slightly stale GHR; 0 = at decode, with the live GHR. See
-    // branch_predictor.sv for the accuracy trade and rv32_pkg for the sizing.
-    parameter int BP_PUSH_LOOKUP = 1,
+    parameter int MUL_SHARED_DSP = 0,
+    // Where the PHT direction bit is read. 0 = at decode, with the live GHR
+    // (default, and what ships); 1 = at instruction-buffer PUSH time, carried
+    // in the entry -- takes the PHT array read off decode's redirect path and
+    // makes PHT depth timing-neutral, at the cost of a slightly stale GHR.
+    // See branch_predictor.sv for the accuracy trade and rv32_pkg for sizing.
+    //
+    // The default is 0 to match rv32_pkg::BP_PUSH_LOOKUP, which is what every
+    // real instantiation passes. It used to default to 1 here -- a form that
+    // has never been through PnR -- so a standalone instance, or a new one
+    // that forgot to thread the knob, got an unmeasured configuration.
+    parameter int BP_PUSH_LOOKUP = 0,
     // Forwarded to fetch: whether the EXECUTE redirect launches its I-mem read
     // in the redirect cycle. 0 (default) keeps the register file off the I-mem
     // address pins at a cost of 1 cycle per mispredict/trap; 1 restores the

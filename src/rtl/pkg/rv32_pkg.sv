@@ -325,22 +325,37 @@ package rv32_pkg;
         BR_JALR
     } branch_t;
 
-    // ALU operand-A source.
+    // ALU operand-A source. ALU_A_CSR is gone (2026-09-02): no opcode ever
+    // produced it -- a Zicsr op's old value reaches rd through WB_CSR and the
+    // RMW through csr_rdata_i directly, neither of which goes near the ALU --
+    // and while it existed it hung csr_rdata_i off the operand-A mux, which
+    // sits on regfile -> forward -> operand -> DSP, the design's worst path.
     typedef enum logic [1:0] {
         ALU_A_RS1,
         ALU_A_PC,
-        ALU_A_CSR,
         ALU_A_RS2   // Zilx base (spec: rs2 = base, rs1 = index)
     } alu_src_a_t;
     // ALU operand-B source. Zilx reuses ALU_B_RS1 (the index, rs1) — the
     // <<shamt shift is keyed on alu_op==ALU_LX inside the ALU, not on this
     // enum, so a dedicated "shifted rs1" select is not needed.
-    typedef enum logic [2:0] {
+    //
+    // THREE values, and the width is what the timing is about (2026-09-02).
+    // It used to hold five in 3 bits, which makes the operand-B mux an 8:1
+    // tree -- three LUT levels -- in front of the MUL DSP, on the path that
+    // limits the design (regfile -> forward -> operand -> DSP -> alu_result
+    // -> wb_data). Two of the five were never produced by any opcode
+    // (ALU_B_ZERO, and ALU_B_PC4 after the change below), so the mux is now a
+    // 4:1 -- two levels -- and every input is a flop:
+    //   ALU_B_PC4 existed only for JAL, whose alu_result is DISCARDED
+    //     (wb_src=WB_PC4 takes pc_link directly, the redirect target comes
+    //     from the separate branch_target adder, and JAL is not a memory or
+    //     CSR op). JAL now selects ALU_B_IMM, so alu_result becomes pc+imm --
+    //     still unread -- and pc_link, an adder output, leaves the mux.
+    //   ALU_B_ZERO was dead from the start: decode's default is ALU_B_IMM.
+    typedef enum logic [1:0] {
         ALU_B_RS1,
         ALU_B_IMM,
-        ALU_B_RS2,
-        ALU_B_PC4,
-        ALU_B_ZERO
+        ALU_B_RS2
     } alu_src_b_t;
     // Write-back source. WB_CSR writes the OLD CSR value to rd (Zicsr:
     // rd <- csr[addr] before the RMW side effect commits).
