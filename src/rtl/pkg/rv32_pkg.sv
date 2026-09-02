@@ -459,8 +459,13 @@ package rv32_pkg;
         logic [XLEN-1:0] pc;  // instr PC (P for low/32-bit, P+2 for upper half)
         logic [XLEN-1:0] instr;  // 32-bit word decode treated (native or RVC-expanded)
         logic is_compressed;  // source was a 16-bit RVC instr
+        // rs1_addr rides D/E because execute needs it to classify a JALR as a
+        // RAS return (rs1 in {x1,x5}). There is deliberately NO rs2_addr: it
+        // was carried until 2026-09-02 and read by nothing -- the regfile read
+        // ports are driven by decode's own combinational rs1_addr_o/rs2_addr_o,
+        // not from this struct -- so it was five dead flops per pipeline stage.
+        // `make lint` (UNUSEDSIGNAL) is what surfaced it.
         logic [4:0] rs1_addr;
-        logic [4:0] rs2_addr;
         logic [XLEN-1:0] rs1_data;  // operand captured at decode (async read)
         logic [XLEN-1:0] rs2_data;
         logic [XLEN-1:0] imm;  // sign-extended I/S/B/U/J immediate
@@ -495,6 +500,12 @@ package rv32_pkg;
         logic pred_valid;
         logic pred_taken;
         logic [XLEN-1:0] pred_target;
+        // WRITE-ONLY, on purpose. No RTL and no C++ reads pred_source; it
+        // exists so a VCD shows WHICH source predicted a branch (direct / PHT
+        // / RAS) when a mispredict is being debugged, which the sim's
+        // aggregate accuracy and RAS counters cannot attribute. `make lint`
+        // reports it as unused every run -- that is expected, do not chase it.
+        // Cost is two flops per pipeline stage; delete it if that ever matters.
         pred_source_t pred_source;
         logic [BP_PHT_IDX_W-1:0] pred_pht_index;
     } de_t;

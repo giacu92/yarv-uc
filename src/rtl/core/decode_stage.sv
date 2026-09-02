@@ -1508,7 +1508,6 @@ module decode_stage #(
         de_d.instr           = src_instr32;  // 32-bit word decode treated
         de_d.is_compressed   = src_is_compressed;
         de_d.rs1_addr        = rs1_addr_dec;
-        de_d.rs2_addr        = rs2_addr_dec;
         //        de_d.rs1_data      = rs1_data_i;
         //        de_d.rs2_data      = rs2_data_i;
         de_d.rs1_data        = rs1_fwd;
