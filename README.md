@@ -1,4 +1,4 @@
-# YARV-uC: Yet Another RISC-V uController
+# YARV32-uC: Yet Another RISC-V uController
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/giacu92/yarv-uc)
 
