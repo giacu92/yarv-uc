@@ -41,6 +41,10 @@ package rv32_pkg;
     // redirect also launches its read in the redirect cycle. Default 0 keeps
     // the register file off the I-mem address pins (see fetch_stage.sv) and
     // costs 1 cycle per mispredict / trap / mret.
+    // Timing closure on 2026-09-03 (wrt BT_EN=1, LSU_LIVE_LOAD=1, others=0) 
+    // from 52.890 MHz to 50.065 MHz. Benchmarks score:
+    // - CoreMark: from 2.33 to 2.37 CoreMark/MHz
+    // - Dhrystone: from 52.02 to 52.40 DMIPS
     localparam int unsigned EXEC_REDIR_INCYCLE = 0;
 
     // LSU launch shape. 1 = an aligned D-mem LOAD launches live from
@@ -433,7 +437,6 @@ package rv32_pkg;
     localparam logic [XLEN-1:0] MSTATUS_RESET = 32'h0000_1800;
 
     // mtvec MODE field (mtvec[1:0]).
-    localparam logic [1:0] MTVEC_DIRECT = 2'b00;
     localparam logic [1:0] MTVEC_VECTORED = 2'b01;
 
 
