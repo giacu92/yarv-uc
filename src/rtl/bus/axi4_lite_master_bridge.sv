@@ -9,12 +9,12 @@ import rv32_pkg::*;
  *
  * Sits between the CPU's native mem_req_t / mem_rsp_t interface and a
  * master AXI4-Lite port. The native interface is split per direction
- * (stile AXI): req_i carries all master->bridge signals (wvalid/we/
+ * (stile AXI): req_i carries all master->bridge signals (valid/we/
  * addr/wdata/wstrb/rready), rsp_o carries all bridge->master signals
  * (wready/rvalid/rdata).
  *
  * Behaviour:
- *   - Request launch handshake: req_i.wvalid && rsp_o.wready, where
+ *   - Request launch handshake: req_i.valid && rsp_o.wready, where
  *     rsp_o.wready is high only in S_IDLE. On acceptance the request
  *     (addr/wdata/wstrb) is latched into addr_q/wdata_q/wstrb_q so the
  *     bridge no longer depends on req_i staying stable once the native
@@ -87,7 +87,7 @@ module axi4_lite_master_bridge (
 
     // -----------------------------------------------------------------
     // Request latch: captured on acceptance (state_q==S_IDLE &&
-    // req_i.wvalid), so every downstream state drives AXI from these
+    // req_i.valid), so every downstream state drives AXI from these
     // registers instead of from req_i, which the native master is free
     // to change/drop the cycle after wready is seen high. we/direction
     // doesn't need latching: state_q alone distinguishes the read side
@@ -97,13 +97,18 @@ module axi4_lite_master_bridge (
     logic [$bits(axi.wdata)-1:0] wdata_q;
     logic [$bits(axi.wstrb)-1:0] wstrb_q;
 
-    wire accept = (state_q == S_IDLE) && req_i.wvalid;
+    wire accept = (state_q == S_IDLE) && req_i.valid;
 
     always_ff @(posedge clk_i) begin
         if (accept) begin
-            addr_q  <= req_i.addr;
-            wdata_q <= req_i.wdata;
-            wstrb_q <= req_i.wstrb;
+            // The native port is 64-bit (MEM_WIDTH) on the cache build; the
+            // AXI4-Lite peri fabric is 32-bit and the LSU drives the low
+            // lanes (a word/strb byte b of the request is field bit b), so
+            // slice the low half explicitly. The truncation is intentional
+            // and would otherwise warn (EX3791) on every field.
+            addr_q  <= req_i.addr[$bits(axi.awaddr)-1:0];
+            wdata_q <= req_i.wdata[$bits(axi.wdata)-1:0];
+            wstrb_q <= req_i.wstrb[$bits(axi.wstrb)-1:0];
         end
     end
 
@@ -139,17 +144,19 @@ module axi4_lite_master_bridge (
 
         unique case (state_q)
             S_IDLE: begin
-                if (req_i.wvalid) begin
+                if (req_i.valid) begin
                     if (req_i.we) begin
                         // Write: launch AW + W in lock-step from the
                         // live request (still valid this cycle; the
                         // latch above captures it in parallel). Cover
                         // all four accept combinations so neither
                         // channel is ever orphaned.
-                        axi.awaddr  = req_i.addr;
+                        // Low lanes of the 64-bit native fields (see the
+                        // latch above): the peri AXI fabric is 32-bit.
+                        axi.awaddr  = req_i.addr[$bits(axi.awaddr)-1:0];
                         axi.awvalid = 1'b1;
-                        axi.wdata   = req_i.wdata;
-                        axi.wstrb   = req_i.wstrb;
+                        axi.wdata   = req_i.wdata[$bits(axi.wdata)-1:0];
+                        axi.wstrb   = req_i.wstrb[$bits(axi.wstrb)-1:0];
                         axi.wvalid  = 1'b1;
                         if (aw_hs && w_hs) begin
                             state_d = S_WR_WAIT;
@@ -165,7 +172,7 @@ module axi4_lite_master_bridge (
                         end
                     end else begin
                         // Read: launch AR.
-                        axi.araddr  = req_i.addr;
+                        axi.araddr  = req_i.addr[$bits(axi.araddr)-1:0];
                         axi.arvalid = 1'b1;
                         state_d     = ar_hs ? S_RD_WAIT : S_RD_ADDR;
                     end

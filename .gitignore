@@ -11,10 +11,14 @@ impl/pnr/*.html
 impl/pnr/*.xml
 impl/pnr/*.txt
 impl/pnr/*.timing_paths
+impl/pnr/*.posp
+impl/pnr/*.tr
 impl/temp/
 
 # IDE workspace state (per-machine, TerosHDL / Gowin IDE)
 rv32imac_Zicsr_Zifencei.gprj.user
+*.gprj.user
+*.user
 
 # Claude Code workspace state (per-machine)
 .claude/

@@ -58,7 +58,15 @@ module sim_top #(
     // costs 1 cycle per mispredict / trap / mret.
     parameter int          EXEC_REDIR_INCYCLE = rv32_pkg::EXEC_REDIR_INCYCLE,
     // -GLSU_LIVE_LOAD=0 captures every bus op (the pre-2026-09-01 LSU).
-    parameter int          LSU_LIVE_LOAD      = rv32_pkg::LSU_LIVE_LOAD
+    parameter int          LSU_LIVE_LOAD      = rv32_pkg::LSU_LIVE_LOAD,
+    // -GIMEM_DELAY=1 registers the I-mem response one extra cycle, so
+    // fetch's inflight_q genuinely reaches 2 -- the variable-latency
+    // regime the in-flight PC FIFO exists for (the cache build). The
+    // native BSRAM answers in exactly 1 cycle, so at 0 the second slot is
+    // never used and the FIFO degenerates to the old single-register
+    // behaviour. Cycle counts move (one extra cycle per fetch word), the
+    // retire stream must NOT.
+    parameter int          IMEM_DELAY         = 0
 ) (
     input  wire       clk_i,
     input  wire       rstn_i,
@@ -92,12 +100,20 @@ module sim_top #(
     // Native memory ports. Fetch and the LSU each get a dedicated
     // native_ram.
     // -----------------------------------------------------------------
-    // Fetch I-mem port is 64-bit read-only (ifetch); the LSU D-mem port stays
-    // on the 32-bit byte-strobed mem_req_t / mem_rsp_t.
+    // Fetch I-mem port is 64-bit read-only (ifetch); the LSU D-mem port
+    // rides the (64-bit-field) mem_req_t / mem_rsp_t, but the sim's D-mem
+    // is a 32-bit native_ram and the CPU is a 32-bit master on it: the
+    // word/strobes sit in the low lanes of the widened fields (the cache
+    // build steers them at the cache boundary, see top_module), so the
+    // slices below are the whole adaptation.
     ifetch_req_t imem_req;
     ifetch_rsp_t imem_rsp;
+    // RAM-facing side of the fetch port: u_imem drives this, the IMEM_DELAY
+    // generate block below turns it into the CPU-visible imem_rsp.
+    ifetch_rsp_t imem_rsp_ram;
     mem_req_t    dmem_req;
     mem_rsp_t    dmem_rsp;
+    wire [XLEN-1:0] dmem_rdata;
     // The read-only I-mem holds BVALID low (no write-ack); sink it so the
     // port is connected (a native_ram write-ack only exists for the D-mem).
     wire         imem_bvalid_unused;
@@ -130,7 +146,7 @@ module sim_top #(
     ) u_cpu (
         .clk_i      (clk_i),
         .rstn_i     (rstn_i),
-        .boot_addr_i(32'h0000_0000),
+        .boot_addr_i(32'h0080_0000),
         .dbg_stall_o(unused_dbg_stall),
         .axi_peri   (axi_bus_peri.master),
         .imem_req_o (imem_req),
@@ -166,12 +182,70 @@ module sim_top #(
         .req_addr_i  (imem_req.addr),
         .req_wdata_i ({64{1'b0}}),
         .req_wstrb_i ({8{1'b0}}),
-        .req_rready_i(imem_req.rready),
-        .rsp_wready_o(imem_rsp.ready),
-        .rsp_rvalid_o(imem_rsp.rvalid),
-        .rsp_rdata_o (imem_rsp.rdata),
+        // The RAM's response pop is driven by the IMEM_DELAY generate block
+        // below: fetch's own rready at 0 (the old direct wiring), the skid's
+        // slot-free term at 1 (the skid then holds the response until fetch
+        // consumes it).
+        .req_rready_i(imem_ram_rready),
+        .rsp_wready_o(imem_rsp_ram.ready),
+        .rsp_rvalid_o(imem_rsp_ram.rvalid),
+        .rsp_rdata_o (imem_rsp_ram.rdata),
         .rsp_bvalid_o(imem_bvalid_unused)
     );
+
+    // -----------------------------------------------------------------
+    // Optional response delay on the fetch port (IMEM_DELAY): one-entry
+    // skid that presents each RAM response one cycle after the RAM raises
+    // rvalid. The RAM holds rvalid until its rready, and this shim keeps
+    // rready low while the skid is full, so no response is ever lost and
+    // order is preserved (a single skid slot serialises them). At
+    // IMEM_DELAY=0 the block is a pure passthrough and the wiring is
+    // byte-for-byte the old direct connection.
+    //
+    // Why it exists: fetch's in-flight PC FIFO is only exercised when a
+    // response arrives while a second read is outstanding (inflight==2).
+    // The native BSRAM answers in exactly 1 cycle, so at 0 the second slot
+    // never fills and the FIFO degenerates to the old single-register
+    // behaviour. With the delay, every response lands one cycle after
+    // fetch expected it, inflight genuinely reaches 2, and the FIFO's
+    // stamps are proven against the regime the I-cache build creates.
+    // -----------------------------------------------------------------
+    wire imem_ram_rready;  // RAM response pop, driven by the block below
+
+    generate
+        if (IMEM_DELAY != 0) begin : g_imem_delay
+            logic        dly_q;
+            logic [63:0] dly_data_q;
+
+            always_ff @(posedge clk_i) begin
+                if (!rstn_i) begin
+                    dly_q      <= 1'b0;
+                    dly_data_q <= '0;
+                end else if (imem_rsp_ram.rvalid && !dly_q) begin
+                    // Capture the RAM's response into the skid (this is the
+                    // edge the RAM's rready pops it, see req_rready_i above).
+                    dly_q      <= 1'b1;
+                    dly_data_q <= imem_rsp_ram.rdata;
+                end else if (dly_q && imem_req.rready) begin
+                    // Consumed by fetch.
+                    dly_q <= 1'b0;
+                end
+            end
+
+            // The skid takes a RAM response whenever it has room; the RAM's
+            // own depth-2 skid holds anything behind it. Fetch's rready only
+            // pops the CPU-facing side.
+            assign imem_ram_rready  = !dly_q;
+            assign imem_rsp.ready   = imem_rsp_ram.ready;   // wready passthrough
+            assign imem_rsp.rvalid  = dly_q;
+            assign imem_rsp.rdata   = dly_data_q;
+        end else begin : g_imem_direct
+            assign imem_ram_rready  = imem_req.rready;
+            assign imem_rsp.ready   = imem_rsp_ram.ready;
+            assign imem_rsp.rvalid  = imem_rsp_ram.rvalid;
+            assign imem_rsp.rdata   = imem_rsp_ram.rdata;
+        end
+    endgenerate
 
     // -----------------------------------------------------------------
     // Data memory (byte-strobed read/write). Holds .rodata/.data/.bss
@@ -191,17 +265,18 @@ module sim_top #(
     ) u_dmem (
         .clk_i       (clk_i),
         .rstn_i      (rstn_i),
-        .req_valid_i (dmem_req.wvalid),
+        .req_valid_i (dmem_req.valid),
         .req_we_i    (dmem_req.we),
-        .req_addr_i  (dmem_req.addr),
-        .req_wdata_i (dmem_req.wdata),
-        .req_wstrb_i (dmem_req.wstrb),
+        .req_addr_i  (dmem_req.addr[XLEN-1:0]),
+        .req_wdata_i (dmem_req.wdata[XLEN-1:0]),
+        .req_wstrb_i (dmem_req.wstrb[XLEN/8-1:0]),
         .req_rready_i(dmem_req.rready),
         .rsp_wready_o(dmem_rsp.wready),
         .rsp_rvalid_o(dmem_rsp.rvalid),
-        .rsp_rdata_o (dmem_rsp.rdata),
+        .rsp_rdata_o (dmem_rdata),
         .rsp_bvalid_o(dmem_rsp.bvalid)
     );
+    assign dmem_rsp.rdata = {32'b0, dmem_rdata};
 
     string iinit_file;
     string dinit_file;

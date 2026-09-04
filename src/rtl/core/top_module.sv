@@ -55,7 +55,19 @@ module top_module (
     output wire uart_txd_o,
 
     // Debug LEDs: led_o[0] = stall indicator, led_o[3:1] = alive counter.
-    output wire [3:0] led_o
+    output wire [3:0] led_o,
+
+    // GW2AR-18 embedded SDRAM (8 MiB). Fixed names — see header.
+    output wire        O_sdram_clk,
+    output wire        O_sdram_cke,
+    output wire        O_sdram_cs_n,
+    output wire        O_sdram_cas_n,
+    output wire        O_sdram_ras_n,
+    output wire        O_sdram_wen_n,
+    output wire [ 3:0] O_sdram_dqm,
+    output wire [10:0] O_sdram_addr,
+    output wire [ 1:0] O_sdram_ba,
+    inout  wire [31:0] IO_sdram_dq
 );
 
     // -----------------------------------------------------------------
@@ -101,6 +113,7 @@ module top_module (
 
     wire clk_core;
     wire pll_lock;
+    wire sdram_clk;
 
     rPLL #(  // For GW2AR-LV18QN88C8/I7 (Tang Nano 20K)
         .FCLKIN   ("25"),
@@ -108,7 +121,7 @@ module top_module (
         .FBDIV_SEL(9),     // -> FBDIV = 10, CLKOUT = 50 MHz (range 3.125-600)
         .ODIV_SEL (16)     // ->            VCO    = 800 MHz (range 500-1250)
     ) pll (
-        .CLKOUTP (),
+        .CLKOUTP (sdram_clk),
         .CLKOUTD (),
         .CLKOUTD3(),
         .RESET   (1'b0),
@@ -219,11 +232,20 @@ module top_module (
     // (the per-stage taps are internal; the simulation probes them via
     // the Verilator hierarchy).
     // -----------------------------------------------------------------
-    // IMEM_ADDR_W must match u_imem below: fetch uses it to tell a PC inside
-    // the implemented I-mem from one outside it, which is the difference
-    // between fetching an instruction and taking an access fault.
+    // IMEM_ADDR_W must match the address space behind the fetch port: the
+    // cache controller's system map is 24 bits (yarv32_cache_pkg::
+    // SYS_ADDR_W -- 23 bits of SDRAM plus bit 23 selecting bootrom/CSR),
+    // so a PC outside 24 bits faults instead of aliasing. 24, not the
+    // SDRAM's 23: the bootrom lives at 0x80_0000 (bit 23) and fetch must
+    // be able to execute from it -- at 23 the bootrom PCs would all be
+    // instruction access faults and the CPU would have no boot path. The
+    // BSRAM build used 14 (separate 16 KiB I/D BSRAMs, Harvard at the
+    // backing level; the cache build is unified behind the caches).
+    // Linker consequence: .text and .data/.bss/stack must now be laid out
+    // DISJOINT in one shared space -- the split images (.text@0,
+    // .data@0x2000) would collide.
     rv32imac_zicsr_zifencei #(
-        .IMEM_ADDR_W       (14),
+        .IMEM_ADDR_W       (24),
         .BP_EN             (rv32_pkg::BP_EN),
         .MUL_SHARED_DSP    (rv32_pkg::MUL_SHARED_DSP),
         .BP_PUSH_LOOKUP    (rv32_pkg::BP_PUSH_LOOKUP),
@@ -232,7 +254,12 @@ module top_module (
     ) u_cpu (
         .clk_i      (clk_core),
         .rstn_i     (rstn_core),
-        .boot_addr_i(32'h0000_0000),
+        // Boot vector: the bootrom at 0x80_0000. SDRAM is empty at power-up
+        // (volatile, nothing preloads it), so the reset PC must point at the
+        // ROM's boot code; the loader copies the payload into SDRAM and jumps
+        // there. Requires IMEM_ADDR_W=24 above -- the ROM region has bit 23
+        // set, which fetch would fault on at 23.
+        .boot_addr_i(32'h0080_0000),
         .dbg_stall_o(dbg_stall),
         .axi_peri   (axi_bus_peri.master),
         .imem_req_o (imem_req),
@@ -244,6 +271,7 @@ module top_module (
         .meip_i     (meip)
     );
 
+    /*
     // -----------------------------------------------------------------
     // Instruction memory (read-only). Fetch's dedicated port — no
     // contention with the LSU. Preloaded with firmware via INIT_FILE
@@ -313,6 +341,150 @@ module top_module (
         .rsp_rvalid_o(dmem_rsp.rvalid),
         .rsp_rdata_o (dmem_rsp.rdata),
         .rsp_bvalid_o(dmem_rsp.bvalid)
+    );
+*/
+
+    // -----------------------------------------------------------------
+    // Cache controller (I-cache + D-cache over the embedded 8 MiB SDRAM),
+    // replacing the two BSRAM native_ram instances above.
+    //
+    // Its ports speak the 64-bit mem_req_t / mem_rsp_t, but the CPU is a
+    // 32-bit master on that bus, and fetch speaks ifetch_req_t /
+    // ifetch_rsp_t -- so two adapters sit here:
+    //
+    //   icache: ifetch <-> mem types. Pure field wiring -- fetch is
+    //   read-only (we/wdata/wstrb stay zero) and the cache never raises
+    //   bvalid (posted stores), so the only dropped field is that one.
+    //   Fetch issues 8-byte-aligned addresses, and the cache returns the
+    //   addressed doubleword whole, so no lane steering is needed.
+    //
+    //   dcache: the LSU is a 32-bit master on that 64-bit bus. The steering
+    //   lives in mem_width_adapter (src/rtl/utils), not here: it replicates
+    //   the CPU word into both halves and shifts the strobes into the one
+    //   addr[2] selects (the cache's store path is byte-strobed, so the
+    //   unstrobed half can never commit), and selects the addressed half
+    //   back out of the load response, with the half-select registered at
+    //   accept -- the master may change its request the cycle after wready,
+    //   and the response can land many cycles later. All per-request state
+    //   is the adapter's; what is left here is a pure slice between the
+    //   64-bit low-lane view the CPU speaks and the 32-bit view the adapter
+    //   speaks. Zero added latency: the request path is wires, the response
+    //   path one mux.
+    // -----------------------------------------------------------------
+    mem_req_t  icache_req;
+    mem_rsp_t  icache_rsp;
+    mem_req_t  dcache_req;
+    mem_rsp_t  dcache_rsp;
+    mem32_req_t dmem32_req;
+    mem32_rsp_t dmem32_rsp;
+
+    always_comb begin
+        icache_req        = '0;
+        icache_req.valid  = imem_req.valid;
+        icache_req.addr   = imem_req.addr;
+        icache_req.rready = imem_req.rready;
+    end
+    assign imem_rsp.ready  = icache_rsp.wready;
+    assign imem_rsp.rvalid = icache_rsp.rvalid;
+    assign imem_rsp.rdata  = icache_rsp.rdata;
+
+    // 64-bit low-lane view -> 32-bit view. The LSU only ever drives the low
+    // lanes of the 64-bit bus, so this narrows without losing anything.
+    always_comb begin
+        dmem32_req        = '0;
+        dmem32_req.valid  = dmem_req.valid;
+        dmem32_req.we     = dmem_req.we;
+        dmem32_req.addr   = dmem_req.addr[XLEN-1:0];
+        dmem32_req.wdata  = dmem_req.wdata[XLEN-1:0];
+        dmem32_req.wstrb  = dmem_req.wstrb[STRB_WIDTH-1:0];
+        dmem32_req.rready = dmem_req.rready;
+    end
+
+    // 32-bit selected word back into the low lane of the 64-bit response
+    // (the LSU reads rdata[XLEN-1:0]).
+    always_comb begin
+        dmem_rsp        = '0;
+        dmem_rsp.wready = dmem32_rsp.wready;
+        dmem_rsp.rvalid = dmem32_rsp.rvalid;
+        dmem_rsp.rdata  = dmem32_rsp.rdata;
+        dmem_rsp.bvalid = dmem32_rsp.bvalid;
+    end
+
+    mem_width_adapter u_dmem_width (
+        .clk_i     (clk_core),
+        .rstn_i    (rstn_core),
+        .cpu_req_i (dmem32_req),
+        .cpu_rsp_o (dmem32_rsp),
+        .mem_req_o (dcache_req),
+        .mem_rsp_i (dcache_rsp)
+    );
+
+    cache_cntrl #(
+        // Main memory: the GW2AR's embedded 8 MiB SDRAM, 23-bit byte
+        // address (yarv32_cache_pkg::SYS_ADDR_W adds one bit on top for
+        // the bootrom/CSR window). Must match the real die -- a smaller
+        // value aliases the top of memory onto the bottom.
+        .MEM_SIZE(23),
+        // 32-byte line: one refill = 8 SDRAM beats at 32 bit, and the data
+        // macros are one line wide (DATA_WIDTH = 2**(5+3) = 256 bit). The
+        // 1 KiB full-page-burst figure was rejected in the plan -- ~260
+        // core cyc/miss and a bank held 5.12 us against a 7.8 us tREFI.
+        .CL_SIZE(5),
+        // 2-way: the tag compare->hit->way-mux path is post-flop, so this
+        // competes with -- but does not extend -- the CPU's critical path.
+        // Go 4-way only if PnR slack allows.
+        .N_WAY(2),
+        // 8 KiB per cache: 128 sets x 2 ways x 32 B, the same BSRAM budget
+        // as the two 16 KiB BSRAMs this replaces (16 of 46 blocks).
+        .CACHE_SIZE(13),
+        // MHZ, not Hz: this parameter spaces the SDRAM refresh interval
+        // (sdram_controller's CYCLES_BETWEEN_REFRESH) and sizes the
+        // power-up wait counter. rv32_pkg::UART_CLK_HZ is 50_000_000 --
+        // passing it here made the refresh constant ~46x too large for
+        // its 14-bit counter, silently truncating it to a wrong value
+        // (EX3791 at sdram_controller.v:79) and overflowing the init-wait
+        // localparam. Must stay the clk_core rate in MHz.
+        .CLK_FREQ_MHZ(50),
+        // JEDEC power-up wait before the SDRAM accepts PRECHARGE/MRS
+        // (stable clock, NOP-only for >=100 us). Invisible in sim, fatal
+        // on a real die -- the controller itself only waits 15 cycles.
+        .SDRAM_INIT_US(200),
+        // 2 KiB bootrom image, 64-bit $readmemh words (low 32 bits = the
+        // instruction at the word's byte address). Path relative to the
+        // Gowin project dir (repo root); a file that is not found is
+        // silently an all-zero ROM, so check the NL0002 sweep line in the
+        // synth log after a path change.
+        .BOOTROM_FILE("sim/sw/bootrom_2k/build/imem.hex"),
+        // Control register power-up value: caches ON, bypass OFF (bit 0
+        // is CSR_BIT_BYPASS). Firmware can still flip it at runtime
+        // through the CSR window at 0x80_1000.
+        .CSR_RST_VAL('0)
+    ) u_cache (
+        .clk_i        (clk_core),
+        .rstn_i       (rstn_core),
+        .sdram_clk_i  (sdram_clk),
+        .icache_req_i (icache_req),
+        .icache_rsp_o (icache_rsp),
+        .dcache_req_i (dcache_req),
+        .dcache_rsp_o (dcache_rsp),
+        .sdram_clk_o  (O_sdram_clk),
+        .sdram_cke_o  (O_sdram_cke),
+        .sdram_cs_n_o (O_sdram_cs_n),
+        .sdram_cas_n_o(O_sdram_cas_n),
+        .sdram_ras_n_o(O_sdram_ras_n),
+        .sdram_wen_n_o(O_sdram_wen_n),
+        .sdram_dqm_o  (O_sdram_dqm),
+        .sdram_addr_o (O_sdram_addr),
+        .sdram_ba_o   (O_sdram_ba),
+        .sdram_dq_io  (IO_sdram_dq),
+        .dbg_state_o  (),
+        .dbg_dport_o  (),
+        .dbg_cnt_o    (),
+        .dbg_acc_o    (),
+        .dbg_go_o     (),
+        .dbg_rsp_o    (),
+        .dbg_tick_o   (),
+        .dbg_hb_o     ()
     );
 
     // -----------------------------------------------------------------

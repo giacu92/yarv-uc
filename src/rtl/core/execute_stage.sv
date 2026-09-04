@@ -744,7 +744,13 @@ module execute_stage #(
     // Latching also shortens the response-cycle path to a flop output.
     logic [XLEN-1:0] load_shifted;
     logic [XLEN-1:0] load_data;
-    assign load_shifted = lsu_rsp_wait.rdata >> {mem_addr_q[1:0], 3'b000};
+    // The native rsp carries a 64-bit doubleword (MEM_WIDTH) on the cache
+    // build; the LSU's 32-bit word sits in the LOW half by convention --
+    // the cache build lane-steers the response at the cache boundary
+    // (top_module), and the 32-bit sim D-mem drives only the low half --
+    // so slice it explicitly instead of truncating (EX3791) per field.
+    wire [XLEN-1:0] load_word = lsu_rsp_wait.rdata[XLEN-1:0];
+    assign load_shifted = load_word >> {mem_addr_q[1:0], 3'b000};
     always_comb begin
         unique case (de_i.mem_size)
             MS_B:
@@ -753,8 +759,8 @@ module execute_stage #(
             MS_H:
             load_data = de_i.mem_unsigned ?
                 {16'b0, load_shifted[15:0]} : {{16{load_shifted[15]}}, load_shifted[15:0]};
-            MS_W: load_data = lsu_rsp_wait.rdata;
-            default: load_data = lsu_rsp_wait.rdata;
+            MS_W: load_data = load_word;
+            default: load_data = load_word;
         endcase
     end
 
@@ -1071,13 +1077,13 @@ module execute_stage #(
     // cycle's values, and an idle bus is zero. "The receiver ignores that
     // field" is a property of today's receiver, not of the bus.
     always_comb begin
-        mem_req_o.wvalid  = 1'b0;
+        mem_req_o.valid  = 1'b0;
         mem_req_o.we      = 1'b0;
         mem_req_o.addr    = '0;
         mem_req_o.wdata   = '0;
         mem_req_o.wstrb   = '0;
         mem_req_o.rready  = 1'b0;
-        peri_req_o.wvalid = 1'b0;
+        peri_req_o.valid = 1'b0;
         peri_req_o.we     = 1'b0;
         peri_req_o.addr   = '0;
         peri_req_o.wdata  = '0;
@@ -1090,7 +1096,7 @@ module execute_stage #(
             // Live D-mem LOAD launch. A load carries no write data and no
             // strobes, so those stay at their zero defaults rather than
             // exposing the previous captured op's flops.
-            mem_req_o.wvalid = 1'b1;
+            mem_req_o.valid = 1'b1;
             mem_req_o.addr   = lsu_ea;
         end else if (is_peri_rsp) begin
             // we is gated by the drive, matching mem_req_o.we below. The
@@ -1099,13 +1105,13 @@ module execute_stage #(
             // registered address belonging to an older op, which is the exact
             // shape of mixed-lifetime bundle that cost a board bring-up here
             // (see the note above). One AND buys the invariant back.
-            peri_req_o.wvalid = captured_drive;
+            peri_req_o.valid = captured_drive;
             peri_req_o.we     = captured_drive & de_i.mem_write;
             peri_req_o.addr   = mem_addr_q;  // registered EA
             peri_req_o.wdata  = mem_wdata_q;
             peri_req_o.wstrb  = mem_wstrb_q;
         end else begin
-            mem_req_o.wvalid = dmem_captured_drive;
+            mem_req_o.valid = dmem_captured_drive;
             mem_req_o.we     = dmem_store_we;
             mem_req_o.addr   = mem_addr_q;  // registered EA
             mem_req_o.wdata  = mem_wdata_q;

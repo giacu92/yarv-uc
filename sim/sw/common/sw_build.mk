@@ -27,6 +27,12 @@
 #                     WORDS: the I-mem hex is 64-bit-wide (--word-width 8), so
 #                     16 KiB = 2048 words (was 4096 at the old 32-bit width).
 #   IMEM_PAD_VALUE  : filler word (default 0x00100073 = ebreak).
+#   IMEM_SECTIONS   : objcopy -j list cut into the I-mem image
+#                     (default `-j .text.init -j .text`).
+#   DMEM_SECTIONS   : objcopy -j list cut into the D-mem image
+#                     (default `-j .rodata -j .data`). bootrom_2k sets both
+#                     to the same full list: its linker script has a single
+#                     2 KiB space, so one image feeds both ports.
 #   DMEM_BASE       : byte address of the first word of the data image
 #                     (default 0x2000, the DMEM ORIGIN in common/link.ld).
 #                     Must equal the ORIGIN of the DMEM region in whatever
@@ -111,6 +117,14 @@ IMEM_PAD_WORDS ?= 0
 IMEM_PAD_VALUE ?= 0x00100073
 DMEM_BASE      ?= 0x2000
 
+# Which ELF sections each image is cut from. The defaults implement the
+# Harvard split: code to the I-mem, data to the D-mem. A harness whose
+# linker script puts everything in ONE address space (bootrom_2k: a single
+# 2 KiB memory serving both ports) overrides both to the same full list, so
+# the two hex files are two width-formattings of one identical image.
+IMEM_SECTIONS ?= -j .text.init -j .text
+DMEM_SECTIONS ?= -j .rodata -j .data
+
 # Object list: C programs link the common start.o first (so _start / .text.init
 # is the first thing linked -> IMEM 0x0); standalone .S programs carry their own
 # _start and link alone.
@@ -170,7 +184,7 @@ $(ELF): $(OBJS) $(LINK_LD)
 # 64-bit port: bin2hex --word-width 8 packs two 32-bit instructions per
 # $readmemh element (low 32 bits = word at the byte address, high = +4).
 $(IMEM_BIN): $(ELF)
-	$(OBJCOPY) -O binary -j .text.init -j .text $< $@
+	$(OBJCOPY) -O binary $(IMEM_SECTIONS) $< $@
 
 # Data image: .rodata + .data -> DMEM (VMA DMEM_BASE). .bss is NOBITS (no file
 # content) and placed last, so it does not punch a gap. objcopy -j starts the
@@ -178,7 +192,7 @@ $(IMEM_BIN): $(ELF)
 # --base $(DMEM_BASE) emits the matching @ index and the words land at that
 # D-mem offset -- @0x800 for the default 0x2000.
 $(DMEM_BIN): $(ELF)
-	$(OBJCOPY) -O binary -j .rodata -j .data $< $@
+	$(OBJCOPY) -O binary $(DMEM_SECTIONS) $< $@
 
 ifeq ($(IMEM_PAD_WORDS),0)
 $(IMEM_HEX): $(IMEM_BIN) $(BIN2HEX)

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1" encoding="UTF-8"?>
 <!DOCTYPE gowin-fpga-project>
 <Project>
     <Template>FPGA</Template>
@@ -9,21 +9,25 @@
         <File path="src/rtl/bus/axi4_lite_master_bridge.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/bus/axi4_lite_xbar.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/bus/axi4_lite_xbar_3.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/core/fetch_stage.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/core/reg_file.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/core/csr_regfile.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/core/decode_stage.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/core/trap_unit.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/alu.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/branch_predictor.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/csr_regfile.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/decode_stage.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/execute_stage.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/fetch_stage.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/reg_file.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/rv32imac_zicsr_zifencei.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/core/top_module.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/core/trap_unit.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/pkg/rv32_pkg.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/utils/native_ram.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/utils/msip_peri.sv" type="file.verilog" enable="1"/>
-        <File path="src/rtl/utils/clint_timer.sv" type="file.verilog" enable="1"/>
         <File path="src/rtl/utils/axi4_lite_uart.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/utils/clint_timer.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/utils/mem_width_adapter.sv" type="file.verilog" enable="1"/>
+        <File path="src/rtl/utils/msip_peri.sv" type="file.verilog" enable="1"/>
+        <File path="src/sub/yarv32-native-caches/src/ips/sdram-controller/rtl/sdram_controller.v" type="file.verilog" enable="1"/>
+        <File path="src/sub/yarv32-native-caches/src/rtl/cache_cntrl.sv" type="file.verilog" enable="1"/>
+        <File path="src/sub/yarv32-native-caches/src/rtl/native_ram.sv" type="file.verilog" enable="1"/>
+        <File path="src/sub/yarv32-native-caches/src/rtl/pkg/yarv32_cache_pkg.sv" type="file.verilog" enable="1"/>
         <File path="src/phys/rv32imac_Zicsr_Zifencei.cst" type="file.cst" enable="1"/>
         <File path="src/phys/rv32imac_Zicsr_Zifencei.sdc" type="file.sdc" enable="1"/>
     </FileList>
