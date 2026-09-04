@@ -99,7 +99,7 @@ LDFLAGS := -march=$(ARCH) -mabi=$(ABI) -nostdlib -nostartfiles -ffreestanding \
            -T $(LINK_LD) -Wl,--no-check-sections -no-pie -Wl,-N \
            $(EXTRA_LDFLAGS)
 
-BUILD    := build
+BUILD    ?= build
 ELF      := $(BUILD)/program.elf
 IMEM_BIN := $(BUILD)/imem.bin
 DMEM_BIN := $(BUILD)/dmem.bin
